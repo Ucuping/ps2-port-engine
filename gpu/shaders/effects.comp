@@ -70,11 +70,13 @@ float DepthAt(vec2 pixel) {
 }
 
 // Interleaved gradient noise (Jimenez): a different angle each pixel, no
-// pattern the eye picks up, and each frame turned.
-float Noise(vec2 pixel) {
-    pixel += 5.588238 * float(pc.size.z & 63);
+// pattern the eye picks up - the same each frame (still): with nothing
+// accumulating frames, a pattern turned each frame is grain that crawls.
+float StillNoise(vec2 pixel) {
     return fract(52.9829189 * fract(0.06711056 * pixel.x + 0.00583715 * pixel.y));
 }
+// ...and turned each frame (the blur's jitter: the motion hides it).
+float Noise(vec2 pixel) { return StillNoise(pixel + 5.588238 * float(pc.size.z & 63)); }
 
 vec3 Luma3() { return vec3(0.2126, 0.7152, 0.0722); }
 
@@ -122,7 +124,7 @@ void main() {
         return;
     }
     const int kSamples = 12;
-    const float spin = Noise(vec2(at)) * 6.2831853;
+    const float spin = StillNoise(vec2(at)) * 6.2831853;
     float sum = 0.0;
     for (int i = 0; i < kSamples; ++i) {
         const float alpha = (float(i) + 0.5) / float(kSamples);
@@ -160,7 +162,7 @@ void main() {
         float t = 0.06;
         const float grow = pow(pc.p[11] / 0.06, 1.0 / float(kSteps));
         for (int i = 0; i < kSteps; ++i) {
-            const vec3 q = start + sun * t * (1.0 + 0.25 * Noise(vec2(at) + float(i)));
+            const vec3 q = start + sun * t * (1.0 + 0.25 * StillNoise(vec2(at) + float(i)));
             t *= grow;
             if (q.z < 0.3) break;
             const vec2 qp = ToPixel(q);
