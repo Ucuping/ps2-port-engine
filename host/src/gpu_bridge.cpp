@@ -90,6 +90,10 @@ std::atomic<u32> g_tag_tbp{~0u}, g_tag_bits{0};
 std::atomic<u32> g_rule_begin{0}, g_rule_end{0}, g_rule_fbw{0};
 }  // namespace
 
+// (PS2HOST_MODERN_TEXTURES=1: on from the start - a capture's replay)
+std::atomic<bool> g_modern_textures{std::getenv("PS2HOST_MODERN_TEXTURES") != nullptr};
+void SetGpuModernTextures(bool on) { g_modern_textures = on; }
+
 void SetGpuDrawTag(u32 tbp, u32 tag) {
     g_tag_bits = tag;
     g_tag_tbp = tag ? tbp : ~0u;
@@ -1771,6 +1775,7 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     state.gouraud = gouraud;
     state.textured = (call.prim >> 4) & 1;
     if (state.textured && Bits(c.tex0, 0, 14) == g_tag_tbp.load(std::memory_order_relaxed)) state.tag = g_tag_bits;
+    if (state.textured && g_modern_textures.load(std::memory_order_relaxed)) state.tag |= 2u;
     state.sprite = type == 6 && s.renderer->Scale() > 1;     // (at 1x it would only split batches)
     state.sprite_prim = type == 6;
     if (s.primary && s.Dumping()) {

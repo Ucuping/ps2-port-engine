@@ -267,6 +267,32 @@ vec4 ReplacedSample(vec2 r, float footprint) {
 // the two around mixed; 4 and 5 bilinear within a level. The GS's own
 // selection, not the GPU's: the levels it picks at any internal resolution
 // (the software GS's ChooseLevel).
+/* A mipmapped texture as a modern GPU filters it (blend_ops bit 20: a
+   game's choice, the bridge's SetGpuModernTextures): the level from the
+   footprint on screen - at an internal resolution the finer levels it can
+   show, where the GS's depth-based level is the PS2's picture's - blended
+   between levels (no bands where the level changes), and up to eight taps
+   along the footprint's long axis (anisotropic: the road ahead sharp, not
+   smeared). `dx`, `dy` the coordinate's change a pixel, in level 0's
+   texels. */
+vec4 SampleModern(vec2 uv, vec2 dx, vec2 dy, int mxl) {
+    const float lx = length(dx), ly = length(dy);
+    const float major = max(lx, ly), minor = max(min(lx, ly), 1e-4);
+    const float taps = clamp(ceil(major / minor), 1.0, 8.0);
+    const float lod = clamp(log2(max(major / taps, 1e-4)) - 1.0, 0.0, float(mxl));     // (a level finer: sharp, the taps keep it calm)
+    const int n = int(floor(lod));
+    const float f = lod - float(n);
+    const vec2 axis = lx > ly ? dx : dy;
+    vec4 sum = vec4(0.0);
+    for (int i = 0; i < int(taps); ++i) {
+        const vec2 at = uv + axis * ((float(i) + 0.5) / taps - 0.5);
+        vec4 c = Sample(at, n, true);
+        if (n < mxl && f > 0.0) c = mix(c, Sample(at, n + 1, true), f);
+        sum += c;
+    }
+    return floor(sum / taps + 0.5);
+}
+
 vec4 Sample(vec2 uv) {
     const uint m = p.bilinear;
     if (!Has(kMip) || (m & 2u) == 0u) return Sample(uv, 0, Has(kLinear) && (m & 1u) != 0u);
@@ -321,6 +347,9 @@ void main() {
             const vec2 r = coordinate.xy / coordinate.z * vec2(TextureSize()) * k;
             const vec2 dx = dFdx(r), dy = dFdy(r);
             t = ReplacedSample(uv * k, sqrt(max(dot(dx, dx), dot(dy, dy))));
+        } else if (Has(kMip) && ((p.blend_ops >> 20) & 1u) != 0u && (p.bilinear & 2u) != 0u) {
+            const vec2 r = coordinate.xy / coordinate.z * vec2(TextureSize());
+            t = SampleModern(uv, dFdx(r), dFdy(r), int((p.bilinear >> 2) & 7u));
         } else {
             t = Sample(uv);
         }

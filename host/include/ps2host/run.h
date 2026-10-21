@@ -594,6 +594,10 @@ void SetGpuPipelineHints(const u32* keys, std::size_t count);
    (ps2gpu::GsDrawState::tag; 0 none): bit 0 a car's paint reflecting a
    sphere map, its blend's share by a Fresnel term. One texture at a time. */
 void SetGpuDrawTag(u32 tbp, u32 tag);
+/* Mipmapped textures filtered as a modern GPU filters them - the level from
+   the footprint on screen (finer at an internal resolution), trilinear,
+   anisotropic - not by the GS's depth-based level (GsDrawState::tag bit 1). */
+void SetGpuModernTextures(bool on);
 /* Small targets at FBP [fbp_begin, fbp_end), at most max_fbw pages wide,
    drawn at the internal resolution (GsRenderer::SetScaleRule): a game's
    reflection maps. Applied between frames; an empty range none. */
