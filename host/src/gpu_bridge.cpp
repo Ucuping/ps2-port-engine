@@ -94,6 +94,9 @@ std::atomic<u32> g_rule_begin{0}, g_rule_end{0}, g_rule_fbw{0};
 std::atomic<bool> g_modern_textures{std::getenv("PS2HOST_MODERN_TEXTURES") != nullptr};
 void SetGpuModernTextures(bool on) { g_modern_textures = on; }
 
+std::string g_gpu_name;         // GpuName
+std::string GpuName() { return g_gpu_name; }
+
 void SetGpuDrawTag(u32 tbp, u32 tag) {
     g_tag_bits = tag;
     g_tag_tbp = tag ? tbp : ~0u;
@@ -2335,6 +2338,7 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
             if (!g_present_at_blank_end || VirtualClock()) PresentWaiting();
         });
     }
+    g_gpu_name = device->Describe();
     std::fprintf(stderr, "gpu: drawing on %s %s\n", device->Describe().c_str(),
                  bridge.primary ? "instead of the software GS" : "beside the software GS");
     return true;

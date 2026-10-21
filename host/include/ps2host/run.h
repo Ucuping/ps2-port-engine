@@ -598,6 +598,10 @@ void SetGpuDrawTag(u32 tbp, u32 tag);
    the footprint on screen (finer at an internal resolution), trilinear,
    anisotropic - not by the GS's depth-based level (GsDrawState::tag bit 1). */
 void SetGpuModernTextures(bool on);
+/* The GPU drawing the game ("" before it is started, or with none): its
+   name as the driver gives it - a game's defaults may weigh it (an
+   integrated GPU's). */
+std::string GpuName();
 /* Small targets at FBP [fbp_begin, fbp_end), at most max_fbw pages wide,
    drawn at the internal resolution (GsRenderer::SetScaleRule): a game's
    reflection maps. Applied between frames; an empty range none. */
