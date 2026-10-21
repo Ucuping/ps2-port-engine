@@ -179,6 +179,13 @@ public:
     /* A transfer into local memory that Touch announced is done: its last
        pixel written (the GPU bridge patches what it holds newer then). */
     std::function<void()> on_transfer_done;
+    /* PC effects: A+D writes to GS register addresses 0x70-0x7F, which no
+       GS has (the console's, PCSX2's and the software GS ignore them). A
+       game's port writes them into its own packet stream, so that an effect
+       of the PC's (ambient occlusion, a speed blur) runs at that point of the
+       frame: 0x70-0x7D are its parameters, kept here, and 0x7E runs it -
+       its value and the 14 parameters to this. */
+    std::function<void(u64 run, const u64* params)> on_effect;
     /* The texture the primitive being drawn samples, decoded as the software
        rasteriser reads it (CLUT, TEXA): RGBA in memory, rows top-down. */
     void DecodeTexture(std::vector<u32>* pixels, u32* width, u32* height) const;
@@ -298,6 +305,7 @@ private:
     std::atomic<u64> pixels_{0};               // written by the row workers too
     u64 tags_[4] = {}, image_qwords_ = 0;
     std::array<u64, 256> register_writes_{};
+    u64 effect_params_[14] = {};                // 0x70-0x7D (on_effect)
     // CLUT, loaded per TEX0's CLD; copied when it changes, so that queued
     // primitives keep the one they were drawn with.
     std::shared_ptr<std::array<u32, 256>> clut_ = std::make_shared<std::array<u32, 256>>();

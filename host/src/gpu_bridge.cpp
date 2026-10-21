@@ -1519,6 +1519,106 @@ bool Shuffle(Bridge& s, const gs::Gs::DrawCall& call, const gs::Context& c, u32 
     return true;
 }
 
+/* A PC effect (gs.h's on_effect): the run register's value - the effect in
+   bits 0-7, its flags in 8-31 - and the 14 parameters: 0 FRAME, 1 ZBUF (the
+   target and depth buffer it works on, as the game draws the view; a ZBUF
+   of 0 none), 2 the view's rectangle (x0, y0, x1, y1: 16 bits each, ends
+   exclusive), 3-13 the effect's own 22 floats (two a parameter, the low
+   word first). Each image found as a draw finds its own - player 2's
+   target rows into player 1's - brought up to date, the effect run on the
+   GPU in turn with the draws, and the target then newer than memory. */
+void OnEffect(u64 run, const u64* p) {
+    Bridge& s = *g_bridge;
+    static const bool log = std::getenv("PS2HOST_EFFECT_LOG") != nullptr;
+    const u32 fbp = Bits(p[0], 0, 9), fbw = std::max(1u, Bits(p[0], 16, 6)), psm = Bits(p[0], 24, 6);
+    auto skip = [&](const char* why) {
+        if (log) std::fprintf(stderr, "[effect] %u on %X/%u/%02X skipped: %s\n", unsigned(run & 0xFF), unsigned(fbp),
+                              unsigned(fbw), unsigned(psm), why);
+    };
+    if (!s.primary || !s.renderer->CanRunEffects()) return skip("no effects here");
+    static const bool off = std::getenv("PS2HOST_GPU_NO_EFFECTS") != nullptr;
+    if (off) return;
+    if (psm != gs::PSMCT32 && psm != gs::PSMCT24) return skip("its format");
+    u32 down = 0;
+    Owned* target = nullptr;
+    if (auto at = s.owned.find(std::make_tuple(fbp, fbw, psm, false)); at != s.owned.end() && at->second.width)
+        target = &at->second;
+    if (!target) target = Containing(s, fbp, fbw, psm, &down);
+    if (!target || !target->width) return skip("no target");
+    Owned* depth = nullptr;
+    if (p[1]) {
+        const u32 zbp = Bits(p[1], 0, 9), zpsm = 0x30 | Bits(p[1], 24, 4);
+        // Its depth buffer: at ZBP, or as many pages into one as the
+        // target's rows are into its own (player 2's).
+        const u32 pages = fbp - target->fbp;
+        for (u32 shift : {0u, pages}) {
+            if (shift > zbp) continue;
+            auto at = s.owned.find(std::make_tuple(zbp - shift, fbw, zpsm, true));
+            if (at != s.owned.end() && at->second.width) {
+                depth = &at->second;
+                break;
+            }
+        }
+    }
+    ps2gpu::GsEffect e;
+    e.id = ps2gpu::GsEffectId(u32(run & 0xFF));
+    e.flags = u32(run >> 8) & 0xFFFFFF;
+    e.fbp = target->fbp;
+    e.fbw = target->fbw;
+    e.psm = target->psm;
+    const u32 x0 = Bits(p[2], 0, 16), y0 = Bits(p[2], 16, 16), x1 = Bits(p[2], 32, 16), y1 = Bits(p[2], 48, 16);
+    e.x0 = int(std::min(x0, target->width));
+    e.x1 = int(std::min(x1, target->width));
+    e.y0 = int(std::min(y0 + down, target->height));
+    e.y1 = int(std::min(y1 + down, target->height));
+    if (e.x1 <= e.x0 || e.y1 <= e.y0) {
+        if (log) std::fprintf(stderr, "[effect] %u: an empty view (%u,%u)-(%u,%u) in %ux%u\n", unsigned(run & 0xFF),
+                              unsigned(x0), unsigned(y0), unsigned(x1), unsigned(y1), unsigned(target->width),
+                              unsigned(target->height));
+        return;
+    }
+    for (int i = 0; i < 11; ++i) {
+        const u32 lo = u32(p[3 + i]), hi = u32(p[3 + i] >> 32);
+        std::memcpy(&e.params[2 * i], &lo, 4);
+        std::memcpy(&e.params[2 * i + 1], &hi, 4);
+    }
+    // PS2HOST_EFFECT_SET=id.n=value,...: parameter n of effect id set (to
+    // tune an effect on a capture's replay); PS2HOST_EFFECT_LOG=1 tells
+    // each effect run.
+    static const std::vector<std::tuple<u32, u32, float>> sets = [] {
+        std::vector<std::tuple<u32, u32, float>> list;
+        const char* env = std::getenv("PS2HOST_EFFECT_SET");
+        for (const char* at = env; at && *at;) {
+            unsigned id = 0, n = 0;
+            float value = 0;
+            if (std::sscanf(at, "%u.%u=%f", &id, &n, &value) == 3 && n < 22) list.emplace_back(id, n, value);
+            at = std::strchr(at, ',');
+            if (at) ++at;
+        }
+        return list;
+    }();
+    for (const auto& [id, n, value] : sets)
+        if (id == u32(e.id)) e.params[n] = value;
+    if (log) {
+        std::fprintf(stderr, "[effect] %u on %X/%u/%02X rows %u down, (%d,%d)-(%d,%d), depth %s:", unsigned(e.id),
+                     unsigned(fbp), unsigned(fbw), unsigned(psm), unsigned(down), int(x0), int(y0), int(x1), int(y1),
+                     depth ? "yes" : "no");
+        for (float v : e.params) std::fprintf(stderr, " %g", v);
+        std::fprintf(stderr, "\n");
+    }
+    Use(s, target->fbp, target->fbw, target->psm, false, target->width, target->height, 1);   // (growing neither)
+    if (depth) {
+        Use(s, depth->fbp, depth->fbw, depth->psm, true, depth->width, depth->height, 1);
+        e.depth = true;
+        e.zbp = depth->fbp;
+        e.zwidth = depth->width;
+        e.zheight = depth->height;
+    }
+    ++g_draws;
+    s.renderer->RunEffect(e);
+    Drew(s, *target, u32(e.x0), u32(e.x1), u32(e.y1), u32(e.y0));
+}
+
 void OnDraw(const gs::Gs::DrawCall& call) {
     // Timed only past the fast path below: two clock reads a primitive were
     // a twentieth of the GS thread.
@@ -2120,6 +2220,7 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     bridge.targets_as_textures = mode == GpuMode::ShadowRtt;
     gs::Gs& g = gs::TheGs();
     g.on_draw = OnDraw;
+    g.on_effect = OnEffect;
     if (bridge.primary) {
         g.rasterize = false;
         g.on_memory = [](u32 begin, u32 end, bool write) {

@@ -351,6 +351,15 @@ void Gs::WriteRegister(u32 address, u64 value) {
             }
             break;
         case 0x54: Transfer(value, 0); break;          // HWREG: 64 bits
+        case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76:
+        case 0x77: case 0x78: case 0x79: case 0x7A: case 0x7B: case 0x7C: case 0x7D:
+            effect_params_[address - 0x70] = value;
+            break;
+        case 0x7E:
+            if (trace) std::fprintf(trace_out, "[gs] PC effect %llX\n", static_cast<unsigned long long>(value));
+            if (std::getenv("PS2HOST_EFFECT_LOG")) std::fprintf(stderr, "[gs] effect %llX set %d\n", static_cast<unsigned long long>(value), on_effect ? 1 : 0);
+            if (on_effect) on_effect(value, effect_params_);
+            break;
         default: break;
     }
 }

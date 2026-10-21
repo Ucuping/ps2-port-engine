@@ -32,7 +32,7 @@ inline GpuWaitObserver g_wait_observer = nullptr;      // SetGpuWaitObserver
 inline std::atomic<std::uint64_t> g_gpu_ns{0};
 /* PS2HOST_GPU_PROFILE: the GPU's time by what it did (GpuProfileReport). */
 enum ProfileKind { kProfOther, kProfDraw, kProfSwizzle, kProfLinear, kProfMemory, kProfFeedback, kProfDecode,
-                   kProfUpload, kProfClear, kProfDate, kProfReadback, kProfKinds };
+                   kProfUpload, kProfClear, kProfDate, kProfReadback, kProfEffects, kProfKinds };
 inline std::atomic<std::uint64_t> g_profile_ns[kProfKinds] = {};
 /* PS2HOST_GPU_PROFILE: the draws' time by their tag too (MarkDraw: the
    renderer's - its target and what kind of draw), for the report's list of

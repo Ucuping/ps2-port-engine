@@ -182,6 +182,27 @@ struct GsShuffle {
     bool aem = false, fba = false;
 };
 
+/* An effect of the PC's run on a target and its depth buffer at a point of
+   the GS stream (gs.h's on_effect: a game's port writes it into its own
+   packets): ambient occlusion, a speed blur, a glow, a grade - drawn at the
+   internal resolution, before what the game draws after it (its HUD). */
+enum class GsEffectId : std::uint32_t {
+    kTint = 0xF0,       /* a test: the rectangle's colour times params[0..2] */
+    kOcclusion = 1,     /* ambient occlusion and sun shadows, from the depth */
+    kMotionBlur = 2,    /* a camera's motion blur, from the depth */
+    kBloom = 3,         /* a glow of the bright parts */
+    kGrade = 4,         /* tone and colour */
+};
+struct GsEffect {
+    GsEffectId id = GsEffectId::kTint;
+    std::uint32_t flags = 0;                            /* the effect's own */
+    std::uint32_t fbp = 0, fbw = 1, psm = 0;            /* the target as it was made */
+    bool depth = false;                                 /* a depth buffer, as it was made: */
+    std::uint32_t zbp = 0, zwidth = 0, zheight = 0;
+    std::int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;        /* the view in the target (GS pixels, ends exclusive) */
+    float params[22] = {};                              /* the effect's own */
+};
+
 class GsRenderer {
 public:
     virtual ~GsRenderer() = default;
@@ -282,6 +303,10 @@ public:
        this renderer cannot, the draw then made as it is. */
     virtual bool CanShuffle() const { return false; }
     virtual void ChannelShuffle(const GsShuffle& shuffle) { (void)shuffle; }
+    /* GsEffect, in turn with what is recorded; false when this renderer
+       has none (the picture is then as the game drew it). */
+    virtual bool CanRunEffects() const { return false; }
+    virtual void RunEffect(const GsEffect& effect) { (void)effect; }
     /* A depth buffer's Z (the GS's, unsigned), rows top-down; false if there
        is none of that size. */
     virtual bool ReadDepth(std::uint32_t zbp, std::uint32_t width, std::uint32_t height,

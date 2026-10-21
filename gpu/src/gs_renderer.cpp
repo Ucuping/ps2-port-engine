@@ -33,6 +33,7 @@
 #include <unordered_set>
 
 #include "gpu_internal.h"
+#include "effects.h"
 #include "gs_frag.h"
 #include "gs_frag_single.h"
 #include "gs_frag_blend.h"
@@ -488,6 +489,8 @@ public:
     void ClutRows(const std::uint32_t* clut, std::uint32_t rows) override;
     bool CanShuffle() const override { return shuffle_pipeline_ != VK_NULL_HANDLE; }
     void ChannelShuffle(const GsShuffle& shuffle) override;
+    bool CanRunEffects() const override { return effects_.ready(); }
+    void RunEffect(const GsEffect& effect) override;
     bool ReadTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::vector<std::uint32_t>* pixels,
                     std::uint32_t* width, std::uint32_t* height) override;
     bool ReadTargetFull(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::vector<std::uint32_t>* pixels,
@@ -808,6 +811,8 @@ private:
     GsShuffle shuffle_wait_;
     std::int32_t shuffle_period_ = 0, shuffle_count_ = 0;
     void RecordShuffle();
+    /* The PC's effects (RunEffect, effects.cpp). */
+    GsEffects effects_{g_};
 };
 
 void* VulkanGsRenderer::Vertices(VkDeviceSize bytes, VkBuffer* buffer, VkDeviceSize* offset) {
@@ -978,6 +983,7 @@ bool VulkanGsRenderer::MakeImage(Image& t, std::uint32_t width, std::uint32_t he
 }
 
 void VulkanGsRenderer::DestroyImage(Image& t) {
+    effects_.ForgetView(t.view);
     if (t.view) vkDestroyImageView(g_.device, t.view, nullptr);
     if (t.words) vkDestroyImageView(g_.device, t.words, nullptr);
     if (t.depth_view) vkDestroyImageView(g_.device, t.depth_view, nullptr);
@@ -1260,6 +1266,7 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         return false;
     }
     MakeShufflePipeline();
+    effects_.Init(cache_);
     {
         VkShaderModuleCreateInfo pi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         pi.codeSize = sizeof spirv_patch_comp;
@@ -1763,6 +1770,45 @@ void VulkanGsRenderer::RecordShuffle() {
     });
 }
 
+void VulkanGsRenderer::RunEffect(const GsEffect& e) {
+    if (!effects_.ready()) return;
+    Flush();                                    // the draws before it, recorded
+    auto target = targets_.find(Key{e.fbp, e.fbw, e.psm});
+    if (target == targets_.end() || !target->second.image) return;
+    Image& t = target->second;
+    Image* d = nullptr;
+    if (e.depth) {
+        auto depth = depths_.find(Key{e.zbp, e.zwidth, e.zheight});
+        if (depth != depths_.end() && depth->second.depth_view) d = &depth->second;
+    }
+    GsEffects::Target view;
+    view.view = t.view;
+    view.pw = t.pw();
+    view.ph = t.ph();
+    view.scale = t.scale;
+    g_.Record([&](VkCommandBuffer cmd) {
+        drawn_ = DrawState{};
+        if (d) {
+            Transition(cmd, *d, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            view.depth_view = d->depth_view;
+        }
+        if (t.layout == VK_IMAGE_LAYOUT_GENERAL) {
+            ++g_barriers;
+            VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                                 &b, 0, nullptr, 0, nullptr);
+        }
+        Transition(cmd, t, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        effects_.Record(cmd, e, view);
+        ++g_dispatches;
+        g_.Mark(cmd, kProfEffects);
+    });
+}
+
 void VulkanGsRenderer::TargetRowsFromMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm,
                                             std::uint32_t width, std::uint32_t height, std::uint32_t first_row,
                                             std::uint32_t rows, std::uint32_t first_col, std::uint32_t end_col) {
@@ -1845,6 +1891,7 @@ void VulkanGsRenderer::SetScale(std::uint32_t scale) {
     targets_.clear();
     depths_.clear();
     feedbacks_.clear();
+    effects_.Forget();
     scale_ = scale;
 }
 
@@ -3448,7 +3495,7 @@ std::uint64_t GpuBusyNanoseconds() { return g_gpu_ns.load(); }
 std::string GpuProfileReport() {
     static const char* const kNames[kProfKinds] = {"other", "draws", "swizzle", "image<->linear", "memory copies",
                                                    "feedback copies", "decodes", "uploads", "clears", "DATE",
-                                                   "read-backs"};
+                                                   "read-backs", "effects"};
     std::uint64_t total = 0, ns[kProfKinds];
     for (int i = 0; i < kProfKinds; ++i) total += ns[i] = g_profile_ns[i].exchange(0);
     if (!total) return "";
