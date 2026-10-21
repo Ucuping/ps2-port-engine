@@ -141,8 +141,42 @@ void main() {
     float ao = max(0.0, 1.0 - sum * pc.p[5] * 5.0 / (r6 * float(kSamples)));
     // Faded out with distance, and slightly by the slope's own darkening.
     ao = mix(ao, 1.0, smoothstep(pc.p[6] * 0.6, pc.p[6], z));
-    if (pc.p[7] > 3.5) ao = pc.p[7] > 4.5 ? n.y * 0.5 + 0.5 : n.x * 0.5 + 0.5;    // (p7 4, 5: the normal)
-    else if (pc.p[7] > 2.5) ao = pc.p[8] > 0.5 ? z / 200.0 : screen_radius / 100.0;
+    // Sun shadows (p10 their strength): from the pixel towards the sun (p7-9,
+    // in view space) through the depth buffer, up to p11 metres - anything
+    // on screen nearer than the ray, by less than a thickness, shades it.
+    // Only what faces the sun: the rest is in the game's own shade.
+    // The player's car (p12-14 its centre, p15 its size; 0 none): its own
+    // occlusion at a third, and no sun's shadow.
+    const float on_car = pc.p[15] > 0.0
+        ? 1.0 - smoothstep(0.7 * pc.p[15], pc.p[15], length((c - vec3(pc.p[12], pc.p[13], pc.p[14])) * vec3(1.0, 3.5, 1.0)))
+        : 0.0;
+    ao = mix(ao, 1.0 - (1.0 - ao) * 0.35, on_car);
+    const vec3 sun = vec3(pc.p[7], pc.p[8], pc.p[9]);
+    const float lit = dot(n, sun);
+    if (pc.p[10] > 0.0 && lit > 0.0 && on_car < 0.99) {
+        const int kSteps = 20;
+        const vec3 start = c + n * (0.02 + 0.002 * z);
+        float shade = 0.0;
+        float t = 0.06;
+        const float grow = pow(pc.p[11] / 0.06, 1.0 / float(kSteps));
+        for (int i = 0; i < kSteps; ++i) {
+            const vec3 q = start + sun * t * (1.0 + 0.25 * Noise(vec2(at) + float(i)));
+            t *= grow;
+            if (q.z < 0.3) break;
+            const vec2 qp = ToPixel(q);
+            if (any(lessThan(qp, vec2(pc.rect.xy))) || any(greaterThanEqual(qp, vec2(pc.rect.zw)))) break;
+            const float scene = DepthAt(qp);
+            const float thickness = 0.6 + 0.08 * q.z;
+            if (scene < q.z - 0.02 * q.z - 0.02 && scene > q.z - thickness) {
+                shade = 1.0;
+                break;
+            }
+        }
+        ao *= 1.0 - pc.p[10] * shade * smoothstep(0.0, 0.25, lit) * (1.0 - smoothstep(pc.p[6] * 0.5, pc.p[6], z)) *
+                    (1.0 - on_car);
+    }
+    if (pc.p[20] > 3.5) ao = pc.p[20] > 4.5 ? n.y * 0.5 + 0.5 : n.x * 0.5 + 0.5;    // (p20 4, 5: the normal)
+    else if (pc.p[20] > 2.5) ao = pc.p[21] > 0.5 ? z / 200.0 : screen_radius / 100.0;
     imageStore(dst, at, vec4(ao, z, 0.0, 0.0));
 
 #elif PASS == PASS_AO_BLUR_X || PASS == PASS_AO_BLUR_Y
@@ -187,8 +221,9 @@ void main() {
         }
     const float ao = sum / weight;
     const vec4 c = imageLoad(target, q);
-    // p7: 1 the occlusion alone, 2 the distance (p8 white)
-    const vec3 shown = pc.p[7] > 1.5 && pc.p[7] < 2.5 ? vec3(fract(z / pc.p[8]), min(z / pc.p[8], 1.0), 0.0) : pc.p[7] > 0.5 ? vec3(ao) * 0.5 : c.rgb * ao;
+    // p20: 1 the occlusion alone, 2 the distance (p21 white), 3-5 AO's own (above)
+    const vec3 shown = pc.p[20] > 1.5 && pc.p[20] < 2.5 ? vec3(fract(z / pc.p[21]), min(z / pc.p[21], 1.0), 0.0)
+                     : pc.p[20] > 0.5 ? vec3(ao) * 0.5 : c.rgb * ao;
     imageStore(target, q, vec4(shown, c.a));
 
 #elif PASS == PASS_BLUR
@@ -198,8 +233,7 @@ void main() {
     // matrix), and the picture gathered along that line. Nearer points than
     // the pixel's own take part only as far as they themselves move (no halo
     // of the background over them). The player's car moves with the camera:
-    // within its ellipse (p18, p19 its centre on screen in -1..1, p20 its
-    // radius, as a share of the height) and nearer than p21 it stays sharp.
+    // within a sphere around it (p18-21) it stays sharp.
     // p16 the shutter (a share of a frame), p17 the most a pixel moves, as a
     // share of the view's height.
     const ivec2 q = pc.rect.xy + at;
@@ -214,11 +248,11 @@ void main() {
                            dot(vec4(v, 1.0), vec4(pc.p[12], pc.p[13], pc.p[14], pc.p[15])));
     vec2 motion = prev.z > 0.1 ? pixel - ToPixel(prev) : vec2(0.0);
     const float height = float(pc.rect.w - pc.rect.y);
-    // The car: an ellipse around it, nearer than its far side.
-    const vec2 ndc = (pixel - vec2(pc.rect.xy)) / vec2(pc.rect.zw - pc.rect.xy) * 2.0 - 1.0;
-    const float aspect = float(pc.rect.z - pc.rect.x) / height;
-    const vec2 e = (ndc - vec2(pc.p[18], pc.p[19])) * vec2(aspect, 1.0) / max(pc.p[20], 1e-3);
-    const float car = (1.0 - smoothstep(0.8, 1.15, length(e))) * (1.0 - smoothstep(pc.p[21], pc.p[21] * 1.25, z));
+    // The car: what lies within p21 metres of its centre (p18-20, view
+    // space; p21 0 none) - an ellipsoid, flat, so the road around it blurs.
+    const float car = pc.p[21] > 0.0
+                    ? 1.0 - smoothstep(0.7 * pc.p[21], pc.p[21], length((v - vec3(pc.p[18], pc.p[19], pc.p[20])) * vec3(1.0, 2.2, 1.0)))
+                    : 0.0;
     motion *= pc.p[16] * (1.0 - car);
     const float most = pc.p[17] * height;
     const float len = length(motion);

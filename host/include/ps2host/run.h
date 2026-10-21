@@ -590,6 +590,14 @@ bool FramePacingDefault();
    the background - none made in the middle of a player's first race
    (ps2gpu::SetPipelineHints). Called as the game's overrides register. */
 void SetGpuPipelineHints(const u32* keys, std::size_t count);
+/* A game's tag on the GPU's draws that sample the texture at TBP
+   (ps2gpu::GsDrawState::tag; 0 none): bit 0 a car's paint reflecting a
+   sphere map, its blend's share by a Fresnel term. One texture at a time. */
+void SetGpuDrawTag(u32 tbp, u32 tag);
+/* Small targets at FBP [fbp_begin, fbp_end), at most max_fbw pages wide,
+   drawn at the internal resolution (GsRenderer::SetScaleRule): a game's
+   reflection maps. Applied between frames; an empty range none. */
+void SetGpuScaleRule(u32 fbp_begin, u32 fbp_end, u32 max_fbw);
 void AdvanceClock(u64 ns);
 /* Run the INTC handlers for `cause`, if it is enabled (threads.cpp). */
 void RaiseIntc(u32 cause);

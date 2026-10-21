@@ -131,6 +131,11 @@ struct GsDrawState {
     bool depth = false;
     std::uint32_t zbp = 0, ztst = 1;
     bool depth_write = true;                             /* !ZBUF.ZMSK */
+
+    /* A game's tag on the draw (the bridge's SetGpuDrawTag, by the texture
+       it samples): bit 0 a car's paint sampling a sphere map, its colour
+       scaled by a Fresnel term from the texel's place in the map (gs.frag). */
+    std::uint32_t tag = 0;
 };
 
 /* A texture in GS local memory, and how its texels expand: TEX0's TBP0 (in
@@ -213,6 +218,13 @@ public:
        it. */
     virtual std::uint32_t Scale() const { return 1; }
     virtual void SetScale(std::uint32_t scale) { (void)scale; }
+    /* Targets and depth buffers at FBP (ZBP) [fbp_begin, fbp_end), at most
+       max_fbw pages wide, drawn at the internal resolution too - small ones
+       otherwise stay at the PS2's (a game's reflection maps, sharper). An
+       empty range none. Changing it drops every image, as SetScale. */
+    virtual void SetScaleRule(std::uint32_t fbp_begin, std::uint32_t fbp_end, std::uint32_t max_fbw) {
+        (void)fbp_begin, (void)fbp_end, (void)max_fbw;
+    }
     /* A texture, RGBA in memory (alpha as the GS has it, 0x80 is 1.0), rows
        top-down. Replaces what the key named. */
     virtual void UploadTexture(std::uint64_t key, const std::uint32_t* pixels, std::uint32_t width,

@@ -43,6 +43,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <cmath>
 #include <cstdio>
@@ -81,6 +82,24 @@ std::vector<u32> g_pipeline_hints;      // SetGpuPipelineHints
 }  // namespace
 
 void SetGpuPipelineHints(const u32* keys, std::size_t count) { g_pipeline_hints.assign(keys, keys + count); }
+
+namespace {
+// SetGpuDrawTag's: the textures (TBP) whose draws a game tags, and the tags.
+std::atomic<u32> g_tag_tbp{~0u}, g_tag_bits{0};
+// SetGpuScaleRule's, as asked and as the renderer has it.
+std::atomic<u32> g_rule_begin{0}, g_rule_end{0}, g_rule_fbw{0};
+}  // namespace
+
+void SetGpuDrawTag(u32 tbp, u32 tag) {
+    g_tag_bits = tag;
+    g_tag_tbp = tag ? tbp : ~0u;
+}
+
+void SetGpuScaleRule(u32 fbp_begin, u32 fbp_end, u32 max_fbw) {
+    g_rule_begin = fbp_begin;
+    g_rule_end = fbp_end;
+    g_rule_fbw = max_fbw;
+}
 
 #if PS2HOST_VULKAN
 
@@ -1751,6 +1770,7 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     state.scissor_y1 = scissor_y1;
     state.gouraud = gouraud;
     state.textured = (call.prim >> 4) & 1;
+    if (state.textured && Bits(c.tex0, 0, 14) == g_tag_tbp.load(std::memory_order_relaxed)) state.tag = g_tag_bits;
     state.sprite = type == 6 && s.renderer->Scale() > 1;     // (at 1x it would only split batches)
     state.sprite_prim = type == 6;
     if (s.primary && s.Dumping()) {
@@ -2143,6 +2163,33 @@ void Rescale(Bridge& b, u32 scale) {
     std::fprintf(stderr, "[gpu] internal resolution: %ux\n", unsigned(scale));
 }
 
+/* The game's scale rule changed: as Rescale, the images dropped and back
+   from memory. */
+void RescaleRule(Bridge& b, u32 fbp_begin, u32 fbp_end, u32 max_fbw) {
+    const u32 scale = b.renderer->Scale();
+    for (auto& [key, o] : b.owned)
+        if (o.gpu_newer) WriteBack(b, o);
+    b.renderer->SetScaleRule(fbp_begin, fbp_end, max_fbw);
+    b.renderer->SetScale(scale);
+    for (auto& [key, o] : b.owned) {
+        o.stale = true;
+        o.stale_beyond = false;
+        o.why = 0;
+        o.by16 = false;
+        o.stale_row0 = 0;
+        o.stale_row1 = ~0u;
+        o.stale_pages.set();
+        o.gpu_newer = false;
+        o.dirty_begin = ~0u;
+        o.dirty_end = 0;
+        o.dirty_pages.reset();
+        o.rect_dirty = false;
+        o.checked = 0;
+    }
+    ++b.newer_epoch;
+    ++g_mutations;
+}
+
 void PresentGpuPicture(ps2gpu::Display& display, u64 due_ns) {
     u32 fbp = 0, fbw = 0, psm = 0;
     if (g_bridge && gs::TheGs().Displayed(&fbp, &fbw, &psm)) {
@@ -2271,6 +2318,13 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
             // The internal resolution, between frames (the GS thread's).
             const u32 scale = WantedScale(WindowDisplay());
             if (scale != g_bridge->renderer->Scale()) Rescale(*g_bridge, scale);
+            // The game's scale rule (SetGpuScaleRule), between frames too.
+            static u32 rule[3] = {};
+            const u32 wanted[3] = {g_rule_begin, g_rule_end, g_rule_fbw};
+            if (std::memcmp(rule, wanted, sizeof rule) != 0) {
+                std::memcpy(rule, wanted, sizeof rule);
+                RescaleRule(*g_bridge, rule[0], rule[1], rule[2]);
+            }
             g_present_frame = frame;
             g_present_waits = true;
             if (!g_present_at_blank_end || VirtualClock()) PresentWaiting();

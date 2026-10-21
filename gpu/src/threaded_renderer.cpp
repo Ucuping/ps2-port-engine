@@ -223,6 +223,17 @@ public:
         End();
     }
     bool CanRunEffects() const override { return inner_->CanRunEffects(); }
+    void SetScaleRule(std::uint32_t fbp_begin, std::uint32_t fbp_end, std::uint32_t max_fbw) override {
+        if (fbp_begin == rule_[0] && fbp_end == rule_[1] && max_fbw == rule_[2]) return;
+        rule_[0] = fbp_begin;
+        rule_[1] = fbp_end;
+        rule_[2] = max_fbw;
+        Drain(0);
+        inner_->SetScaleRule(fbp_begin, fbp_end, max_fbw);
+        targets_.clear();                           // (every image dropped)
+        depths_.clear();
+        last_target_ = last_depth_ = ~std::uint64_t(0);
+    }
     void RunEffect(const GsEffect& effect) override {
         Op(kRunEffect, sizeof effect);
         Put(&effect, sizeof effect);
@@ -555,6 +566,7 @@ private:
         "TargetToMemory", "DepthToMemory", "ReadDepth", "ReadTexture", "DisplayTarget", "ReadTarget",
         "ReadTargetFull", "queue full"};
     mutable unsigned drains_[kWhys] = {};
+    std::uint32_t rule_[3] = {};      // SetScaleRule's, as last passed on
     unsigned kicks_ = 0;
     // The caller's side.
     mutable std::vector<std::uint8_t> open_;

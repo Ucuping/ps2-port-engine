@@ -373,6 +373,22 @@ void main() {
         if (p.pabe == 2u && c.a >= 128.0) discard;
     }
 
+    if (((p.blend_ops >> 19) & 1u) != 0u) {
+        // A car's paint taking its reflection from a sphere map (a game's
+        // tag): the map's centre the view straight back, its rim grazing -
+        // N.V = sqrt(1 - r^2) - and a Fresnel term (Schlick's, softened) on
+        // the reflection: dimmer face on, brighter towards the body's edges,
+        // as lacquer. (On the colour, the blend by the paint's alpha as it
+        // was: scaling the share itself needs the target in the shader, a
+        // copy of it for each of the thousands of triangles.) Not to the rim
+        // itself: a warped map is least like the world there.
+        const vec2 st = coordinate.xy / (coordinate.z != 0.0 ? coordinate.z : 1.0) * 2.0 - 1.0;
+        const float r2 = min(dot(st, st), 0.85);
+        const float facing = 1.0 - sqrt(1.0 - r2);
+        const float fresnel = 0.04 + 0.96 * facing * facing * facing;
+        c.rgb = min(c.rgb * (0.7 + 3.0 * fresnel), vec3(255.0));
+    }
+
 #ifdef SHADER_BLEND
     // Cv = ((A - B) * C >> 7) + D, clamped (COLCLAMP), as the software GS.
     vec4 dst = round(texelFetch(destination, ivec2(gl_FragCoord.xy), 0) * 255.0);

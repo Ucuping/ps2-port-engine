@@ -398,7 +398,7 @@ bool SameBatch(const GsDrawState& x, const GsDrawState& y) {
     // Most primitives come with the very state of the one before (the
     // bridge's fast path): the same bytes are the same fields, at once.
     if (std::memcmp(&x, &y, sizeof x) == 0) return true;
-    return x.fbp == y.fbp && x.fbw == y.fbw && x.psm == y.psm && x.fbmsk == y.fbmsk && x.scissor_x0 == y.scissor_x0 &&
+    return x.tag == y.tag && x.fbp == y.fbp && x.fbw == y.fbw && x.psm == y.psm && x.fbmsk == y.fbmsk && x.scissor_x0 == y.scissor_x0 &&
            x.scissor_y0 == y.scissor_y0 && x.scissor_x1 == y.scissor_x1 && x.scissor_y1 == y.scissor_y1 &&
            x.textured == y.textured && (!x.textured || (x.texture == y.texture && x.tfx == y.tfx &&
            x.tcc == y.tcc && x.bilinear == y.bilinear && x.mip == y.mip && x.wms == y.wms && x.wmt == y.wmt && x.minu == y.minu &&
@@ -472,6 +472,7 @@ public:
     bool ReadDepth(std::uint32_t zbp, std::uint32_t width, std::uint32_t height, std::vector<std::uint32_t>* z) override;
     std::uint32_t Scale() const override { return scale_; }
     void SetScale(std::uint32_t scale) override;
+    void SetScaleRule(std::uint32_t fbp_begin, std::uint32_t fbp_end, std::uint32_t max_fbw) override;
     void MemoryWrite(std::uint32_t begin, std::uint32_t end, const std::uint8_t* bytes) override;
     void MemoryRead(std::uint32_t begin, std::uint32_t end, std::uint8_t* bytes) override;
     void MemoryPatch(const std::uint32_t* words, std::size_t count) override;
@@ -615,7 +616,12 @@ private:
        1024x256 over its glow's memory, read as PSMT8H, brought back from
        memory 18 times a splitscreen frame and never drawn into: at 3x its
        reloads were a third of the swizzles. */
-    std::uint32_t ScaleOf(std::uint32_t width) const { return width <= 320 || width >= 1024 ? 1u : scale_; }
+    std::uint32_t ScaleOf(std::uint32_t width, std::uint32_t fbp) const {
+        if (fbp >= rule_begin_ && fbp < rule_end_ && width <= rule_max_fbw_ * 64) return scale_;
+        return width <= 320 || width >= 1024 ? 1u : scale_;
+    }
+    std::uint32_t rule_begin_ = 0, rule_end_ = 0, rule_max_fbw_ = 0;       // SetScaleRule
+    void DropImages();
     Image* open_target_ = nullptr;
     Image* open_depth_ = nullptr;
     void EndPass(VkCommandBuffer cmd, PassEnd why = kEndOther) {
@@ -1863,9 +1869,22 @@ void VulkanGsRenderer::DepthFromMemory(std::uint32_t zbp, std::uint32_t width, s
     });
 }
 
+void VulkanGsRenderer::SetScaleRule(std::uint32_t fbp_begin, std::uint32_t fbp_end, std::uint32_t max_fbw) {
+    if (fbp_begin == rule_begin_ && fbp_end == rule_end_ && max_fbw == rule_max_fbw_) return;
+    DropImages();
+    rule_begin_ = fbp_begin;
+    rule_end_ = fbp_end;
+    rule_max_fbw_ = max_fbw;
+}
+
 void VulkanGsRenderer::SetScale(std::uint32_t scale) {
     scale = std::min(std::max(1u, scale), kMaxScale);
     if (scale == scale_) return;
+    DropImages();
+    scale_ = scale;
+}
+
+void VulkanGsRenderer::DropImages() {
     // Every target, depth buffer and feedback copy goes (the caller has had
     // what the GPU drew written to its local memory first); they come back
     // at the new size, from memory, as they are next asked for. The linear
@@ -1892,7 +1911,6 @@ void VulkanGsRenderer::SetScale(std::uint32_t scale) {
     depths_.clear();
     feedbacks_.clear();
     effects_.Forget();
-    scale_ = scale;
 }
 
 namespace {
@@ -2643,7 +2661,7 @@ Image* VulkanGsRenderer::TargetFor(const GsDrawState& state) {
     MakeImage(t, state.width, state.height,
               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                   VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
-              VK_FORMAT_R8G8B8A8_UNORM, ScaleOf(state.width));
+              VK_FORMAT_R8G8B8A8_UNORM, ScaleOf(state.width, state.fbp));
     // Local memory starts as zeros.
     g_.Record([&](VkCommandBuffer cmd) {
         Transition(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -2662,7 +2680,7 @@ Image* VulkanGsRenderer::DepthFor(std::uint32_t key, std::uint32_t width, std::u
     MakeImage(d, width, height,
               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-              kDepthFormat, ScaleOf(width));
+              kDepthFormat, ScaleOf(width, key & 0xFFFFu));
     // Local memory starts as zeros: the farthest Z.
     g_.Record([&](VkCommandBuffer cmd) {
         Transition(cmd, d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -3111,6 +3129,7 @@ void VulkanGsRenderer::Flush() {
                        std::uint32_t(state_.d) << 6;
     if (state_.textured && t->scale > 1) params.blend_ops |= (t->scale & 0xFFu) << 8;
     if (Is16Bit(state_.psm)) params.blend_ops |= 1u << 16;    // gs.frag: colour cut to five bits a channel
+    if (state_.tag & 1u) params.blend_ops |= 1u << 19;          // gs.frag: the paint's Fresnel term
     params.blend_ops |= std::uint32_t(Blender16(state_)) << 17;     // gs.frag: S for the blender
     const std::uint32_t count = std::uint32_t(pending_.size());
     static int complaints = 0;
