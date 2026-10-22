@@ -4,13 +4,14 @@
  *
  * With the GPU display built in (PS2HOST_VULKAN, engine/gpu) the window is an
  * SDL3 window presenting through Vulkan; without it, or when no Vulkan device
- * can be had, a plain Win32 window drawn with GDI. Both are pumped on the host's
- * thread at each frame (FrameDone).
+ * can be had, a plain Win32 window drawn with GDI on Windows, and elsewhere
+ * an SDL3 window drawing the software GS's picture with SDL's own renderer
+ * (platform/sdl_display.cpp). Each is pumped on the host's thread at each
+ * frame (FrameDone) - the process's first thread, which on Apple's systems
+ * is the only one a window may have.
  */
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "keycodes.h"                   // <windows.h> on Windows
 
 #include <atomic>
 #include <chrono>
@@ -30,6 +31,9 @@
 #include <SDL3/SDL_scancode.h>
 
 #include "ps2gpu/display.h"
+#ifndef _WIN32
+#include "platform/sdl_display.h"
+#endif
 #endif
 
 namespace ps2host {
@@ -38,7 +42,9 @@ std::atomic<std::uint64_t> g_late_pictures{0};    // LatePictures
 
 namespace {
 
+#ifdef _WIN32
 HWND g_window = nullptr;
+#endif
 bool g_closed = false;
 
 #ifdef PS2HOST_VULKAN
@@ -100,6 +106,7 @@ int Scancode(int key) {
 }
 #endif
 
+#ifdef _WIN32
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM w, LPARAM l) {
     switch (message) {
         case WM_CLOSE:
@@ -154,6 +161,7 @@ void PresentGdi() {
                   DIB_RGB_COLORS, SRCCOPY);
     ReleaseDC(g_window, dc);
 }
+#endif  // _WIN32
 
 #ifdef PS2HOST_VULKAN
 /* The "antialiasing" setting as the display takes it: supersampling's
@@ -202,8 +210,18 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
     g_title = narrow;
     std::string error;
     g_display = ps2gpu::CreateVulkanDisplay(narrow.c_str(), width, height, &error);
+    if (g_display) Note("window", "window: Vulkan on " + g_display->Describe());
+#ifndef _WIN32
+    if (!g_display) {
+        const std::string vulkan_error = error;
+        g_display = platform::CreateSdlDisplay(narrow.c_str(), width, height, &error);
+        if (g_display)
+            Note("window", "window: no Vulkan display (" + vulkan_error + "); " + g_display->Describe());
+        else
+            Note("window", "window: none (no Vulkan display: " + vulkan_error + "; no SDL window: " + error + ")");
+    }
+#endif
     if (g_display) {
-        Note("window", "window: Vulkan on " + g_display->Describe());
         g_display->SetKeepRefresh(Setting("frame_rate", "60") == "display");
         if (SettingOn("fullscreen")) g_display->SetFullscreen(true);
         ApplyCursorArt();
@@ -233,23 +251,41 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
         g_display->SetAntiAliasing(DisplayAntiAliasing(Setting("antialiasing", "off")));
         return true;
     }
+#ifdef _WIN32
     Note("window", "window: no Vulkan display (" + error + "); drawing with GDI");
 #endif
+#endif
+#ifdef _WIN32
     return OpenGdiWindow(title, width, height);
+#else
+#ifndef PS2HOST_VULKAN
+    Note("window", "window: none (built without SDL: PS2HOST_VULKAN is off)");
+#endif
+    (void)title, (void)width, (void)height;
+    return false;
+#endif
 }
 
 bool WindowOpen() {
 #ifdef PS2HOST_VULKAN
     if (g_display) return !g_closed;
 #endif
+#ifdef _WIN32
     return g_window != nullptr;
+#else
+    return false;
+#endif
 }
 
 bool WindowFocused() {
 #ifdef PS2HOST_VULKAN
     if (g_display) return g_display->Focused();
 #endif
+#ifdef _WIN32
     return g_window && GetForegroundWindow() == g_window;
+#else
+    return false;
+#endif
 }
 
 bool WindowClosed() { return g_closed; }
@@ -262,7 +298,11 @@ bool HostKeyDown(int key) {
 #ifdef PS2HOST_VULKAN
     if (g_display) return g_display->KeyDown(Scancode(key));
 #endif
+#ifdef _WIN32
     return (GetAsyncKeyState(key) & 0x8000) != 0;
+#else
+    return false;
+#endif
 }
 
 void HostTriggerEffects(const HostTriggerEffect& left, const HostTriggerEffect& right) {
@@ -477,7 +517,9 @@ bool PumpWindow() {
         return !g_closed;
     }
 #endif
+#ifdef _WIN32
     if (g_window) PresentGdi();
+#endif
     return !g_closed;                  // a game's EXIT GAME (QuitGame) with no window too
 }
 
@@ -492,9 +534,14 @@ namespace {
 
 std::vector<std::string> g_overlay_lines;      // SetWindowOverlay's: the panel's, a notice's
 
-// Draws the lines as the window's overlay (none when empty).
+// Draws the lines as the window's overlay (none when empty). Drawn with GDI's
+// text, so on Windows only: elsewhere no overlay - the F1 counter, the F9
+// panel's, a notice - until it has text of its own.
 void DrawOverlay(const std::vector<std::string>& lines) {
-#ifdef PS2HOST_VULKAN
+#if defined(PS2HOST_VULKAN) && !defined(_WIN32)
+    if (g_display) g_display->SetOverlay({}, 0, 0);
+    (void)lines;
+#elif defined(PS2HOST_VULKAN)
     if (!g_display) return;
     if (lines.empty()) {
         g_display->SetOverlay({}, 0, 0);
@@ -679,7 +726,9 @@ void PresentFrame() {
         return;
     }
 #endif
+#ifdef _WIN32
     if (g_window) PresentGdi();
+#endif
 }
 
 }  // namespace ps2host

@@ -212,14 +212,24 @@ void StepPcSetting(int index, int step) {
 
 bool PcMenuOpen() { return g_open || g_releasing; }
 
+// The panel is drawn on the window's overlay, which only Windows draws yet
+// (window.cpp's DrawOverlay): elsewhere it stays shut - open, it would take
+// the game's input with nothing on the screen.
+#ifdef _WIN32
+constexpr bool kPanelShown = true;
+#else
+constexpr bool kPanelShown = false;
+#endif
+
 void OpenPcMenu() {
-    if (g_open) return;
+    if (!kPanelShown || g_open) return;
     g_open = true;
     g_row = 0;
     Draw(true);
 }
 
 void UpdatePcMenu() {
+    if (!kPanelShown) return;
     static std::array<bool, kInputs> before{};
     const std::array<bool, kInputs> now = Held();
     const bool was_open = g_open;

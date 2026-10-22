@@ -111,6 +111,11 @@ if(PS2HOST_VULKAN)
     add_subdirectory(${PS2_ENGINE_DIR}/gpu ${CMAKE_BINARY_DIR}/ps2gpu)
     target_link_libraries(ps2host PUBLIC ps2gpu)
     target_compile_definitions(ps2host PRIVATE PS2HOST_VULKAN=1)
+    if(NOT WIN32)
+        # Where no Vulkan display can be had, a plain SDL window draws the
+        # software GS's picture (src/platform/sdl_display.cpp): GDI's place.
+        target_sources(ps2host PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/platform/sdl_display.cpp)
+    endif()
 endif()
 
 # AVX2: three-operand SIMD for the VU's lanes and the rest (6% of a race).
@@ -226,6 +231,14 @@ target_link_libraries(ps2rt_tests PRIVATE ps2rt)
 add_executable(ps2platform_tests ${CMAKE_CURRENT_LIST_DIR}/tests/platform_tests.cpp)
 target_link_libraries(ps2platform_tests PRIVATE ps2platform)
 target_include_directories(ps2platform_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
+
+# The plain SDL window's tests, where it is built: on SDL's dummy video
+# driver, no screen needed.
+if(PS2HOST_VULKAN AND NOT WIN32)
+    add_executable(ps2host_sdl_tests ${CMAKE_CURRENT_LIST_DIR}/tests/sdl_display_tests.cpp)
+    target_link_libraries(ps2host_sdl_tests PRIVATE ps2host)
+    target_include_directories(ps2host_sdl_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
+endif()
 
 # ps2_add_port(<target>
 #     GENERATED <dir with dispatch.cpp from engine/tools/port.py>
