@@ -199,6 +199,10 @@ std::unordered_map<u32, FunctionEntry> g_overrides;
 bool g_trace = false;
 bool g_all_notes = false;
 std::vector<u32> g_watch;
+bool g_watching = false;        // !g_watch.empty(), for Dispatch's fast path (a vector's load a call)
+// Each call counted (the report's "most called": a scripted run's, or PS2HOST_CALL_COUNTS=1): the count's
+// increment missed the cache a call - at 144 pictures a second a tenth of the EE's time.
+bool g_count_calls = false;
 std::set<std::string> g_noted;
 
 // Calls already made, by address: the function and its call count, so a call
@@ -206,7 +210,7 @@ std::set<std::string> g_noted;
 // of thousands). Cleared when an override replaces a function.
 struct CachedCall {
     u32 address = 0;
-    const FunctionEntry* entry = nullptr;
+    GuestFunction function = nullptr;   // (the entry's own, here: no second load from the table)
     u64* count = nullptr;
 };
 constexpr std::size_t kCallCache = 1u << 14;
@@ -408,12 +412,12 @@ void Note(const std::string& key, const std::string& text) {
 
 void Dispatch(lifted::Context& c, u32 address) {
     CachedCall& line = g_call_cache[(address >> 2) & (kCallCache - 1)];
-    if (line.address == address && line.entry && g_watch.empty()) {
-        ++*line.count;
+    if (line.address == address && line.function && !g_watching) {
+        if (g_count_calls) ++*line.count;
         if (g_trace) std::fprintf(stderr, "[call] %s\n", Describe(address).c_str());
         Frame frame(address);
         try {
-            line.entry->function(c);
+            line.function(c);
         } catch (...) {
             if (RunStats().stopped_in.empty()) {
                 RunStats().stopped_in = CurrentCalls();
@@ -441,8 +445,8 @@ void Dispatch(lifted::Context& c, u32 address) {
     u64& count = RunStats().calls[address];
     if (++count == 1 || g_trace)
         std::fprintf(stderr, "[call] %s\n", Describe(address).c_str());
-    if (cacheable) line = CachedCall{address, entry, &count};
-    if (std::find(g_watch.begin(), g_watch.end(), address) != g_watch.end()) {
+    if (cacheable) line = CachedCall{address, entry->function, &count};
+    if (g_watching && std::find(g_watch.begin(), g_watch.end(), address) != g_watch.end()) {
         std::fprintf(stderr, "[watch] %s a0=%016llX a1=%016llX a2=%016llX a3=%016llX "
                      "f12=%08X f13=%08X ra=%08X s0=%08X s1=%08X sp=%08X gp=%08X t0=%08X\n",
                      Describe(address).c_str(),
@@ -463,7 +467,7 @@ void Dispatch(lifted::Context& c, u32 address) {
         }
         throw;
     }
-    if (std::find(g_watch.begin(), g_watch.end(), address) != g_watch.end())
+    if (g_watching && std::find(g_watch.begin(), g_watch.end(), address) != g_watch.end())
         std::fprintf(stderr, "[watch] %s returned v0=%016llX f0=%08X s0=%08X s1=%08X sp=%08X\n",
                      Describe(address).c_str(), (unsigned long long)c.r[2], c.f[0],
                      unsigned(c.r[16]), unsigned(c.r[17]), unsigned(c.r[29]));
@@ -745,6 +749,8 @@ int Run(const Options& options) {
     if (!options.frames_dir.empty())
         SetFrameDumps(options.frames_dir, options.frames_every, options.frames_limit, u64(options.frames_from));
     g_watch = options.watch;
+    g_watching = !g_watch.empty();
+    g_count_calls = (options.virtual_time && !options.real_time_from) || std::getenv("PS2HOST_CALL_COUNTS") != nullptr;
     InstallDevices();
     InstallIopServers();
     if (!options.gs_inline) StartGsThread();

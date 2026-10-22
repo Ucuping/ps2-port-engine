@@ -598,6 +598,11 @@ void SetGpuDrawTag(u32 tbp, u32 tag);
    the footprint on screen (finer at an internal resolution), trilinear,
    anisotropic - not by the GS's depth-based level (GsDrawState::tag bit 1). */
 void SetGpuModernTextures(bool on);
+/* In real time, the EE asleep until something it waits on may have come - a
+   blank, a timer, an interrupt to deliver, an IOP reply - for a game's wait
+   loop whose turns call a function (Burnout 3's packet wait): its turns
+   then one an event, not thousands. At once in virtual time. */
+void WaitForGuestEvent();
 /* A game's particle textures (TBPs, up to four; none to stop): their draws
    blended and depth tested after a view's effects are soft particles, faded
    near the scene's depth the game's kSceneDepth effect saved (tag bit 2). */

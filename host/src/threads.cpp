@@ -577,6 +577,10 @@ std::unordered_set<u32>& IdleLoops() {
     return loops;
 }
 constexpr s64 kIdleSliceIterations = 256;
+// ...in real time, between its waits: an idle loop runs on only to see what
+// woke it (Burnout 3's packet wait calls a function each turn: at 144
+// pictures a second its 256 turns a wake were a third of the EE's time).
+constexpr s64 kRealtimeIdleSliceIterations = 16;
 
 // lifted::loop_head_hook: a spent budget is either this host's request to
 // deliver interrupts, or the end of the run.
@@ -629,7 +633,7 @@ void LoopHead(lifted::Context& c, u32 address) {
     s.current->delivery_requested = false;
     c.budget = requested ? s.current->saved_budget
              : s.virtual_time ? (idle ? kIdleSliceIterations : kSliceIterations)
-             : realtime_idle ? kIdleSliceIterations : s.loop_budget;
+             : realtime_idle ? kRealtimeIdleSliceIterations : s.loop_budget;
     if (StopRequested()) c.budget = -1;         // the watchdog fired meanwhile
     // In real time the timer may have spent the budget since the blank and
     // timers were looked at: its spend kept (VblankTimer).
@@ -653,6 +657,24 @@ void LoopHead(lifted::Context& c, u32 address) {
 }  // namespace
 
 void AddIdleLoop(u32 address) { IdleLoops().insert(address); }
+
+void WaitForGuestEvent() {
+    Scheduler& s = S();
+    if (!s.realtime || s.in_interrupt || !s.current) return;
+    const auto idle_from = std::chrono::steady_clock::now();
+    for (;;) {
+        u32 seen = g_timer_seq.load(std::memory_order_acquire);
+        if (s.vblank_due || s.timer_due || s.current->delivery_requested || StopRequested() || IopReplyPending())
+            break;
+        WaitOnAddress(&g_timer_seq, &seen, sizeof seen, 2);
+    }
+    g_idle_ns.fetch_add(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - idle_from).count()),
+                        std::memory_order_relaxed);
+    IdleSpan(idle_from);
+    // What woke it, delivered at the loop's next head.
+    if (s.vblank_due || s.timer_due) SpendBudget(s.current->context);
+}
 
 InterruptWait::InterruptWait() { g_interrupt_waits.fetch_add(1, std::memory_order_relaxed); }
 InterruptWait::~InterruptWait() { g_interrupt_waits.fetch_sub(1, std::memory_order_relaxed); }
