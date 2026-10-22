@@ -87,6 +87,16 @@ comparison with a profiled build).
    (the full hash differs: what fast mode gives up, the flags a run ends
    with). `PS2_VU_OLD_MAC_LIVE=1` for the walk as before. With steps 1 and
    3: 60.8 -> 46.0 ms, -24%.
+7. **ITOF four lanes at once** (done). It was a double division a lane and
+   Result's checks - a third of a hot block (program 20's 0x560). cvtdq2ps
+   rounds as the run's control word says (toward zero) as the narrowing
+   did, the scale a power of two (exact, commuting with the rounding), and
+   an integer is never a NaN, an infinity or a denormal. Fast bench 46.6 ->
+   43.5 ms (-6.6%), exact 74.5 -> 70.6, both hashes the same. ABS likewise
+   (CleanLanes, rare here). With the steps before: 60.8 -> 43.5 ms, -28%.
+   Tried, no gain: entry versions carried through blocks of fewer than three
+   pairs (the generic blocks left are entered from the driver - a run's
+   start, MSCNT - 7% of the samples against 28% in versions).
 5. **Superblocks for loops.** A loop body chained into itself (most of the
    hot code) compiled as one function with the loop kept, so the steps above
    hold from one iteration to the next.

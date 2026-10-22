@@ -566,10 +566,23 @@ struct VuCore {
     /* ITOF0/4/12/15 (Shift 0-3), FTOI the same, ABS: into ft (VF0 stays). */
     template <u32 Dest, int Shift>
     static PS2HOST_VU_INLINE void Itof(Vu& v, int ft, int fs) {
+#if PS2RT_VU_SSE
+        // Four lanes at once, as the scalar's rounding has it: cvtdq2ps
+        // rounds as the run's control word says (toward zero, VuRounding) as
+        // the double's narrowing did, and scaling by a power of two is exact
+        // and commutes with it; an integer is never a NaN, an infinity or a
+        // denormal (Result's cases). The scalar way was a double division a
+        // lane - a third of a hot block's time.
+        static constexpr float kInverse[4] = {1.0f, 1.0f / 16.0f, 1.0f / 4096.0f, 1.0f / 32768.0f};
+        const __m128 x = _mm_cvtepi32_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs])));
+        alignas(16) u32 out[4];
+        _mm_store_si128(reinterpret_cast<__m128i*>(out), _mm_castps_si128(_mm_mul_ps(x, _mm_set1_ps(kInverse[Shift]))));
+#else
         static constexpr double kScale[4] = {1.0, 16.0, 4096.0, 32768.0};
         const u32* a = v.regs.vf[fs];
         u32 out[4];
         for (int lane = 0; lane < 4; ++lane) out[lane] = lifted::Result(double(std::int32_t(a[lane])) / kScale[Shift]);
+#endif
         WriteVf<Dest>(v, ft, out);
         Wrote<Dest>(v, ft, true);
     }
@@ -602,9 +615,16 @@ struct VuCore {
     }
     template <u32 Dest>
     static PS2HOST_VU_INLINE void Abs(Vu& v, int ft, int fs) {
+#if PS2RT_VU_SSE
+        alignas(16) u32 out[4];
+        _mm_store_si128(reinterpret_cast<__m128i*>(out),
+                        _mm_and_si128(lifted::CleanLanes(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs]))),
+                                      _mm_set1_epi32(0x7FFFFFFF)));
+#else
         const u32* a = v.regs.vf[fs];
         u32 out[4];
         for (int lane = 0; lane < 4; ++lane) out[lane] = lifted::Clean(a[lane]) & ~lifted::kSign;
+#endif
         WriteVf<Dest>(v, ft, out);
         Wrote<Dest>(v, ft, true);
     }
