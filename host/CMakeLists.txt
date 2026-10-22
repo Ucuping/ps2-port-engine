@@ -192,13 +192,21 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/vu_corpus.cpp
     DEPENDS ${PS2HOST_VURECOMP}
     COMMENT "vurecomp: the VU test corpus")
 add_executable(ps2host_tests ${CMAKE_CURRENT_LIST_DIR}/tests/host_tests.cpp
-                             ${CMAKE_CURRENT_BINARY_DIR}/vu_corpus.cpp)
+                             ${CMAKE_CURRENT_BINARY_DIR}/vu_corpus.cpp
+                             ${PS2_ENGINE_DIR}/runtime/tests/fp_mode_tests.cpp)
 target_link_libraries(ps2host_tests PRIVATE ps2host)
 if(PS2HOST_VULKAN)
     target_compile_definitions(ps2host_tests PRIVATE PS2HOST_VULKAN=1)
 endif()
-# The IOP interpreter's internals, for its instruction tests.
-target_include_directories(ps2host_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
+# The IOP interpreter's internals, for its instruction tests; the runtime's
+# float-mode tests, which run here too.
+target_include_directories(ps2host_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src ${PS2_ENGINE_DIR}/runtime/tests)
+
+# The runtime's own tests, ps2rt alone: what needs no host - its float modes -
+# checked on a platform before the host builds there.
+add_executable(ps2rt_tests ${PS2_ENGINE_DIR}/runtime/tests/runtime_tests.cpp
+                           ${PS2_ENGINE_DIR}/runtime/tests/fp_mode_tests.cpp)
+target_link_libraries(ps2rt_tests PRIVATE ps2rt)
 
 # ps2_add_port(<target>
 #     GENERATED <dir with dispatch.cpp from engine/tools/port.py>

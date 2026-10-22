@@ -31,6 +31,7 @@
 #include "ps2host/vu.h"
 #include "ps2host/vu_core.h"
 #include "ps2rt/generated.h"
+#include "fp_mode_tests.h"
 
 #if PS2HOST_VULKAN
 #include "ps2gpu/gs_renderer.h"
@@ -1822,6 +1823,7 @@ int main() {
     VifRunsMicroprogramsOnAVu();
     MemoryCardKeepsSaves();
     VuLanesAreTheModel();
+    ps2rt_tests::FloatModeTests(Check);
     VuCompiledIsTheInterpreter();
     VuFastIsTheExactButFlags();
     VuTimingIsVisible();
