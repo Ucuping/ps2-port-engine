@@ -1,0 +1,60 @@
+# The Windows build, kept working while this fork moves the engine to other
+# platforms: the runtime, the host, the GPU renderer and their tests, a port
+# linked from a dispatch table of no game (tests/ci), and the toolchain's tests
+# - which on Windows, with MSVC present, include the lifter's compiled checks.
+# MSVC, with AVX2 on and off. No game material is needed or used.
+name: windows
+
+on:
+  push:
+    branches: [macos-arm64]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  msvc:
+    name: MSVC, AVX2 ${{ matrix.avx2 }}
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        avx2: ["ON", "OFF"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
+        with:
+          arch: x64
+
+      - name: Generated sources of a port of no game
+        run: python tests/ci/stub_generated.py build/stub-generated
+
+      - name: Configure the stub port
+        run: |
+          $generated = (Join-Path $env:GITHUB_WORKSPACE 'build/stub-generated') -replace '\\', '/'
+          cmake -S tests/ci/stub_game/port -B build/stub-port -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DPS2HOST_AVX2=${{ matrix.avx2 }}" `
+            "-DPS2_GENERATED_DIR=$generated"
+
+      # A file of compiled VU code takes the compiler 2 GB and more.
+      - name: Build the runtime, the host, the renderer, their tests and the port
+        run: cmake --build build/stub-port -j 3
+
+      - name: Runtime tests
+        run: ./build/stub-port/ps2host/ps2rt_tests.exe
+
+      - name: Host tests (the GPU's skip without a Vulkan device)
+        run: ./build/stub-port/ps2host/ps2host_tests.exe
+
+      - name: Toolchain tests
+        run: python -m unittest discover -s tests -v
