@@ -69,6 +69,8 @@ struct Matrix {
     float m[16];
 };
 std::unordered_map<u32, Matrix> g_last, g_now;      // the transforms after the last two steps
+std::vector<u32> g_known;           // where the last whole read found them (TakeDown)
+unsigned g_steps = 0;
 // What the in-between placing covered: as the step left it, and as placed.
 struct Placed {
     u32 address;
@@ -229,6 +231,21 @@ void TakeDown() {
     }
     g_last.swap(g_now);
     g_now.clear();
+    // The regions read whole every kRescan steps; between, only where a
+    // transform was (Burnout 3's ~850 of 2 MB) - a transform made since is
+    // blended from the next look on, a few steps later.
+    constexpr unsigned kRescan = 4;
+    if (++g_steps % kRescan != 0 && !g_known.empty()) {
+        for (u32 address : g_known) {
+            const u8* p = generated::RamPointer(address, 64);
+            Matrix m;
+            if (!p) continue;
+            std::memcpy(m.m, p, sizeof m.m);
+            if (Shaped(m.m)) g_now.emplace(address, m);
+        }
+        return;
+    }
+    g_known.clear();
     for (const HighFpsRegion& region : g_game.transforms) {
         const u8* base = generated::RamPointer(region.begin, region.end - region.begin);
         if (!base) continue;
@@ -242,6 +259,7 @@ void TakeDown() {
             std::memcpy(m.m, base + at, sizeof m.m);
             if (!Shaped(m.m)) continue;
             g_now.emplace(region.begin + at, m);
+            g_known.push_back(region.begin + at);
             at += 48;                   // (its rows are not another's)
         }
     }
@@ -424,6 +442,7 @@ bool Blend() {
 void Reset() {
     g_last.clear();
     g_now.clear();
+    g_known.clear();
     g_time = 1.0;
     g_behind = 0.0;
     g_counted = false;
