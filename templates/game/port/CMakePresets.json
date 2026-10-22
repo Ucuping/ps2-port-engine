@@ -4,7 +4,7 @@
     {
       "name": "macos-arm64",
       "displayName": "macOS on Apple silicon",
-      "description": "Apple clang and Ninja against the macOS 26.5 SDK, named so xcrun finds it. The SDK and the linker must be a pair: an SDK whose libraries the installed ld cannot read fails every link.",
+      "description": "Apple clang and Ninja against the default macOS SDK, by name (xcrun resolves it), deployment target 26.0. The SDK and the linker must be a pair: an SDK whose libraries the installed ld cannot read fails every link.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/../build/port/cmake-macos-arm64",
       "condition": {
@@ -17,7 +17,7 @@
         "CMAKE_C_COMPILER": "clang",
         "CMAKE_CXX_COMPILER": "clang++",
         "CMAKE_OSX_ARCHITECTURES": "arm64",
-        "CMAKE_OSX_SYSROOT": "macosx26.5",
+        "CMAKE_OSX_SYSROOT": "macosx",
         "CMAKE_OSX_DEPLOYMENT_TARGET": "26.0"
       }
     }
