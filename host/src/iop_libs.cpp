@@ -20,6 +20,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -946,9 +947,45 @@ Outcome SdSetParam(Vm&, Context& c) { S().spu.SetParam(c.r[4] & 0xFFFF, c.r[5] &
 Outcome SdGetParam(Vm&, Context& c) { return Ret(c, S().spu.GetParam(c.r[4] & 0xFFFF)); }
 Outcome SdSetSwitch(Vm&, Context& c) { S().spu.SetSwitch(c.r[4] & 0xFFFF, c.r[5]); return Ret(c, 0); }
 Outcome SdGetSwitch(Vm&, Context& c) { return Ret(c, S().spu.GetSwitch(c.r[4] & 0xFFFF)); }
-Outcome SdSetAddr(Vm&, Context& c) { S().spu.SetAddr(c.r[4] & 0xFFFF, c.r[5]); return Ret(c, 0); }
+// The SPU2's interrupt traffic (SoundIrqTrace): the last 1,024 events, the
+// same one again counted rather than kept.
+struct IrqEvent {
+    u64 us = 0, last_us = 0, repeats = 0;
+    char kind = 0;              // A IRQA set, E interrupts on/off, F fired
+    u32 core = 0, value = 0, by = 0;
+};
+std::array<IrqEvent, 1024> g_irq_events;
+std::size_t g_irq_next = 0;
+
+void NoteIrq(u64 us, char kind, u32 core, u32 value, u32 by) {
+    if (g_irq_next) {
+        IrqEvent& last = g_irq_events[(g_irq_next - 1) % g_irq_events.size()];
+        if (last.kind == kind && last.core == core && last.value == value && last.by == by) {
+            ++last.repeats;
+            last.last_us = us;
+            return;
+        }
+    }
+    g_irq_events[g_irq_next++ % g_irq_events.size()] = IrqEvent{us, 0, 0, kind, core, value, by};
+}
+
+// An address or core attribute set: IRQA or the interrupt's enable noted.
+void NoteSet(u64 us, bool addr, u32 entry, u32 value, u32 by) {
+    if (addr && (entry >> 8) == 0x1F) NoteIrq(us, 'A', entry & 1, value, by);
+    if (!addr && (entry & ~1u) == 0x4) NoteIrq(us, 'E', entry & 1, value, by);
+}
+
+Outcome SdSetAddr(Vm& vm, Context& c) {
+    NoteSet(vm.NowUs(), true, c.r[4] & 0xFFFF, u32(c.r[5]), u32(c.r[31]));
+    S().spu.SetAddr(c.r[4] & 0xFFFF, c.r[5]);
+    return Ret(c, 0);
+}
 Outcome SdGetAddr(Vm&, Context& c) { return Ret(c, S().spu.GetAddr(c.r[4] & 0xFFFF)); }
-Outcome SdSetCoreAttr(Vm&, Context& c) { S().spu.SetCoreAttr(c.r[4] & 0xFFFF, c.r[5] & 0xFFFF); return Ret(c, 0); }
+Outcome SdSetCoreAttr(Vm& vm, Context& c) {
+    NoteSet(vm.NowUs(), false, c.r[4] & 0xFFFF, u32(c.r[5] & 0xFFFF), u32(c.r[31]));
+    S().spu.SetCoreAttr(c.r[4] & 0xFFFF, c.r[5] & 0xFFFF);
+    return Ret(c, 0);
+}
 Outcome SdGetCoreAttr(Vm&, Context& c) { return Ret(c, S().spu.GetCoreAttr(c.r[4] & 0xFFFF)); }
 
 // Pitch: 0x1000 plays a sample at its recorded rate; a semitone is 2^(1/12).
@@ -968,8 +1005,12 @@ Outcome SdPitch2Note(Vm&, Context& c) {
     return Ret(c, u32((note << 8) | (fine & 0xFF)));
 }
 
+u64 g_batch_us = 0;
+u32 g_batch_by = 0;
+
 u32 Batch(u32 func, u32 entry, u32 value) {
     Spu2& s = S().spu;
+    if (func == 0x03 || func == 0x04) NoteSet(g_batch_us, func == 0x03, entry, func == 0x04 ? value & 0xFFFF : value, g_batch_by);
     switch (func) {
         case 0x01: s.SetParam(entry, value & 0xFFFF); return 0;
         case 0x02: s.SetSwitch(entry, value); return 0;
@@ -985,6 +1026,8 @@ u32 Batch(u32 func, u32 entry, u32 value) {
 
 Outcome SdProcBatch(Vm& vm, Context& c) {
     const u32 batch = A(vm, c, 0), rets = A(vm, c, 1), count = A(vm, c, 2);
+    g_batch_us = vm.NowUs();
+    g_batch_by = u32(c.r[31]);
     for (u32 i = 0; i < count; ++i) {
         const u32 head = vm.Read(batch + 8 * i, 4), value = vm.Read(batch + 8 * i + 4, 4);
         const u32 result = Batch(head & 0xFFFF, head >> 16, value);
@@ -995,6 +1038,8 @@ Outcome SdProcBatch(Vm& vm, Context& c) {
 
 Outcome SdProcBatchEx(Vm& vm, Context& c) {
     const u32 batch = A(vm, c, 0), rets = A(vm, c, 1), count = A(vm, c, 2), voices = A(vm, c, 3);
+    g_batch_us = vm.NowUs();
+    g_batch_by = u32(c.r[31]);
     u32 done = 0;
     for (u32 i = 0; i < count; ++i) {
         const u32 head = vm.Read(batch + 8 * i, 4), value = vm.Read(batch + 8 * i + 4, 4);
@@ -1286,6 +1331,7 @@ bool SoundInterrupts(Vm& vm, bool idle) {
     // The SPU2's own interrupt: playback (or a transfer) reached IRQA.
     Timed timed(Section::Spu2);
     s.spu.Advance(to, [&](u32 core) {
+        NoteIrq(vm.NowUs(), 'F', core, s.spu.GetAddr((0x1Fu << 8) | core), s.spu2.function ? s.spu2.function : s.irq_callback);
         if (s.spu2.function) vm.Call(s.spu2.function, {1u << core, s.spu2.arg});
         else if (s.irq_callback) vm.Call(s.irq_callback, {0});
     }, [&](u32 core) {
@@ -1334,6 +1380,25 @@ std::string Format(Vm& vm, u32 format, const std::function<u32()>& next) {
             default: std::snprintf(buffer, sizeof buffer, "%%%c", conversion); break;
         }
         out += buffer;
+    }
+    return out;
+}
+
+std::string SoundIrqTrace() {
+    std::string out = "  the SPU2's interrupts (us; A IRQA set, E on/off, F fired - by the caller, or the handler):\n";
+    char line[160];
+    for (std::size_t k = 0; k < g_irq_events.size(); ++k) {
+        const IrqEvent& e = g_irq_events[(g_irq_next + k) % g_irq_events.size()];
+        if (!e.kind) continue;
+        std::snprintf(line, sizeof line, "  %12llu %c core %u 0x%05X by 0x%08X", static_cast<unsigned long long>(e.us),
+                      e.kind, unsigned(e.core), unsigned(e.value), unsigned(e.by));
+        out += line;
+        if (e.repeats) {
+            std::snprintf(line, sizeof line, "  (and %llu times more, to %llu)", static_cast<unsigned long long>(e.repeats),
+                          static_cast<unsigned long long>(e.last_us));
+            out += line;
+        }
+        out += "\n";
     }
     return out;
 }

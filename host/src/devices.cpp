@@ -535,6 +535,8 @@ std::atomic<bool> g_capture_request{false};
 long long g_capture_frame = -1;
 std::string g_capture_dir;
 
+void (*g_capture_hook)(const std::string&) = nullptr;
+
 void StartCapture(u64 frame) {
     namespace fs = std::filesystem;
     fs::path base = SettingsPath().empty() ? fs::path("captures") : fs::path(SettingsPath()).parent_path() / "captures";
@@ -570,6 +572,7 @@ void StartCapture(u64 frame) {
     }
     std::fprintf(stderr, "[capture] frame %llu to %s\n", static_cast<unsigned long long>(frame + 1),
                  g_capture_dir.c_str());
+    if (g_capture_hook) g_capture_hook(g_capture_dir);
 }
 
 void FinishCapture(u64 frame) {
@@ -603,6 +606,8 @@ void FinishCapture(u64 frame) {
 }
 
 void RequestCapture() { g_capture_request = true; }
+
+void SetCaptureHook(void (*hook)(const std::string& dir)) { g_capture_hook = hook; }
 
 void FrameDone(u64 frame) {
     FrameTimes(frame);

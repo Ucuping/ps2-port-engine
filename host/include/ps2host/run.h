@@ -189,6 +189,9 @@ bool GpuPrimary();
 void GpuSetScale(u32 scale);
 /* F12 or L3+R3 (the window's): capture the next frame. */
 void RequestCapture();
+/* A port's own at each capture, given its folder (Burnout 3: the threads,
+   its sound's last words and both memories - a hang looked into). */
+void SetCaptureHook(void (*hook)(const std::string& dir));
 std::string GpuShadowSummary();
 /* --until-frame: stop the run when frame N is done (with --virtual-time, the
    same point every time). */

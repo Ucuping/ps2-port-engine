@@ -75,6 +75,11 @@ void SetPcmInputVolume(std::uint32_t core, std::uint32_t percent);
 /* For the report: one line per IOP thread. */
 std::string Report();
 
+/* The SPU2's interrupts as the IOP's code set them up and they fired, the
+   last of them (IRQA set, interrupts on or off, an interrupt and the handler
+   it went to), a line each - for a stream that stopped asking for data. */
+std::string SoundIrqTrace();
+
 }  // namespace iop
 }  // namespace ps2host
 
