@@ -20,7 +20,9 @@
 
 #include <algorithm>
 #include <cstring>
+#if defined(__SSE2__) || defined(_M_X64)
 #include <emmintrin.h>
+#endif
 #if defined(__SSE4_1__) || defined(__AVX2__)
 #include <smmintrin.h>
 #endif
@@ -310,6 +312,7 @@ void StoreRun(u8* bytes, const PageTable& t, u32 bp, u32 bw, u32 x, u32 y, const
             }
         }
 #endif
+#if defined(__SSE2__) || defined(_M_X64)
         if constexpr (Psm == PSMCT32 || Psm == PSMZ32) {
             // Eight at a time where they lie as pairs (PageTable::pairs): two
             // loads and four stores, not eight of each and the offsets.
@@ -326,6 +329,9 @@ void StoreRun(u8* bytes, const PageTable& t, u32 bp, u32 bw, u32 x, u32 y, const
                 }
             }
         }
+#endif
+        // Without SSE2 (arm64) every pixel takes this, the reference the
+        // paths above are tested against. TODO(neon): the same runs in NEON.
         for (; k < in_page; ++k, ++wx)
             Store<Psm>(bytes, row[wx], page, values[i + k]);
         i += in_page;
