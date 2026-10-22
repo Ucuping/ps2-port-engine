@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -98,6 +99,24 @@ constexpr double kStepRate = 1e6 / 16683.0;    // the blanks' own, 59.94 (thread
 // up).
 double g_cap = 0.0;
 int g_sampled = 0;                      // frames since the last look
+
+/* Into a rate above the game's own, the rate rises to it over a moment
+   (PS2HOST_HIGH_FPS_RAMP ms, 600 by default; 0: at once): a laptop's GPU
+   idles clocked down through the loading and the 60-a-second screens
+   before a race (an RTX 4070 Laptop at 600-900 MHz, its memory at 810),
+   and at once at 144 it took half a second to clock up, the race's first
+   dozen pictures shown late. Rising, its load rises with the rate and its
+   clocks with it. */
+double g_target = 0.0;                  // the rate risen to (0: not rising)
+std::chrono::steady_clock::time_point g_rise_from;
+
+double RiseMs() {
+    static const double ms = [] {
+        const char* e = std::getenv("PS2HOST_HIGH_FPS_RAMP");
+        return e ? std::max(0.0, std::atof(e)) : 600.0;
+    }();
+    return VirtualClock() ? 0.0 : ms;   // (a GPU's clocks are real time's: a scripted run's pictures as ever)
+}
 int g_looks = 0;                        // looks since the rate changed
 u64 g_late_seen = 0;                    // LatePictures at the last look
 
@@ -541,6 +560,21 @@ void HighFpsStepped() {
     if (g_rate > 0.0) TakeDown();
 }
 
+/* Rising (g_target): the rate for the time since it began, in eighths of
+   the way from the game's own (a blank rate set each eighth, not each
+   picture); the target once the time is up. */
+void Rise() {
+    if (g_target <= 0.0 || g_rate <= 0.0) return;
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_rise_from).count();
+    const double part = RiseMs() > 0.0 ? std::min(1.0, std::floor(8.0 * ms / RiseMs() + 1.0) / 8.0) : 1.0;
+    const double rate = part >= 1.0 ? g_target : Own() + (g_target - Own()) * part;
+    if (rate > g_rate + 0.5) {
+        g_rate = rate;
+        g_per_picture = Pace(rate);
+    }
+    if (part >= 1.0) g_target = 0.0;
+}
+
 void HighFpsPicture() {
     // Down to 60 only once the game has not run for a moment (`settle`
     // calls): a change drains the GS thread - a hitch.
@@ -548,7 +582,7 @@ void HighFpsPicture() {
     const bool running = Running();
     if (!running) g_cap = 0.0;          // (the next run tries the setting's rate again)
     const double want = running ? Wanted() : Own();
-    const double now = g_rate > 0.0 ? g_rate : Own();
+    const double now = g_target > 0.0 ? g_target : g_rate > 0.0 ? g_rate : Own();
     differing = std::fabs(want - now) >= 0.5 ? differing + 1 : 0;
     if (differing >= (want > Own() ? 1 : g_game.settle)) {
         differing = 0;
@@ -558,15 +592,21 @@ void HighFpsPicture() {
         g_sampled = 0;
         g_looks = 0;
         if (want > Own()) {
-            g_rate = want;
-            g_per_picture = Pace(want);
+            // From the game's own rate: rising to it (Rise).
+            const bool rising = g_rate <= 0.0 && RiseMs() > 0.0;
+            g_target = rising ? want : 0.0;
+            g_rise_from = std::chrono::steady_clock::now();
+            g_rate = rising ? Own() + (want - Own()) / 8.0 : want;
+            g_per_picture = Pace(g_rate);
         } else {
+            g_target = 0.0;
             g_rate = 0.0;
             g_per_picture = 1.0;
             SetBlankRate(0.0);
             SetFastForward(1);
         }
     }
+    Rise();
     if (g_rate > 0.0 && Blend()) {
         PutBack();
         PlaceBetween(g_picture_time);
@@ -599,6 +639,7 @@ void HighFpsLeave(const char* why) {
     if (g_rate <= 0.0) return;
     std::fprintf(stderr, "[high fps] %.0f pictures a second (%s)\n", Own(), why);
     g_cap = 0.0;
+    g_target = 0.0;
     g_placed.clear();
     for (CameraValues& v : g_cameras) v.placing = false;
     g_rate = 0.0;
