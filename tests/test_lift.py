@@ -236,6 +236,24 @@ def programs():
         cop2 | (2 << 21) | (V1 << 16) | (2 << 11),                   # cfc2 $v1, vi2
         JR_RA, cop2 | (1 << 21) | (T2 << 16) | (9 << 11),            # qmfc2 $t2, vf9
     ])
+    # Its join is reached from inside a branch whose delay slot changes the
+    # test's register - kept as `{ ...t...; slot; if (t)` - and from the other
+    # arm of the branch around it, by a goto into that block: legal C++ only if
+    # the goto passes no initialisation.
+    start = at
+    add("goto_into_branch", [
+        branch(0x05, A0, ZERO, start, start + 0x10),             # bne $a0, $zero, inner
+        NOP,
+        branch(0x04, ZERO, ZERO, start + 0x08, start + 0x18),    # b join
+        addiu(V0, ZERO, 7),
+        branch(0x05, A1, ZERO, start + 0x10, start + 0x38),      # inner: bne $a1, $zero, other
+        addiu(A1, A1, 1),                                         # (changes $a1)
+        addiu(V0, A1, 2),                                         # join
+        branch(0x04, V0, ZERO, start + 0x1C, start + 0x2C),      # beq $v0, $zero, nine
+        NOP, JR_RA, NOP,
+        addiu(V0, ZERO, 9), JR_RA, NOP,                           # nine
+        addiu(V0, ZERO, 5), JR_RA, NOP,                           # other
+    ])
     return out
 
 
@@ -348,6 +366,9 @@ class TestLift(unittest.TestCase):
     def test_vu0_macro_mode(self):
         self.check("vu0")
 
+    def test_a_goto_into_a_branch_with_its_test_kept(self):
+        self.check("goto_into_branch")
+
     def test_break_abandons_the_run(self):
         start, _body = self.programs["trap"]
         self.assertEqual(self.lifted.run(start, liftcheck.entry_context(())), "trap")
@@ -385,7 +406,8 @@ class TestStructured(TestLift):
         cls.lifted = liftcheck.LiftedFunctions(liftcheck.build([source], work), cls.machine)
 
     def test_the_programs_are_structured(self):
-        self.assertTrue({"count_bits", "likely", "caller", "arithmetic", "float"} <= self.structured)
+        self.assertTrue({"count_bits", "likely", "caller", "arithmetic", "float",
+                         "goto_into_branch"} <= self.structured)
 
 
 class TestLiftRefusals(unittest.TestCase):
