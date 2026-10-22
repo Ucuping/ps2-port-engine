@@ -2,7 +2,10 @@
 # dispatch table and drives this file. (From engine/templates/game.)
 
 cmake_minimum_required(VERSION 3.20)
-project(@TARGET@_port LANGUAGES CXX RC)     # RC: the icon and version
+project(@TARGET@_port LANGUAGES CXX)
+if(WIN32)
+    enable_language(RC)     # the icon and version (engine/host/CMakeLists.txt)
+endif()
 
 set(PS2_GENERATED_DIR "" CACHE PATH "dispatch.cpp, from engine/tools/port.py")
 

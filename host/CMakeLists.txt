@@ -244,7 +244,9 @@ function(ps2_add_port target)
                                                      PS2HOST_GAME_TITLE="${game_title}"
                                                      PS2HOST_GAME_VERSION="${game_version}"
                                                      PS2HOST_GAME_EXECUTABLE="${game_executable}")
-        target_link_libraries(${target} PRIVATE comdlg32)
+        if(WIN32)
+            target_link_libraries(${target} PRIVATE comdlg32)   # the disc picker (main.cpp)
+        endif()
         set(icon ${game_dir}/build/port/icon.ico)
         if(NOT EXISTS ${icon})
             set(icon ${game_dir}/port/icon.ico)
