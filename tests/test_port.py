@@ -147,6 +147,19 @@ class TestDiscovered(unittest.TestCase):
         self.assertIn("0x00120010 (from 0x00120010): no section", said.getvalue())
         self.assertIn("0x00130000 (from 0x00130000): no section", said.getvalue())
 
+    def test_a_section_with_no_bytes_laid_over_another_is_not_it(self):
+        # Tekken 5's .dmh (no bytes in the file) spans its .y4.
+        elf = ElfFile(tiny_elf([
+            (".text", 0x00100000, returns_a0_plus(1), SHF_ALLOC | SHF_EXECINSTR, SHT_PROGBITS),
+            (".dmh", 0x00488000, bytes(0x01000000), SHF_ALLOC | SHF_WRITE, SHT_NOBITS),
+            (".y4", 0x00D05700, bytes(0x10) + returns_a0_plus(7), SHF_ALLOC | SHF_EXECINSTR, SHT_PROGBITS),
+        ]))
+        self.assertEqual(port.section_with_bytes(elf, 0x00D05710).name, ".y4")
+        self.assertIsNone(port.section_with_bytes(elf, 0x00500000))
+        found = port.discovered_functions(types.SimpleNamespace(load_elf=lambda: elf), "",
+                                          {(0x00D05710, 0x00D05710)})
+        self.assertIn("+ 0x7u", found[0x00D05710][1])
+
     def test_the_code_section_as_before(self):
         elf = tiny_elf([(".text", 0x00100000, bytes(0x20) + returns_a0_plus(3) + bytes(0x10),
                          SHF_ALLOC | SHF_EXECINSTR, SHT_PROGBITS)])

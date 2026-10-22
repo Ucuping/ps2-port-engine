@@ -179,6 +179,13 @@ def discovered_pairs(path: str) -> set:
                 (line.split() for line in handle if line.strip())}
 
 
+def section_with_bytes(elf, address: int):
+    """The allocated section whose bytes in the file hold `address`, or None -
+    never a section with none laid over it (Tekken 5's .dmh spans its .y4)."""
+    return next((s for s in elf.sections if s.is_alloc and s.size and s.occupies_file
+                 and s.addr <= address < s.end_addr), None)
+
+
 def discovered_functions(game, path: str, pairs=None) -> dict:
     """{run address: (source, C++)} for the code runs found copied at run time,
     translated at their run addresses from the executable's bytes - from whichever
@@ -193,7 +200,7 @@ def discovered_functions(game, path: str, pairs=None) -> dict:
     loaded = [s for s in elf.sections if s.is_alloc and s.size and s.occupies_file]
     found = {}
     for run, source in sorted(pairs):
-        section = next((s for s in loaded if s.addr <= source < s.end_addr), None)
+        section = section_with_bytes(elf, source)
         if section is None:
             print("  cannot translate the code at 0x%08X (from 0x%08X): no section of the "
                   "executable holds it" % (run, source))
@@ -244,7 +251,7 @@ def generate(game) -> str:
     elf = game.load_elf() if discovered else None
     where = {}
     for run, (source, text) in sorted(discovered.items()):
-        section = elf.section_at(source)
+        section = section_with_bytes(elf, source)
         where[run] = section.name if section is not None else "?"
         if source == run:
             copies += ["/* 0x%08X: reached at run time, in %s; no function in the analysis "
