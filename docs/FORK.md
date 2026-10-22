@@ -27,7 +27,8 @@ symbols or libraries.
 
 ## Fixes and additions meant for upstream
 
-None of these changes what the Windows build does; the Windows CI
+None of these changes what the Windows build does but one, made on purpose
+(the float control register kept per fiber, below); the Windows CI
 (`.github/workflows/windows.yml`: MSVC, AVX2 on and off, a port linked from a
 stub dispatch table, every test) checks that it still builds and passes.
 
@@ -65,6 +66,14 @@ stub dispatch table, every test) checks that it still builds and passes.
   (`bool t; t = C;`): a goto into the block may pass that in standard C++,
   where `const bool t = C` - which MSVC accepts and clang refuses - it may
   not.
+- A platform layer, `host/src/platform` (library `ps2platform`, tests
+  `ps2platform_tests`): fibers, waits, sleeps, thread priorities, guarded
+  reads and the crash report behind one face - Windows' calls as before,
+  Apple's (macOS, iOS) beside them - and `threads.cpp` on it. On Apple's
+  arm64 the fibers are a switch of our own with stacks mapped under a guard
+  of max(16 KB, a page). The float control register goes with each fiber
+  on Windows as on arm64: Windows' fibers were made without
+  `FIBER_FLAG_FLOAT_SWITCH`, and the layer saves and restores it itself.
 
 Found and not yet changed, with the evidence in the Tekken 5 repository's
 `games/tekken5/docs/FINDINGS.md` ("Engine findings worth upstreaming"): a call
