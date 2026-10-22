@@ -75,6 +75,26 @@ stub dispatch table, every test) checks that it still builds and passes.
   `FIBER_FLAG_FLOAT_SWITCH` - were seen in CI to keep MXCSR per fiber
   already (the platform tests print it); the layer saves and restores the
   register itself rather than lean on that, so arm64 does the same.
+- `tools/toolchain.py`: where CMake, Ninja and the compiler come from, how a
+  port's build is configured and run, and what its executable is called.
+  Windows keeps what `port.py` did - Visual Studio's CMake and Ninja under
+  `vcvars64.bat` in `cmd`, clang-cl or MSVC, `<name>.exe`; macOS builds
+  through the port's `macos-arm64` preset into
+  `build/port/cmake-macos-arm64`, a plain executable `<name>` (no app bundle
+  yet). `port.py`, `regress.py` and `bisect_lifted.py` find the executable
+  through it, and the CI builds its stub port with it. `pgo` and `--sse4`
+  stay Windows' (x86, clang-cl).
+- The host builds and runs outside Windows. The executable's path and the
+  process's processors are the platform layer's; keys are named by
+  Windows' virtual-key numbers everywhere (`host/src/keycodes.h`); where no
+  Vulkan display opens, a plain SDL window takes GDI's place
+  (`host/src/platform/sdl_display.cpp`, SDL's 2D renderer; tests
+  `ps2host_sdl_tests`), reading gamepads as the Vulkan display does
+  (`gpu/include/ps2gpu/sdl_pad.h`). The overlay - the F1 counter, the F9
+  panel - is drawn with GDI, so it is Windows' alone. There is no audio
+  device yet: a run is silent, and `--audio-wav` records. `main.cpp`'s
+  Windows calls sit behind `_WIN32`; elsewhere there is no disc dialog yet
+  (`--disc`, or the image beside the executable).
 
 Found and not yet changed, with the evidence in the Tekken 5 repository's
 `games/tekken5/docs/FINDINGS.md` ("Engine findings worth upstreaming"): a call
@@ -83,4 +103,5 @@ outside the code section are invisible to the analysis; only the first
 executable section is analysed; four faults of the C++ rendering, which the
 compiled check catches and drops; `callers_known` holds for an executable
 whose own modules, loaded at run time, call it, until they are listed as
-overlays.
+overlays; code copied at run time is looked for only in the executable's
+first loaded segment, and translated only from its first executable section.
