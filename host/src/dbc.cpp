@@ -35,9 +35,7 @@
  * profile FF FF FF FF 00.
  */
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "keycodes.h"                   // the keys by Windows' numbers, everywhere
 
 #include <algorithm>
 #include <cctype>
