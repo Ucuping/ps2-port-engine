@@ -69,8 +69,13 @@ comparison with a profiled build).
    131 (the build ~2 -> ~4 minutes). Bench: fast 58.7 -> 54.2 ms (-8%),
    exact 81.1 -> 74.2 ms (-8.5%), hashes the same; with step 1, the
    explosion's VU1 time -11%.
-4. **Clean operands across an edge.** Fields an FMAC left clean before the
-   edge need no clamp after it.
+   Versions are told only the fields the block's first three pairs read
+   (Chain.used): the same code, 115 generated files instead of 131.
+4. **Clean operands across an edge** (tried, dropped). Versions that also
+   knew the fields an FMAC left clean before the exit, their clamps left
+   out: more versions (221-256 files), and slower - fast bench 53.8 ->
+   56.6-58.7 ms at 6 or 16 versions a block. The code's size costs more
+   than the clamps.
 5. **Superblocks for loops.** A loop body chained into itself (most of the
    hot code) compiled as one function with the loop kept, so the steps above
    hold from one iteration to the next.

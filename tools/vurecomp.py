@@ -621,8 +621,10 @@ def leave_to(pc: int, chain, recent: dict = None) -> str:
 
 # The entry versions a block may have (Chain.version), past which the run
 # goes on into the block as it is.
-MAX_VERSIONS = 6
-# PS2_VU_NO_VERSIONS=1: none (to compare).
+MAX_VERSIONS = int(os.environ.get("PS2_VU_MAX_VERSIONS", "6"))
+# PS2_VU_NO_VERSIONS=1: none (to compare). Versions that also knew the
+# fields left clean at the exit (their clamps left out) were slower: more
+# code (fast bench 53.8 -> 56.6-58.7 ms, at 6 or 16 versions a block).
 VERSIONS = os.environ.get("PS2_VU_NO_VERSIONS", "") != "1"
 
 
@@ -634,10 +636,28 @@ class Chain:
     known, its stall checks on anything else left out (needless_wait).
     `wanted`: (pc, recent, name) still to be written."""
 
-    def __init__(self, names: dict):
+    def __init__(self, names: dict, blocks: dict = None, pairs: dict = None):
         self.names = names
+        self.blocks = blocks or {}          # start -> the block's pcs
+        self.pairs = pairs or {}
         self.versions = {}
         self.wanted = []
+        self.uses = {}
+
+    def used(self, pc: int) -> set:
+        """The fields the first three pairs of the block at `pc` read: the
+        only stall checks `recent` can leave out (needless_wait) - so its
+        versions differ only where the code would."""
+        if pc not in self.uses:
+            stalls = set()
+            for at in self.blocks.get(pc, [])[:3]:
+                lower, upper = self.pairs[at]
+                for r, lanes in upper_reads(upper) + ([] if upper & 0x80000000 else lower_reads(lower)):
+                    for lane in range(4):
+                        if lanes & (8 >> lane):
+                            stalls.add((r, lane))
+            self.uses[pc] = stalls
+        return self.uses[pc]
 
     def __contains__(self, pc) -> bool:
         return pc in self.names
@@ -648,6 +668,9 @@ class Chain:
     def version(self, pc: int, recent: dict) -> str:
         if recent is None or not VERSIONS:
             return self.names[pc]
+        if self.blocks:
+            stalls = self.used(pc)
+            recent = {k: d for k, d in recent.items() if k in stalls}
         key = (pc, frozenset(recent.items()))
         if key not in self.versions:
             count = sum(1 for k in self.versions if k[0] == pc)
@@ -1212,7 +1235,7 @@ def generate_files(programs: list, what: str, single: str = None) -> dict:
         for block in blocks:
             names.append((block[0], "%sBlock%04X" % (name, block[0])))
         for variant, dropped in [("", frozenset())] + ([("Fast", drops)] if fast else []):
-            chain = Chain({b[0]: "%sBlock%04X%s" % (name, b[0], variant) for b in blocks})
+            chain = Chain({b[0]: "%sBlock%04X%s" % (name, b[0], variant) for b in blocks}, by_start, pairs)
             work = [(b[0], None, chain[b[0]]) for b in blocks]
             while work:
                 start, entry, block_name = work.pop(0)
