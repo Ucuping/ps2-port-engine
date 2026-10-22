@@ -95,6 +95,16 @@ stub dispatch table, every test) checks that it still builds and passes.
   device yet: a run is silent, and `--audio-wav` records. `main.cpp`'s
   Windows calls sit behind `_WIN32`; elsewhere there is no disc dialog yet
   (`--disc`, or the image beside the executable).
+- Code met at run time is looked for in every segment the executable loaded,
+  not only the first, and `port.py` translates it from the section that holds
+  its source: Tekken 5 keeps kernel extensions in `.data` and its loader in
+  a second code section (`.y4`). Each such translation is marked NOT
+  VERIFIED with its section, and the build counts them apart, by section.
+  `LoadExecutable` (`run.h`) loads an executable from bytes, for the host's
+  tests.
+- The ELF loader zeroes every segment's memory first and copies every
+  segment's bytes after: a segment with no bytes in the file laid over
+  another (Tekken 5's `.dmh` over its `.y4`) no longer erases it.
 
 Found and not yet changed, with the evidence in the Tekken 5 repository's
 `games/tekken5/docs/FINDINGS.md` ("Engine findings worth upstreaming"): a call
@@ -103,5 +113,6 @@ outside the code section are invisible to the analysis; only the first
 executable section is analysed; four faults of the C++ rendering, which the
 compiled check catches and drops; `callers_known` holds for an executable
 whose own modules, loaded at run time, call it, until they are listed as
-overlays; code copied at run time is looked for only in the executable's
-first loaded segment, and translated only from its first executable section.
+overlays; a store made in kernel mode and ended by `eret` has no
+translation (Tekken 5 overrides its one; if another game has the same form,
+the lifter should learn it).
