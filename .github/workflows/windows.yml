@@ -44,17 +44,16 @@ jobs:
       - name: Generated sources of a port of no game
         run: python engine/tests/ci/stub_generated.py build/stub-generated
 
-      - name: Configure the stub port
-        run: |
-          $generated = (Join-Path $env:GITHUB_WORKSPACE 'build/stub-generated') -replace '\\', '/'
-          cmake -S engine/tests/ci/stub_game/port -B build/stub-port -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
-            "-DPS2HOST_AVX2=${{ matrix.avx2 }}" `
-            "-DPS2_GENERATED_DIR=$generated"
-
-      # A file of compiled VU code takes the compiler 2 GB and more.
+      # Built as port.py builds a game's port (engine/tools/toolchain.py):
+      # Visual Studio's CMake and Ninja under vcvars - with MSVC's own
+      # compiler here (PS2_COMPILER), not clang-cl - so that path is checked
+      # too. A file of compiled VU code takes the compiler 2 GB and more.
       - name: Build the runtime, the host, the renderer, their tests and the port
-        run: cmake --build build/stub-port -j 3
+        env:
+          PS2_COMPILER: msvc
+        run: >-
+          python engine/tools/toolchain.py build engine/tests/ci/stub_game/port
+          build/stub-port build/stub-generated --avx2 ${{ matrix.avx2 }} --jobs 3
 
       - name: Runtime tests
         run: ./build/stub-port/ps2host/ps2rt_tests.exe

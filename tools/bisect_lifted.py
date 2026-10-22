@@ -36,8 +36,9 @@ import time
 import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(HERE))
+sys.path[:0] = [HERE, os.path.dirname(HERE)]
 from ps2decomp import game as game_config  # noqa: E402
+import toolchain  # noqa: E402
 
 FUNC = re.compile(r"^void F_([0-9A-F]{8})\(lifted::Context& c\) \{$")
 
@@ -108,8 +109,7 @@ class Renderer:
         if "built" not in built.stdout:
             raise SystemExit("the port did not build:\n" + built.stdout[-3000:] + built.stderr[-3000:])
         frames = tempfile.mkdtemp(prefix="bisect_")
-        exe = self.game.path(os.path.join(self.game.build, "port", "cmake",
-                                          os.path.basename(os.path.normpath(self.game.directory)) + ".exe"))
+        exe = toolchain.port_executable(self.game)
         command = [exe, self.game.path(os.path.join(self.game.extracted, self.game.executable))]
         if self.game.iso and os.path.exists(self.game.path(self.game.iso)):
             command += ["--disc", self.game.path(self.game.iso)]

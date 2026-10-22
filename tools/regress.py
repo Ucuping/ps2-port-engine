@@ -31,8 +31,9 @@ import tempfile
 import time
 import zlib
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path[:0] = [os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))]
 from ps2decomp import game as game_config  # noqa: E402
+import toolchain  # noqa: E402
 
 
 def crcs(directory: str) -> dict:
@@ -65,8 +66,7 @@ def main(argv=None) -> int:
     runs = game.path(os.path.join("port", "runs"))
     with open(os.path.join(runs, args.run + ".args"), encoding="utf-8") as handle:
         run_args = handle.read().split()
-    executable = args.exe or game.path(os.path.join(game.build, "port", "cmake", os.path.basename(
-        os.path.normpath(game.directory)) + ".exe"))
+    executable = args.exe or toolchain.port_executable(game)
     elf = game.path(os.path.join(game.extracted, game.executable))
     disc = game.path(game.iso) if game.iso else ""
     renderer = "gpu" if args.gpu else "soft"

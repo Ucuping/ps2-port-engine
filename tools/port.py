@@ -59,6 +59,7 @@ sys.path[:0] = [HERE, os.path.dirname(HERE)]
 
 from ps2decomp import cppcheck, gaps, lift, naming, overlay  # noqa: E402
 from ps2decomp import game as game_config  # noqa: E402
+import toolchain  # noqa: E402
 import vurecomp  # noqa: E402
 
 _FUNCTION = re.compile(r"^void F_([0-9A-F]{8})\(lifted::Context& c\) \{$", re.M)
@@ -267,71 +268,6 @@ def _write_if_changed(path: str, text: str) -> None:
             handle.write(text)
 
 
-def _visual_studio_tool(*parts) -> str:
-    vcvars = cppcheck.find_vcvars()
-    root = os.path.abspath(os.path.join(os.path.dirname(vcvars), "..", "..", ".."))
-    return os.path.join(root, "Common7", "IDE", "CommonExtensions", "Microsoft", "CMake", *parts)
-
-
-def _clang_cl() -> str | None:
-    """LLVM's clang-cl, if installed and not turned away (PS2_COMPILER=msvc):
-    on the path, in LLVM's own folder, or the one Visual Studio installs."""
-    if os.environ.get("PS2_COMPILER", "").lower() == "msvc":
-        return None
-    candidates = [shutil.which("clang-cl"),
-                  os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "LLVM", "bin", "clang-cl.exe")]
-    try:
-        vc = os.path.abspath(os.path.join(os.path.dirname(cppcheck.find_vcvars()), "..", ".."))
-        candidates.append(os.path.join(vc, "Tools", "Llvm", "x64", "bin", "clang-cl.exe"))
-    except Exception:
-        pass
-    for candidate in candidates:
-        if candidate and os.path.isfile(candidate):
-            return os.path.abspath(candidate)
-    return None
-
-
-def _forget_other_compiler(binary: str, compiler: str | None) -> None:
-    """A build folder configured with the other compiler: CMake keeps the
-    compiler it found first, so its cache goes (the objects are rebuilt)."""
-    cache = os.path.join(binary, "CMakeCache.txt")
-    if not os.path.exists(cache):
-        return
-    text = open(cache, encoding="utf-8", errors="replace").read()
-    configured = re.search(r"^CMAKE_CXX_COMPILER:[A-Z]+=(.*)$", text, re.M)
-    configured = configured.group(1).strip() if configured else ""
-    clang = "clang-cl" in configured.lower()
-    if clang == (compiler is not None) and (compiler is None or
-                                             os.path.normcase(os.path.abspath(configured)) == os.path.normcase(compiler)):
-        return
-    print("build: %s now (the folder had %s) - configuring again"
-          % (compiler or "MSVC", configured or "another compiler"))
-    os.remove(cache)
-    shutil.rmtree(os.path.join(binary, "CMakeFiles"), ignore_errors=True)
-
-
-def _build_jobs() -> int:
-    """Compilers at once: by the memory there is, not the processors - a
-    file of compiled VU code takes the compiler 2 GB and more, and a build
-    from nothing with Ninja's default (processors + 2) ran out of it on 16 GB."""
-    jobs = os.cpu_count() or 4
-    if sys.platform == "win32":
-        import ctypes
-
-        class MemoryStatus(ctypes.Structure):
-            _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong),
-                        ("total_physical", ctypes.c_ulonglong), ("free_physical", ctypes.c_ulonglong),
-                        ("total_page", ctypes.c_ulonglong), ("free_page", ctypes.c_ulonglong),
-                        ("total_virtual", ctypes.c_ulonglong), ("free_virtual", ctypes.c_ulonglong),
-                        ("free_extended", ctypes.c_ulonglong)]
-
-        status = MemoryStatus()
-        status.length = ctypes.sizeof(MemoryStatus)
-        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
-            jobs = min(jobs, int(status.total_physical / (2.5 * 2 ** 30)))
-    return max(1, jobs)
-
-
 def _game_env(**extra) -> dict:
     """The environment a port runs in: this process's, less what verification
     sets for itself - ps2decomp/cppcheck.py, imported above, makes the runtime
@@ -360,19 +296,21 @@ def build(game, generated: str, sse4: bool = False, pgo: str = "") -> str:
     the build for processors without AVX2 (PS2HOST_AVX2=OFF), in a folder of
     its own, copied beside the main build as <name>-sse4.exe - which the main
     build starts on such a processor (engine/host/src/cpu_check.cpp). The
-    compiler: clang-cl when installed (_clang_cl), else MSVC's. `pgo`:
-    "generate" for the build that counts (a folder of its own: pgo below),
-    "off" for none; by default the profile `pgo` made, if there is one."""
+    compiler: clang-cl when installed (toolchain.clang_cl), else MSVC's.
+    `pgo`: "generate" for the build that counts (a folder of its own: pgo
+    below), "off" for none; by default the profile `pgo` made, if there is
+    one. Those three are Windows': elsewhere the port builds with its CMake
+    preset (toolchain.py), as one plain executable."""
+    if not toolchain.WINDOWS and (sse4 or pgo == "generate"):
+        raise SystemExit("build: %s is Windows' for now (x86 and clang-cl); on macOS the port builds "
+                         "with its preset only" % ("--sse4" if sse4 else "a profile-guided build"))
     source = game.path("port")
-    folder = "cmake-pgo-generate" if pgo == "generate" else "cmake-sse4" if sse4 else "cmake"
+    folder = ("cmake-pgo-generate" if pgo == "generate" else "cmake-sse4" if sse4
+              else toolchain.port_folder())
     binary = game.path(os.path.join(game.build, "port", folder))
     os.makedirs(binary, exist_ok=True)
-    cmake = _visual_studio_tool("CMake", "bin", "cmake.exe")
-    ninja = _visual_studio_tool("Ninja", "ninja.exe")
-    clang = _clang_cl()
-    _forget_other_compiler(binary, clang)
-    compilers = (' -DCMAKE_C_COMPILER="%s" -DCMAKE_CXX_COMPILER="%s"' % ((clang.replace("\\", "/"),) * 2)
-                 if clang else "")
+    clang = toolchain.clang_cl()
+    toolchain.forget_other_compiler(binary, clang)
     # Named every time (CMake keeps what it was last told).
     profile = ""
     if clang and pgo == "generate":
@@ -385,38 +323,24 @@ def build(game, generated: str, sse4: bool = False, pgo: str = "") -> str:
     wanted = os.environ.get("PS2_LTO", "").lower()
     lto = "ON" if clang and pgo != "generate" and (wanted == "on" or (wanted != "off" and _game_json(game).get("lto"))) \
         else "OFF"
-    script = os.path.join(binary, "build.bat")
-    with open(script, "w", encoding="utf-8") as handle:
-        handle.write('@echo off\ncall "%s" >nul\n' % cppcheck.find_vcvars())
-        handle.write('"%s" -S "%s" -B "%s" -G Ninja -DCMAKE_BUILD_TYPE=Release '
-                     '-DCMAKE_MAKE_PROGRAM="%s" -DPS2_GENERATED_DIR="%s" -DPS2HOST_AVX2=%s "-DPS2HOST_PGO=%s"'
-                     ' -DPS2HOST_LTO=%s -DPS2HOST_LTO_JOBS=%d%s >nul || exit /b 1\n'
-                     % (cmake, source, binary, ninja, generated.replace("\\", "/"), "OFF" if sse4 else "ON",
-                        profile, lto, _build_jobs(), compilers))
-        handle.write('"%s" --build "%s" -j %d || exit /b 1\n' % (cmake, binary, _build_jobs()))
-    result = subprocess.run(["cmd", "/c", script], capture_output=True, text=True)
-    if result.returncode:
-        errors = [line for line in (result.stdout + result.stderr).splitlines()
-                  if "error" in line.lower()]
-        raise SystemExit("port build failed:\n" + "\n".join(errors[:40] or
-                                                           (result.stdout + result.stderr)[-4000:].splitlines()))
+    toolchain.build_port(source, binary, generated, avx2=not sse4, pgo=profile, lto=lto, clang=clang)
     target = os.path.basename(os.path.normpath(game.directory))
-    executable = os.path.join(binary, target + ".exe")
+    executable = os.path.join(binary, toolchain.executable_name(target))
     if pgo == "generate":
         # (Its tests would count too: the main build's run them.)
         print("built %s (clang-cl, counting what runs)" % executable)
         return executable
-    tests = os.path.join(binary, "ps2host", "ps2host_tests.exe")
+    tests = os.path.join(binary, "ps2host", toolchain.executable_name("ps2host_tests"))
     result = subprocess.run([tests], capture_output=True, text=True)
     print(result.stdout.strip())
     if result.returncode:
         raise SystemExit("the host's own tests failed")
     if sse4:
-        beside = game.path(os.path.join(game.build, "port", "cmake", target + "-sse4.exe"))
+        beside = game.path(os.path.join(game.build, "port", "cmake", target + "-sse4" + toolchain.EXE))
         os.makedirs(os.path.dirname(beside), exist_ok=True)
         shutil.copyfile(executable, beside)
         executable = beside
-    print("built %s (%s%s%s)" % (executable, "clang-cl" if clang else "MSVC",
+    print("built %s (%s%s%s)" % (executable, toolchain.compiler_name(clang),
                                  ", profile-guided" if profile else "", ", ThinLTO" if lto == "ON" else ""))
     return executable
 
@@ -435,9 +359,9 @@ def pgo(game, generated: str) -> str:
     """The profile-guided build (the module's docstring): the counting build,
     its runs, their counts merged into pgo_profile, and the build with them.
     Returns the last's executable."""
-    clang = _clang_cl()
+    clang = toolchain.clang_cl()
     if not clang:
-        raise SystemExit("pgo: a profile-guided build needs LLVM's clang-cl")
+        raise SystemExit("pgo: a profile-guided build needs LLVM's clang-cl - on Windows, for now")
     merge = os.path.join(os.path.dirname(clang), "llvm-profdata.exe")
     if not os.path.isfile(merge):
         raise SystemExit("pgo: llvm-profdata.exe not found beside %s" % clang)
@@ -521,9 +445,7 @@ def main(argv=None) -> int:
     game = game_config.from_args(args)
     extra = [a for a in args.extra if a != "--"]
     if args.action == "run":
-        target = os.path.basename(os.path.normpath(game.directory))
-        executable = game.path(os.path.join(game.build, "port", "cmake", target + ".exe"))
-        return run(game, executable, extra)
+        return run(game, toolchain.port_executable(game), extra)
     if args.action == "build":
         build(game, generate(game), sse4=args.sse4, pgo="off" if args.no_pgo else "")
         return 0
