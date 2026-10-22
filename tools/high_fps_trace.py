@@ -18,6 +18,20 @@ the picture. Listed here, each picture where a camera's path looks wrong:
           ticks around it (a cut too)
   back    the placed position went backwards along the camera's way
   ticks   a frame that ran 2 or more ticks (a late picture caught up)
+  late    the picture before took 2 or more blanks (shown late: a hitch)
+
+And, for a game that names its subjects (HighFpsGame::subjects: a player's
+car), each subject's drawn place against its camera's - what the player
+sees of it on the screen:
+
+  twitch  the subject moved against the camera much further than in the
+          pictures around it
+  unplaced  the subject's transform moved in the tick but was left where
+          the tick left it while the camera was placed between (the car a
+          tick ahead of the camera for a picture)
+  lost    no transform near the subject (not found since the last look)
+
+A summary of the reasons ends the list.
 """
 
 from __future__ import annotations
@@ -87,8 +101,41 @@ def main() -> int:
                     reasons.append("back")
             if int(r["ticks"]) >= 2:
                 reasons.append(f"ticks {r['ticks']}")
+            if int(r.get("blanks", 1) or 1) >= 2:
+                reasons.append(f"late {r['blanks']} blanks")
             if reasons:
                 found.append((int(r["frame"]), c, float(r["ms"]), float(r["t"]), int(r["ticks"]), reasons))
+
+    subjects = sorted({int(k[1]) for k in rows[0] if k.startswith("s") and k.endswith("_placed")})
+    for sj in subjects:
+        c = sj if f"c{sj}_x" in rows[0] else 0
+        if args.camera is not None and c != args.camera:
+            continue
+        if all(r[f"s{sj}_addr"] in ("0", "") for r in rows):
+            continue
+        cam = [tuple(float(r[f"c{c}_{a}"]) for a in "xyz") for r in rows]
+        car = [tuple(float(r[f"s{sj}_{a}"]) for a in "xyz") for r in rows]
+        rel = [tuple(car[i][k] - cam[i][k] for k in range(3)) for i in range(len(rows))]
+        moves = [0.0] + [math.dist(rel[i], rel[i - 1]) for i in range(1, len(rows))]
+        fresh = {0} | {i for i in range(1, len(rows)) if int(rows[i]["frame"]) != int(rows[i - 1]["frame"]) + 1}
+        fresh |= {i + 1 for i in fresh}
+        for i, r in enumerate(rows):
+            if i in fresh or r[f"s{sj}_addr"] in ("0", ""):
+                if i not in fresh and float(rows[i]["t"]) < 1.0:
+                    found.append((int(r["frame"]), c, float(r["ms"]), float(r["t"]), int(r["ticks"]), [f"lost s{sj}"]))
+                continue
+            reasons = []
+            around = median_around(moves, i)
+            if moves[i] > args.factor * around and moves[i] > 0.03 and r[f"s{sj}_addr"] == rows[i - 1][f"s{sj}_addr"]:
+                reasons.append(f"twitch s{sj} {moves[i]:.3f} (around {around:.3f})")
+            t = float(r["t"])
+            car_moved = math.dist([float(r[f"s{sj}_last_{a}"]) for a in "xyz"],
+                                  [float(r[f"s{sj}_now_{a}"]) for a in "xyz"]) > 1e-3
+            cam_blended = math.dist(cam[i], [float(r[f"c{c}_now_{a}"]) for a in "xyz"]) > 1e-3
+            if t < 0.999 and car_moved and cam_blended and r[f"s{sj}_placed"] == "0":
+                reasons.append(f"unplaced s{sj} (t {t:.2f})")
+            if reasons:
+                found.append((int(r["frame"]), c, float(r["ms"]), t, int(r["ticks"]), reasons))
 
     found.sort()
     print(f"{len(rows)} race frames, {len(found)} pictures listed")
@@ -96,6 +143,13 @@ def main() -> int:
         print(f"  frame {frame:7d}  camera {c}  {ms / 1000:9.3f} s  t {t:.2f}  ticks {ticks}  " + "; ".join(reasons))
     if len(found) > args.limit:
         print(f"  ... {len(found) - args.limit} more (--limit)")
+    summary: dict[str, int] = {}
+    for *_, reasons in found:
+        for reason in reasons:
+            key = reason.split(" ")[0] + (" " + reason.split(" ")[1] if reason.split(" ")[0] in ("twitch", "unplaced", "lost") else "")
+            summary[key] = summary.get(key, 0) + 1
+    if summary:
+        print("summary: " + ", ".join(f"{k} {v}" for k, v in sorted(summary.items(), key=lambda kv: -kv[1])))
     return 0
 
 

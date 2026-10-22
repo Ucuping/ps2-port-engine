@@ -70,6 +70,11 @@ struct HighFpsGame {
     // Blanks (at 60: so many more above it) without a frame of the game's:
     // it has stopped (a loading screen, a movie) - 60 again (HighFpsBlank).
     int gone = 30;
+    // For the trace only: where things the player watches are (3 floats, a
+    // position the game keeps - a player's car), each traced through the
+    // transform nearest it - how its drawn place went from picture to
+    // picture against the camera's.
+    std::vector<u32> subjects;
 };
 
 /* The game's, once, at start-up. */

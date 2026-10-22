@@ -59,6 +59,7 @@ float g_picture_time = 1.0f;
 bool g_counted = false;                 // g_step_count holds the game's (since the rate changed)
 u32 g_step_count = 0;
 u32 g_frame_steps = 1;                  // the steps this frame of the game's ran
+unsigned g_frame_blanks = 1;            // the blanks the picture before took (the trace's)
 // Blanks since the game's frame last ran (HighFpsFrameSteps): past `gone`,
 // it has stopped - a loading screen, a movie - and the rate is its own again.
 // (HighFpsPicture, where the rate is chosen, runs only in its frames.)
@@ -382,10 +383,13 @@ std::FILE* TraceFile() {
         const char* path = std::getenv("PS2HOST_HIGH_FPS_TRACE");
         std::FILE* f = path ? std::fopen(path, "w") : nullptr;
         if (f) {
-            std::fprintf(f, "frame,ms,rate,ticks,t,placed");
+            std::fprintf(f, "frame,ms,rate,ticks,t,placed,blanks,known");
             for (size_t k = 0; k < g_game.cameras.size(); ++k)
                 std::fprintf(f, ",c%zu_last_x,c%zu_last_y,c%zu_last_z,c%zu_now_x,c%zu_now_y,c%zu_now_z,"
                              "c%zu_x,c%zu_y,c%zu_z,c%zu_step,c%zu_turn", k, k, k, k, k, k, k, k, k, k, k);
+            for (size_t k = 0; k < g_game.subjects.size(); ++k)
+                std::fprintf(f, ",s%zu_addr,s%zu_off,s%zu_last_x,s%zu_last_y,s%zu_last_z,s%zu_now_x,s%zu_now_y,"
+                             "s%zu_now_z,s%zu_x,s%zu_y,s%zu_z,s%zu_placed", k, k, k, k, k, k, k, k, k, k, k, k);
             std::fprintf(f, "\n");
         }
         return f;
@@ -393,13 +397,60 @@ std::FILE* TraceFile() {
     return file;
 }
 
+/* Each subject's transform: the one nearest the position the game keeps
+   (kept while within 3 units: a car's wheels are near its body), where the
+   last two steps left it and where it was placed (as the last left it: not
+   placed - it did not move, or it was not found since the last look). */
+void TraceSubjects(std::FILE* f) {
+    static std::vector<u32> chosen;
+    chosen.resize(g_game.subjects.size(), 0);
+    for (size_t k = 0; k < g_game.subjects.size(); ++k) {
+        float at[3] = {};
+        if (const u8* p = generated::RamPointer(g_game.subjects[k], 12)) std::memcpy(at, p, sizeof at);
+        auto distance = [&](const Matrix& m) {
+            const float d[3] = {m.m[12] - at[0], m.m[13] - at[1], m.m[14] - at[2]};
+            return std::sqrt(Dot3(d, d));
+        };
+        const auto kept = g_now.find(chosen[k]);
+        if (kept == g_now.end() || distance(kept->second) > 3.0f) {
+            float best = 1e30f;
+            chosen[k] = 0;
+            for (const auto& [address, m] : g_now) {
+                const float d = distance(m);
+                if (d < best) {
+                    best = d;
+                    chosen[k] = address;
+                }
+            }
+        }
+        const auto now = g_now.find(chosen[k]);
+        const auto last = g_last.find(chosen[k]);
+        if (now == g_now.end()) {
+            std::fprintf(f, ",0,0,0,0,0,0,0,0,0,0,0,0");
+            continue;
+        }
+        const Matrix& b = now->second;
+        const Matrix& a = last != g_last.end() ? last->second : b;
+        const float* placed = b.m + 12;
+        bool was_placed = false;
+        for (const Placed& p : g_placed)
+            if (p.address == chosen[k]) {
+                placed = p.placed.m + 12;
+                was_placed = true;
+            }
+        std::fprintf(f, ",%08X,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d", chosen[k], distance(b),
+                     a.m[12], a.m[13], a.m[14], b.m[12], b.m[13], b.m[14], placed[0], placed[1], placed[2],
+                     was_placed ? 1 : 0);
+    }
+}
+
 void Trace(float t) {
     std::FILE* f = TraceFile();
     static unsigned long long traced = 0;
     if (!f || traced == g_frames) return;
     traced = g_frames;
-    std::fprintf(f, "%llu,%.3f,%.0f,%u,%.4f,%zu", g_frames, double(ClockNs()) / 1e6, g_rate, g_frame_steps,
-                 double(t), g_placed.size());
+    std::fprintf(f, "%llu,%.3f,%.0f,%u,%.4f,%zu,%u,%zu", g_frames, double(ClockNs()) / 1e6, g_rate, g_frame_steps,
+                 double(t), g_placed.size(), g_frame_blanks, g_now.size());
     for (size_t k = 0; k < g_game.cameras.size(); ++k) {
         const HighFpsCamera& camera = g_game.cameras[k];
         const CameraValues& v = g_cameras[k];
@@ -412,6 +463,7 @@ void Trace(float t) {
         std::fprintf(f, ",%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.5f", a[0], a[1], a[2], b[0], b[1], b[2],
                      placed[0], placed[1], placed[2], std::sqrt(Dot3(d, d)), dot);
     }
+    TraceSubjects(f);
     std::fprintf(f, "\n");
     if (g_frames % 120 == 0) std::fflush(f);
 }
@@ -471,6 +523,7 @@ bool HighFpsFrameSteps(u32 steps_so_far, unsigned blanks) {
     ++g_frames;
     if (g_rate > 0.0) KeepUp();
     g_frame_steps = g_counted ? steps_so_far - g_step_count : 1;
+    g_frame_blanks = blanks;
     g_step_count = steps_so_far;
     g_counted = true;
     if (g_rate > 0.0) {
