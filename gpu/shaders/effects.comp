@@ -39,6 +39,7 @@ layout(push_constant) uniform Params {
 #define PASS_BLOOM_APPLY 9
 #define PASS_GRADE 10
 #define PASS_SCENE_DEPTH 11
+#define PASS_DOF 12
 
 const float kTwoTo32 = 4294967296.0;
 
@@ -358,6 +359,57 @@ void main() {
           texture(src_a, uv + vec2(-t.x, t.y)).rgb + texture(src_a, uv + vec2(t.x, t.y)).rgb;
     up /= 16.0;
     imageStore(dst, at, vec4(texelFetch(src_b, at, 0).rgb + up * pc.p[11], 1.0));
+
+#elif PASS == PASS_DOF
+    // Depth of field (dst, then copied back): focused at p6 metres (0: on
+    // what the middle of the view shows), each pixel's circle of confusion
+    // from how far its distance is from the focus's (p4 the aperture, p5 the
+    // largest circle as a share of the height); gathered from a disc of 16
+    // taps, each taking part as far as its own circle reaches this pixel (a
+    // sharp thing in focus keeps out of the blur behind it).
+    const ivec2 q = pc.rect.xy + at;
+    if (any(greaterThanEqual(q, pc.rect.zw))) return;
+    const vec2 pixel = vec2(q) + 0.5;
+    const vec2 texel = 1.0 / vec2(TargetSize());
+    const vec2 mid = (vec2(pc.rect.xy) + vec2(pc.rect.zw)) * 0.5;
+    const float height = float(pc.rect.w - pc.rect.y);
+    float focus = pc.p[6];
+    if (focus <= 0.0) {
+        // The nearest of five points about the middle (the subject is near).
+        focus = 1e9;
+        for (int i = 0; i < 5; ++i) {
+            const vec2 o = i == 0 ? vec2(0.0) : vec2(i == 1 ? -1.0 : i == 2 ? 1.0 : 0.0, i == 3 ? -1.0 : i == 4 ? 1.0 : 0.0);
+            focus = min(focus, DepthAt(mid + o * height * 0.06));
+        }
+        focus = clamp(focus, 1.0, 200.0);
+    }
+    const float most = pc.p[5] * height;
+    #define COC(z) (most * clamp(pc.p[4] * abs(min(z, 1e4) - focus) / max(min(z, 1e4), 0.3), 0.0, 1.0))
+    const float z = DepthAt(pixel);
+    const float coc = COC(z);
+    const vec4 here = texture(target_tex, pixel * texel);
+    if (coc < 0.6) {
+        imageStore(dst, at, vec4(here.rgb, -1.0));
+        return;
+    }
+    vec3 sum = here.rgb;
+    float weight = 1.0;
+    const float spin = StillNoise(pixel) * 6.2831853;
+    for (int i = 0; i < 16; ++i) {
+        const float r = sqrt((float(i) + 0.5) / 16.0);
+        const float a = float(i) * 2.39996323 + spin;          // the golden angle
+        const vec2 o = vec2(cos(a), sin(a)) * r * coc;
+        const vec2 sp = clamp(pixel + o, vec2(pc.rect.xy) + 0.5, vec2(pc.rect.zw) - 0.5);
+        const float sz = DepthAt(sp);
+        const float reach = COC(sz);
+        // A sample nearer than the focus spreads over what is behind it; one
+        // behind it only as far as its own circle.
+        const float w = clamp((max(reach, sz < z ? coc : 0.0) - r * coc) + 1.0, 0.0, 1.0);
+        sum += texture(target_tex, sp * texel).rgb * w;
+        weight += w;
+    }
+    #undef COC
+    imageStore(dst, at, vec4(sum / weight, here.a));
 
 #elif PASS == PASS_SCENE_DEPTH
     // The scene's depth for what is drawn after (soft particles: gs.frag):

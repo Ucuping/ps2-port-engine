@@ -17,6 +17,7 @@
 #include "effects_9.h"
 #include "effects_10.h"
 #include "effects_11.h"
+#include "effects_12.h"
 
 namespace ps2gpu {
 
@@ -73,6 +74,7 @@ bool GsEffects::Init(VkPipelineCache cache) {
         {spirv_effects_6, sizeof spirv_effects_6}, {spirv_effects_7, sizeof spirv_effects_7},
         {spirv_effects_8, sizeof spirv_effects_8}, {spirv_effects_9, sizeof spirv_effects_9},
         {spirv_effects_10, sizeof spirv_effects_10}, {spirv_effects_11, sizeof spirv_effects_11},
+        {spirv_effects_12, sizeof spirv_effects_12},
     };
     for (int i = 0; i < kPasses; ++i) {
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -332,6 +334,14 @@ void GsEffects::Record(VkCommandBuffer cmd, const GsEffect& e, const Target& t) 
         case GsEffectId::kGrade:
             Dispatch(cmd, kGrade, Descriptors(t, nullptr, nullptr, nullptr), push, w, h);
             break;
+        case GsEffectId::kDepthOfField: {
+            if (!t.depth_view) return;
+            Set& set = SetFor(w, h, cmd);
+            Dispatch(cmd, kDof, Descriptors(t, set.full.view, nullptr, nullptr), push, w, h);
+            Barrier(cmd);
+            Dispatch(cmd, kCopy, Descriptors(t, nullptr, set.full.view, nullptr), push, w, h);
+            break;
+        }
         case GsEffectId::kSceneDepth:
             if (!t.depth_view) return;
             if (scene_.w != t.pw || scene_.h != t.ph) {
