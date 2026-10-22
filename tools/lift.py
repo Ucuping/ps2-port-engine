@@ -150,14 +150,26 @@ def build(lifted: dict, work: str):
     raise RuntimeError("could not build the lifted library")
 
 
-def _functions_at(path: str, line_number: int) -> set:
+def _functions_at(path: str, line_number: int, prefixes: str = "F") -> set:
     with open(path, encoding="utf-8") as handle:
         lines = handle.read().splitlines()[:line_number]
     for line in reversed(lines):
-        match = re.match(r"void F_([0-9A-F]{8})\(", line)
+        match = re.match(r"void [%s]_([0-9A-F]{8})\(" % prefixes, line)
         if match:
             return {int(match.group(1), 16)}
     return set()
+
+
+def _pairs_at_errors(errors: str) -> set:
+    """The functions whose plain or structured form (P_/S_, equivalence.sources)
+    holds one of an equivalence build's errors."""
+    found = set()
+    for line in errors.splitlines():
+        match = re.match(r"(.+?)\((\d+)\)", line)
+        if match and os.path.isfile(match.group(1)) and \
+                os.path.basename(match.group(1)).startswith("equivalence_"):
+            found |= _functions_at(match.group(1), int(match.group(2)), "PS")
+    return found
 
 
 # The outcome of a text the compiler rejects - MSVC, for one, refuses blocks
@@ -205,11 +217,15 @@ def verify_texts(texts: dict, work: str, game, seeds, jobs, cache, abi=False,
     return outcomes
 
 
-def equivalent_to_plain(addresses, structured, plain, abi, cache, work) -> list:
+def equivalent_to_plain(addresses, structured, plain, abi, cache, work, unchecked=True) -> list:
     """The addresses whose structured form behaves as their plain lifted form on
     equivalence.CASES native cases (ps2decomp/equivalence.py) - a check far wider
     than the interpreter's, which two structuring bugs once slipped past.
-    Remembered like verdicts, keyed by both texts and the checker's own source."""
+    Remembered like verdicts, keyed by both texts and the checker's own source.
+
+    A structured form the compiler rejects is left out and the rest checked. If
+    the check cannot run at all, `unchecked` decides: the forms stand on their
+    own verification, or - for forms that have none - none passes."""
     import hashlib
 
     from ps2decomp import equivalence
@@ -226,21 +242,45 @@ def equivalent_to_plain(addresses, structured, plain, abi, cache, work) -> list:
         else:
             results[address] = outcome
     if missing:
-        try:
-            checked = equivalence.check({a: (plain[a], structured[a], abi) for a in missing}, work)
-        except (cppcheck.CompileError, cppcheck.CompilerUnavailable) as exc:
+        pairs = {a: (plain[a], structured[a], abi) for a in missing}
+        checked, failure = {}, None
+        while pairs:
+            try:
+                checked = equivalence.check(pairs, work)
+                break
+            except cppcheck.CompileError as exc:
+                # One form the compiler rejects - clang refuses a goto past an
+                # initialisation, which MSVC accepts - leaves the others to be
+                # checked: it is left out, and not remembered.
+                broken = _pairs_at_errors(str(exc)) & set(pairs)
+                if not broken:
+                    failure = exc
+                    break
+                print("  equivalence: %d structured form(s) do not compile: %s"
+                      % (len(broken), ", ".join("0x%08X" % a for a in sorted(broken)[:8])))
+                for address in broken:
+                    del pairs[address]
+                    results[address] = NO_COMPILE
+            except cppcheck.CompilerUnavailable as exc:
+                failure = exc
+                break
+        if failure is not None:
             # A checker that cannot run has found nothing: say so loudly, remember
-            # nothing, and let the forms stand on their verification this time.
+            # nothing, and let the forms stand on their verification this time -
+            # if they have one.
             print("  WARNING: the equivalence check did not build, so it was skipped:\n    %s"
-                  % "\n    ".join(str(exc).splitlines()[:5]))
-            return list(addresses)
+                  % "\n    ".join(str(failure).splitlines()[:5]))
+            if not unchecked:
+                print("  so no structured form without a verification of its own is used")
+                return [a for a in addresses if results.get(a) == "equivalent"]
+            return [a for a in addresses if results.get(a) != NO_COMPILE]
         for address, difference in checked.items():
             outcome = ("equivalent" if difference is None
                        else "differs from the plain form: case %d, %d" % difference)
             cache.put(missing[address], abi, outcome)
             results[address] = outcome
         cache.save()
-    differing = sorted(a for a in addresses if results[a] != "equivalent")
+    differing = sorted(a for a in addresses if results[a] not in ("equivalent", NO_COMPILE))
     if differing:
         print("  %d differ from their plain form natively: %s"
               % (len(differing), ", ".join("0x%08X" % a for a in differing[:12])))
@@ -324,7 +364,8 @@ def structure_unverified(plain, functions, image, base, game, strings, cache) ->
         if not structured:
             break
         work = game.path(os.path.join(game.build, "unverified_" + label.split()[-1]))
-        passed = equivalent_to_plain(list(structured), structured, plain, abi, cache, work)
+        passed = equivalent_to_plain(list(structured), structured, plain, abi, cache, work,
+                                     unchecked=False)
         for address in passed:
             result[address] = structured[address]
         remaining = [a for a in structured if a not in passed]
