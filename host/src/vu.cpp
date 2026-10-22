@@ -921,10 +921,23 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     unclean_ = ~1u;                     // nothing known about the registers yet
     acc_unclean_ = true;
     RunCompiled(state, limit);
+    const u64 compiled = state.count;
     if (!state.done) Interpret(state, limit);
     LandAll();
     resume = state.pc;
     pairs_ += state.count;
+    // A run far longer than a program's usual (a frame's whole VU1 work is a
+    // few million pairs): said, with how much of it the interpreter ran.
+    if (state.count >= (u64(1) << 21)) {
+        static int said = 0;
+        if (said < 20) {
+            ++said;
+            std::fprintf(stderr, "[vu] VU%d run from 0x%X: %llu pairs (%llu interpreted), ended at 0x%X%s\n", unit,
+                         unsigned(pc), (unsigned long long)state.count,
+                         (unsigned long long)(state.count - compiled), unsigned(state.pc),
+                         state.count >= limit ? " - its limit" : "");
+        }
+    }
     return state.count;
 }
 

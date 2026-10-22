@@ -950,10 +950,12 @@ bool Replace(Bridge& b, Cached& t) {
     t.pack_pending = pending;
     if (!image) return false;
     // One image on the GPU for every texture it replaces.
-    if (!b.renderer->HasReplacement(image->id) &&
-        !b.renderer->UploadReplacement(image->id, image->format, image->width, image->height, image->levels,
-                                       image->data.data(), image->data.size()))
-        return false;
+    if (!b.renderer->HasReplacement(image->id)) {
+        const TimelineStep step("pack: a replacement uploaded");
+        if (!b.renderer->UploadReplacement(image->id, image->format, image->width, image->height, image->levels,
+                                           image->data.data(), image->data.size()))
+            return false;
+    }
     ++g_mutations;
     b.renderer->UseReplacement(t.renderer_key, image->id);
     t.replaced = true;
