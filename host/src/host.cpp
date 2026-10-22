@@ -477,6 +477,11 @@ void Dispatch(lifted::Context& c, u32 address) {
 namespace {
 
 // ELF32 little-endian, the PS2's executable format: load every PT_LOAD segment.
+// Every segment's memory is zeroed first, then every segment's bytes copied from
+// the file: a segment's zeroed tail never erases another segment's bytes. The
+// console's loader copies only what the file holds, and an executable may lay a
+// segment with no bytes over others - Tekken 5's .dmh, 23 MB from 0x00488000,
+// spans its .y4, which holds its loader and the names of the files it reads.
 u32 LoadElf(const std::string& path, std::vector<u8> data) {
     auto u16at = [&](std::size_t at) { u16 v; std::memcpy(&v, &data.at(at + 1) - 1, 2); return v; };
     auto u32at = [&](std::size_t at) { u32 v; std::memcpy(&v, &data.at(at + 3) - 3, 4); return v; };
@@ -486,6 +491,8 @@ u32 LoadElf(const std::string& path, std::vector<u8> data) {
     const u16 phentsize = u16at(42), phnum = u16at(44);
     Memory& memory = GuestMemory();
     g_image.clear();
+    struct Segment { u32 offset, vaddr, bytes; };
+    std::vector<Segment> segments;
     for (u16 i = 0; i < phnum; ++i) {
         const std::size_t ph = phoff + std::size_t(i) * phentsize;
         if (u32at(ph) != 1) continue;                       // PT_LOAD
@@ -495,9 +502,13 @@ u32 LoadElf(const std::string& path, std::vector<u8> data) {
         u8* target = memory.Translate(vaddr, memsz);
         if (!target || std::size_t(offset) + filesz > data.size())
             throw Unimplemented{"a segment of " + path + " lies outside guest memory"};
-        std::memcpy(target, data.data() + offset, filesz);
-        std::memset(target + filesz, 0, memsz - filesz);
-        if (filesz) g_image.emplace_back(vaddr, vaddr + filesz);
+        std::memset(target, 0, memsz);
+        segments.push_back({offset, vaddr, std::min(filesz, memsz)});
+    }
+    for (const Segment& s : segments) {
+        if (!s.bytes) continue;
+        std::memcpy(memory.Translate(s.vaddr, s.bytes), data.data() + s.offset, s.bytes);
+        g_image.emplace_back(s.vaddr, s.vaddr + s.bytes);
     }
     return entry;
 }
