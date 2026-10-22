@@ -129,11 +129,12 @@ void VifStream::UnpackRun(const std::uint32_t* words, std::uint32_t count) {
     Unpack& u = unpack_;
     const std::uint32_t vl = u.format & 3, vn = (u.format >> 2) & 3;
     const std::uint32_t size = (vn == 3 && vl == 3) ? 2 : (vn + 1) * (4u >> vl);
-    // The usual case, in one loop: unmasked, no addition (STMOD 0), CL >= WL
-    // (no filling writes), elements of whole words, none part-read - each
-    // stored as WriteElement would, its address kept by counting rather than
-    // dividing.
-    if (u.bytes.empty() && size % 4 == 0 && !u.masked && mode == 0 && vu && write_length_ != 0 &&
+    // The usual case, in one loop: CL >= WL (no filling writes), elements of
+    // whole words, none part-read - each stored as WriteElement would, its
+    // address kept by counting rather than dividing. Unmasked with no
+    // addition (STMOD 0) stored as it is; masked or added (Burnout 3's
+    // STMOD 1 unpacks, half of them) through Store.
+    if (u.bytes.empty() && size % 4 == 0 && vu && write_length_ != 0 &&
         write_length_ <= cycle_length_ && (u.format == 0xC || u.format == 0x8 || u.format == 0x4 ||
                                            u.format == 0x0 || u.format == 0xD || u.format == 0x5 ||
                                            u.format == 0xE)) {
@@ -149,7 +150,28 @@ void VifStream::UnpackRun(const std::uint32_t* words, std::uint32_t count) {
         // V4-32 writing every quadword it passes (WL = CL): the words as they
         // are into consecutive quadwords - a run at a time, up to the end of
         // data memory (the vertices the game sends, most of an UNPACK's data).
-        if (u.format == 0xC && wl == cl) {
+        const bool plain = !u.masked && mode == 0;
+        const bool three = u.format == 0x8;
+        // WriteElement's masked or added store of element `c` at `q`.
+        auto store = [&](std::uint32_t* q, const std::uint32_t c[4], std::uint32_t position) {
+            for (std::uint32_t f = 0; f < 4; ++f) {
+                const std::uint32_t m = u.masked ? (mask >> (position * 8 + f * 2)) & 3 : 0;
+                switch (m) {
+                    case 0: {
+                        if (three && f == 3) break;         // V3 leaves w as it was
+                        std::uint32_t v = c[f];
+                        if (mode == 1) v += row[f];
+                        else if (mode == 2) row[f] = v = v + row[f];
+                        q[f] = v;
+                        break;
+                    }
+                    case 1: q[f] = row[f]; break;
+                    case 2: q[f] = col[position]; break;
+                    default: break;                         // write-protected
+                }
+            }
+        };
+        if (plain && u.format == 0xC && wl == cl) {
             while (count - used >= 4 && k < u.num) {
                 const std::uint32_t at = u.address + k;
                 const std::uint32_t n = std::min({(count - used) / 4, u.num - k, vu->QuadsToEnd(at)});
@@ -161,7 +183,9 @@ void VifStream::UnpackRun(const std::uint32_t* words, std::uint32_t count) {
             base = u.address + (k / wl) * cl;
         }
         while (count - used >= per && k < u.num) {
-            std::uint32_t* q = vu->Quad(base + in_cycle);
+            std::uint32_t* const target = vu->Quad(base + in_cycle);
+            std::uint32_t element[4];
+            std::uint32_t* q = plain ? target : element;
             const std::uint32_t* w = words + used;
             switch (u.format) {
                 case 0xC: std::memcpy(q, w, 16); break;                             // V4-32
@@ -180,6 +204,7 @@ void VifStream::UnpackRun(const std::uint32_t* words, std::uint32_t count) {
                     q[0] = byte(w[0]); q[1] = byte(w[0] >> 8); q[2] = byte(w[0] >> 16); q[3] = byte(w[0] >> 24);
                     break;
             }
+            if (!plain) store(target, element, std::min(in_cycle, 3u));
             used += per;
             ++k;
             if (++in_cycle == wl) {
@@ -233,6 +258,30 @@ void VifStream::Words(const std::uint32_t* words, std::uint32_t count, std::uint
             data_index_ += run;
             g_dma_source = from + 4 * i;
             UnpackRun(words + i, run);
+            i += run;
+            continue;
+        }
+        // Microcode a run at a time: Burnout 3 sends its programs again every
+        // frame (a word at a time through Word, each compared alone, was a
+        // sixth of the VIF1 worker's own time at 144 pictures a second).
+        if (pending_ && data_ == Data::Mpg && vu) {
+            const std::uint32_t run = std::min(pending_, count - i);
+            const std::size_t size = vu->micro.size();
+            const std::size_t at = (mpg_address_ + 4 * std::size_t(data_index_)) & (size - 1);
+            const std::size_t first = std::min<std::size_t>(std::size_t(run) * 4, size - at);
+            bool changed = std::memcmp(vu->micro.data() + at, words + i, first) != 0;
+            if (changed) std::memcpy(vu->micro.data() + at, words + i, first);
+            if (first < std::size_t(run) * 4) {        // wrapped past the end of micro memory
+                const std::uint8_t* rest = reinterpret_cast<const std::uint8_t*>(words + i) + first;
+                if (std::memcmp(vu->micro.data(), rest, std::size_t(run) * 4 - first) != 0) {
+                    std::memcpy(vu->micro.data(), rest, std::size_t(run) * 4 - first);
+                    changed = true;
+                }
+            }
+            if (changed) vu->MicroWritten();
+            pending_ -= run;
+            data_words_ += run;
+            data_index_ += run;
             i += run;
             continue;
         }
