@@ -28,6 +28,34 @@ namespace ps2gpu {
 
 namespace {
 
+/* A chunk of the queue: bytes appended, never zeroed first (a vector's
+   resize filled each primitive's bytes before they were copied in - its
+   memset and the copy a tenth of the GS thread in a race's crash). */
+class Chunk {
+public:
+    const std::uint8_t* data() const { return bytes_.get(); }
+    std::size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    void clear() { size_ = 0; }
+    void reserve(std::size_t capacity) {
+        if (capacity <= capacity_) return;
+        std::unique_ptr<std::uint8_t[]> bigger(new std::uint8_t[capacity]);
+        if (size_) std::memcpy(bigger.get(), bytes_.get(), size_);
+        bytes_ = std::move(bigger);
+        capacity_ = capacity;
+    }
+    std::size_t capacity() const { return capacity_; }
+    void append(const void* data, std::size_t size) {
+        if (size_ + size > capacity_) reserve(std::max(capacity_ * 2, size_ + size));
+        std::memcpy(bytes_.get() + size_, data, size);
+        size_ += size;
+    }
+
+private:
+    std::unique_ptr<std::uint8_t[]> bytes_;
+    std::size_t size_ = 0, capacity_ = 0;
+};
+
 class ThreadedGsRenderer final : public GsRenderer {
 public:
     explicit ThreadedGsRenderer(std::unique_ptr<GsRenderer> inner) : inner_(std::move(inner)) {
@@ -362,10 +390,7 @@ private:
         Put(head, sizeof head);
     }
     void Put(const void* data, std::size_t size) {
-        if (!size) return;
-        const std::size_t at = open_.size();
-        open_.resize(at + size);
-        std::memcpy(open_.data() + at, data, size);
+        if (size) open_.append(data, size);
     }
     void End() {
         if (open_.size() >= kChunk) Submit();
@@ -386,7 +411,7 @@ private:
                 open_ = std::move(spare_.back());
                 spare_.pop_back();
             } else {
-                open_ = std::vector<std::uint8_t>();
+                open_ = Chunk();
             }
         }
         open_.clear();
@@ -406,7 +431,7 @@ private:
         for (;;) {
             wake_.wait(hold, [this] { return stop_ || !full_.empty(); });
             if (full_.empty()) return;
-            std::vector<std::uint8_t> chunk = std::move(full_.front());
+            Chunk chunk = std::move(full_.front());
             full_.pop_front();
             busy_ = true;
             hold.unlock();
@@ -427,7 +452,7 @@ private:
         return value;
     }
 
-    void Play(const std::vector<std::uint8_t>& chunk) {
+    void Play(const Chunk& chunk) {
         const std::uint8_t* at = chunk.data();
         const std::uint8_t* const end = at + chunk.size();
         GsRenderer& r = *inner_;
@@ -569,14 +594,14 @@ private:
     std::uint32_t rule_[3] = {};      // SetScaleRule's, as last passed on
     unsigned kicks_ = 0;
     // The caller's side.
-    mutable std::vector<std::uint8_t> open_;
+    mutable Chunk open_;
     GsDrawState last_;
     bool has_last_ = false;
     // Between the two.
     mutable std::mutex lock_;
     mutable std::condition_variable wake_, drained_;
-    mutable std::deque<std::vector<std::uint8_t>> full_;
-    mutable std::vector<std::vector<std::uint8_t>> spare_;
+    mutable std::deque<Chunk> full_;
+    mutable std::vector<Chunk> spare_;
     mutable bool busy_ = false;
     bool stop_ = false;
     // The renderer's thread.
