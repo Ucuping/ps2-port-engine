@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "crt.h"
 #include "ps2host/disc.h"
 #include "ps2host/host.h"
 #include "ps2host/memory.h"
@@ -84,10 +85,10 @@ std::vector<u8> SCommand(u32 procedure, const std::vector<u8>& /*data*/) {
             if (VirtualClock()) {
                 const std::time_t start = 1094558400;   // 2004-09-07 12:00:00 UTC, Burnout 3's release
                 const std::time_t now = start + std::time_t(ClockNs() / 1000000000ull);
-                gmtime_s(&local, &now);
+                UtcTime(now, &local);
             } else {
                 const std::time_t now = std::time(nullptr);
-                localtime_s(&local, &now);
+                LocalTime(now, &local);
             }
             std::vector<u8> reply = Word(1);
             // sceCdCLOCK { stat, second, minute, hour, pad, day, month, year }, BCD

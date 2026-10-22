@@ -49,6 +49,7 @@
 #include <system_error>
 #include <vector>
 
+#include "crt.h"
 #include "ps2host/host.h"
 #include "ps2host/mc2.h"
 #include "ps2host/memory.h"
@@ -143,7 +144,7 @@ void PutDate(u8* out, const fs::path& path) {
             std::chrono::time_point_cast<std::chrono::system_clock::duration>(
                 stamp - fs::file_time_type::clock::now() + std::chrono::system_clock::now()));
     std::tm t{};
-    localtime_s(&t, &when);
+    LocalTime(when, &t);
     out[0] = 0;
     out[1] = u8(t.tm_sec);
     out[2] = u8(t.tm_min);

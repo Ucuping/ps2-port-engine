@@ -4,6 +4,8 @@
 #include <cstring>
 #include <string>
 
+#include "crt.h"
+
 namespace ps2host {
 
 namespace {
@@ -77,8 +79,8 @@ bool Disc::Open(const std::string& path) {
     }
     file_ = std::fopen(image.c_str(), "rb");
     if (!file_) return false;
-    _fseeki64(file_, 0, SEEK_END);
-    size_ = u64(_ftelli64(file_));
+    FileSeek64(file_, 0, SEEK_END);
+    size_ = u64(FileTell64(file_));
     DetectFormat();
     return true;
 }
@@ -111,7 +113,7 @@ bool Disc::ReadBytes(u64 offset, u64 length, u8* out) {
         std::memcpy(out, memory_.data() + offset, size_t(length));
         return true;
     }
-    if (!file_ || _fseeki64(file_, s64(offset), SEEK_SET) != 0) return false;
+    if (!file_ || FileSeek64(file_, s64(offset), SEEK_SET) != 0) return false;
     return std::fread(out, 1, size_t(length), file_) == length;
 }
 

@@ -25,6 +25,8 @@
 #define STBI_NO_STDIO
 #include "stb_image.h"
 
+#include "crt.h"
+
 namespace ps2host {
 namespace texture_pack {
 
@@ -382,7 +384,7 @@ std::shared_ptr<Image> LoadPng(const std::vector<u8>& file) {
 }
 
 std::shared_ptr<Image> Load(const std::filesystem::path& path) {
-    std::FILE* f = _wfopen(path.wstring().c_str(), L"rb");
+    std::FILE* f = OpenForReading(path);
     if (!f) return nullptr;
     std::vector<u8> bytes;
     std::fseek(f, 0, SEEK_END);
