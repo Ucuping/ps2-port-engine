@@ -497,7 +497,7 @@ def lower_writes(lines: list) -> list:
     return out
 
 
-def needless_wait(r: int, lane: int, index: int, written: dict) -> bool:
+def needless_wait(r: int, lane: int, index: int, written: dict, entry: dict = None) -> bool:
     """Whether a stall check on (r, lane) at the block's pair `index` can never
     stall: VF0 is never written; a field written by the block's pair j lands
     at j's issue cycle + 4, and every pair takes a cycle at least, so from
@@ -508,7 +508,18 @@ def needless_wait(r: int, lane: int, index: int, written: dict) -> bool:
     if r == 0:
         return True
     j = written.get((r, lane))
-    return index - j >= 4 if j is not None else index >= 3
+    if j is not None:
+        return index - j >= 4
+    if entry is not None:
+        # An entry version (Chain.version): the fields written in the three
+        # pairs before the block, d pairs before the pair it left after (0 the
+        # last), the block before having three pairs at least - one written
+        # there lands by that pair's issue + 4 - d, and the block's pair
+        # `index` issues at that issue + 1 + index at the earliest; any other
+        # field landed before the block.
+        d = entry.get((r, lane))
+        return d is None or d + index >= 3
+    return index >= 3
 
 
 class Flags:
@@ -597,18 +608,61 @@ class Flags:
 LEAVE = "s.count = count; s.stopping = stopping; s.delayed = delayed; C::Cycle(v) = cyc; return;"
 
 
-def leave_to(pc: int, chain: dict) -> str:
+def leave_to(pc: int, chain, recent: dict = None) -> str:
     """LEAVE where the run goes on at `pc`, a pair the generator knows: into
-    that block (PS2HOST_VU_NEXT) if the program has one starting there."""
+    that block (PS2HOST_VU_NEXT) if the program has one starting there - its
+    entry version for `recent` (the fields written in the last three pairs,
+    and how many pairs before the last: Chain.version) where it has one."""
     if chain and pc in chain:
-        return LEAVE[:-len("return;")] + "PS2HOST_VU_NEXT(%s);" % chain[pc]
+        name = chain.version(pc, recent) if hasattr(chain, "version") else chain[pc]
+        return LEAVE[:-len("return;")] + "PS2HOST_VU_NEXT(%s);" % name
     return LEAVE
+
+
+# The entry versions a block may have (Chain.version), past which the run
+# goes on into the block as it is.
+MAX_VERSIONS = 6
+# PS2_VU_NO_VERSIONS=1: none (to compare).
+VERSIONS = os.environ.get("PS2_VU_NO_VERSIONS", "") != "1"
+
+
+class Chain:
+    """A program's blocks of one kind by where they start (`names`), and the
+    entry versions its exits asked for: a block entered from a known exit -
+    a block of three pairs or more before it - with the fields written in its
+    last three pairs (`recent`: {(register, lane): pairs before the last})
+    known, its stall checks on anything else left out (needless_wait).
+    `wanted`: (pc, recent, name) still to be written."""
+
+    def __init__(self, names: dict):
+        self.names = names
+        self.versions = {}
+        self.wanted = []
+
+    def __contains__(self, pc) -> bool:
+        return pc in self.names
+
+    def __getitem__(self, pc) -> str:
+        return self.names[pc]
+
+    def version(self, pc: int, recent: dict) -> str:
+        if recent is None or not VERSIONS:
+            return self.names[pc]
+        key = (pc, frozenset(recent.items()))
+        if key not in self.versions:
+            count = sum(1 for k in self.versions if k[0] == pc)
+            if count >= MAX_VERSIONS:
+                return self.names[pc]
+            name = "%sE%d" % (self.names[pc], count)
+            self.versions[key] = name
+            self.wanted.append((pc, dict(recent), name))
+        return self.versions[key]
 
 
 def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int = 0,
               written: dict = None, clean: dict = None, dead_flags: bool = False,
               after: tuple = None, no_flags: bool = False, chain: dict = None, fl: Flags = None,
-              quiet: set = frozenset(), no_status: bool = False) -> list:
+              quiet: set = frozenset(), no_status: bool = False, entry: dict = None) -> list:
     """One pair, as Run runs it, then where the run goes: on to the next pair
     of the block, or (`last`, a branch taken, the program's end) back to the
     driver with s.pc. `index` is its place in the block and `written` where
@@ -631,7 +685,7 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
     waits = []
     for r, lanes in reads:
         for lane in range(4):
-            if lanes & (8 >> lane) and (r, lane) not in waits and not needless_wait(r, lane, index, written):
+            if lanes & (8 >> lane) and (r, lane) not in waits and not needless_wait(r, lane, index, written, entry):
                 waits.append((r, lane))
     q_waits = not immediate and (is_divide(lower) or is_wait(lower, 0x3B))
     p_waits = not immediate and (is_efu(lower) or is_wait(lower, 0x7B))
@@ -735,6 +789,10 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
         body.append("C::End(v, cyc);" if vi0 else "C::Next(cyc);")
     next_pc = (pc + 8) & mask
     body.append("++count;")
+    # What an entry version of where it goes on may know (Chain.version):
+    # the fields written in this pair and the two before, three pairs at
+    # least run in the block.
+    recent = {k: index - j for k, j in written.items() if index - j <= 2} if index >= 2 else None
     leaving = fl.leaving(index) + " " if fl is not None and fl.held else ""
     # Going on into a quiet block with nothing pending (no E bit here, no
     # branch to follow): the held flags all landed (Flags.leaving).
@@ -755,7 +813,7 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
         target = (pc - 8 + 8 + imm11(after[0]) * 8) & mask if static else None
         if target is not None:
             body.append("if (delayed != kNone) { s.pc = 0x%Xu; delayed = %s; %s%s }" %
-                        (target, new_delayed, landing_into(target), leave_to(target, chain)))
+                        (target, new_delayed, landing_into(target), leave_to(target, chain, recent)))
         else:
             body.append("if (delayed != kNone) { s.pc = delayed; delayed = %s; %s%s }" % (new_delayed, leaving, LEAVE))
     if branch:
@@ -764,7 +822,7 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
         body.append("s.pc = 0x%Xu;" % next_pc)
         if leaving:
             body.append(landing_into(next_pc).strip())
-        body.append(leave_to(next_pc, chain))
+        body.append(leave_to(next_pc, chain, recent))
     out += ["        " + line for line in body]
     out.append("    }")
     return out
@@ -1046,7 +1104,8 @@ TIMES_PASS = os.environ.get("PS2_VU_ALL_TIMES", "") != "1"
 
 
 def emit_block(name: str, block: list, pairs: dict, mask: int, drops: set = frozenset(),
-               chain: dict = None, quiet: set = frozenset(), no_status: bool = False) -> list:
+               chain: dict = None, quiet: set = frozenset(), no_status: bool = False,
+               entry: dict = None) -> list:
     # The run's state and the cycle as locals, written back where the block
     # leaves (LEAVE): nothing the block does can reach them through memory.
     # A block starts only with as many pairs left to the limit as it has
@@ -1068,7 +1127,7 @@ def emit_block(name: str, block: list, pairs: dict, mask: int, drops: set = froz
     head = len(out)
     bodies = [emit_pair(pc, pairs[pc][0], pairs[pc][1], mask, i == len(block) - 1, i, written, clean,
                         i in dead, pairs[block[i - 1]] if i else None, pc in drops, chain, fl, quiet,
-                        no_status)
+                        no_status, entry)
               for i, pc in enumerate(block)]
     if TIMES_PASS:
         untimed_writes(bodies)
@@ -1149,17 +1208,22 @@ def generate_files(programs: list, what: str, single: str = None) -> dict:
         # no one sees it (drops), its STATUS everywhere (no_status).
         fast = drops is not None
         quiet = quiet_blocks(blocks, pairs)
+        by_start = {b[0]: b for b in blocks}
         for block in blocks:
-            block_name = "%sBlock%04X" % (name, block[0])
-            names.append((block[0], block_name))
-            for variant, dropped in [("", frozenset())] + ([("Fast", drops)] if fast else []):
-                chain = {b[0]: "%sBlock%04X%s" % (name, b[0], variant) for b in blocks}
-                code = emit_block(block_name + variant, block, pairs, mask, dropped, chain, quiet,
-                                  no_status=variant == "Fast")
+            names.append((block[0], "%sBlock%04X" % (name, block[0])))
+        for variant, dropped in [("", frozenset())] + ([("Fast", drops)] if fast else []):
+            chain = Chain({b[0]: "%sBlock%04X%s" % (name, b[0], variant) for b in blocks})
+            work = [(b[0], None, chain[b[0]]) for b in blocks]
+            while work:
+                start, entry, block_name = work.pop(0)
+                code = emit_block(block_name, by_start[start], pairs, mask, dropped, chain, quiet,
+                                  no_status=variant == "Fast", entry=entry)
+                work += chain.wanted
+                chain.wanted = []
                 if single is None and len(chunks[-1]) + len(code) > LINES_PER_FILE and chunks[-1]:
                     chunks.append([])
                 chunks[-1] += code + [""]
-                declarations.append("PS2HOST_VU_BLOCK void %s%s(Vu& v, VuRunState& s, std::uint64_t limit);" % (block_name, variant))
+                declarations.append("PS2HOST_VU_BLOCK void %s(Vu& v, VuRunState& s, std::uint64_t limit);" % block_name)
         tables.append("const u32 k%sCode[] = {" % name)
         tables.append(code_array(runs_of(pairs)))
         tables.append("};")

@@ -56,9 +56,19 @@ comparison with a profiled build).
    loop. A version of the next block for entry from that edge can take them
    as they are - their cycles known relative to the exit - and land them
    straight-line where it reads MAC.
-3. **Stall checks across a known edge.** The same entry version knows which
-   fields the block before wrote in its last three pairs and when: its
-   first three pairs' checks become constants.
+3. **Stall checks across a known edge** (done, before 2: the larger share).
+   An exit that goes on into a known block, three pairs or more into its
+   own, goes into an *entry version* of it (vurecomp's Chain, up to
+   MAX_VERSIONS a block; `PS2_VU_NO_VERSIONS=1` for none): one compiled
+   knowing which fields were written in the last three pairs before it and
+   how many pairs before the exit (`recent`). A field written d pairs before
+   lands by the exit pair's issue + 4 - d; the version's pair i issues at
+   that issue + 1 + i at the earliest - no stall where d + i >= 3; anything
+   else landed before it. In the explosion's hottest block all fifteen
+   checks were in its first three pairs. Burnout 3's generated files 58 ->
+   131 (the build ~2 -> ~4 minutes). Bench: fast 58.7 -> 54.2 ms (-8%),
+   exact 81.1 -> 74.2 ms (-8.5%), hashes the same; with step 1, the
+   explosion's VU1 time -11%.
 4. **Clean operands across an edge.** Fields an FMAC left clean before the
    edge need no clamp after it.
 5. **Superblocks for loops.** A loop body chained into itself (most of the
