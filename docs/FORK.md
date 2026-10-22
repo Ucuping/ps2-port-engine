@@ -54,15 +54,23 @@ stub dispatch table, every test) checks that it still builds and passes.
   marked NOT VERIFIED instead of stopping. A structured form the equivalence
   check could not build is left out of it, not the check; and a function
   with no verification of its own keeps its plain form unless the check ran.
+- A derived function's result is modelled, compared and emitted as 32 bits,
+  so `derive.py` refuses a derivation whose original ever returns more - a
+  soft-float double or a long long in the whole of `$v0` - on its own test
+  cases or on probes with doubles, 64-bit integers and large magnitudes
+  (`testplan.wide_result`); the lifted copy, verified on the whole state,
+  stands. Modelling 64-bit results instead is proposed in Tekken 5's
+  FINDINGS.md (engine finding 7).
+- The structured form declares a branch's kept test, then sets it
+  (`bool t; t = C;`): a goto into the block may pass that in standard C++,
+  where `const bool t = C` - which MSVC accepts and clang refuses - it may
+  not.
 
 Found and not yet changed, with the evidence in the Tekken 5 repository's
 `games/tekken5/docs/FINDINGS.md` ("Engine findings worth upstreaming"): a call
 that never returns makes the analysis swallow the next function; tables
 outside the code section are invisible to the analysis; only the first
-executable section is analysed; a derived function's result is modelled,
-compared and emitted as a signed 32-bit value, so one returning a double or a
-64-bit integer in `$v0` is `verified` on the low half of its result and
-emitted returning `s32`; four faults of the C++ rendering, which the compiled
-check catches and drops; structured forms with a `goto` past an
-initialisation, which MSVC accepts and clang refuses, so those functions keep
-their plain form outside Windows.
+executable section is analysed; four faults of the C++ rendering, which the
+compiled check catches and drops; `callers_known` holds for an executable
+whose own modules, loaded at run time, call it, until they are listed as
+overlays.
