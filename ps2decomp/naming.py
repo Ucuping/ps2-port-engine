@@ -17,6 +17,11 @@ certainty:
   The shape of their call sites names them (`rpc_names`).
 * **Hand-assigned names.** The ones in the game's status table that are not
   `generated::` placeholders.
+* **The game's renames.** `config/renames.csv`, in the same columns as
+  `names.csv`: names the game's project has decided on - a descriptive name
+  where no public source names a function, a public name where the engine's
+  data has none - each with its own evidence. They are applied after every
+  other source (`apply_renames`), so running the naming again never undoes them.
 
 A game's names live in `config/names.csv` as (address, name, source), so every
 name can be traced back to its evidence and a wrong one is easy to find. Nothing
@@ -229,9 +234,21 @@ def load(path: str) -> dict:
 
 
 def save(path: str, names: dict) -> None:
+    # As CSV proper: a source with commas in it (the SIF RPC evidence lists
+    # server IDs) is quoted, not split into fields `load` would cut off.
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write("address,name,source\n")
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(["address", "name", "source"])
         for address in sorted(names):
             name, source = names[address]
-            handle.write("0x%08X,%s,%s\n" % (address, name, source))
+            writer.writerow(["0x%08X" % address, name, source])
+
+
+def apply_renames(names: dict, path: str) -> int:
+    """Apply a game's renames file (the columns of names.csv) over `names`, last
+    of all; each renamed entry keeps the rename's own evidence. Returns how many."""
+    renames = load(path)
+    for address, (name, source) in renames.items():
+        names[address] = (name, "renamed - " + source)
+    return len(renames)

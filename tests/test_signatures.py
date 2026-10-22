@@ -104,6 +104,27 @@ class TestNaming(unittest.TestCase):
         self.assertEqual(table[0x4A], "SetOsdConfigParam")
         self.assertEqual(table[0x4B], "GetOsdConfigParam")
 
+    def test_a_source_with_commas_survives_save_and_load(self):
+        path = os.path.join(tempfile.mkdtemp(), "names.csv")
+        names = {BASE: ("sceSifBindRpc", "SIF RPC call sites - passed 3 SDK server IDs "
+                                         "(0x80000001, 0x80000003, 0x80000006...)")}
+        naming.save(path, names)
+        self.assertEqual(naming.load(path), names)
+
+    def test_a_rename_has_the_last_word(self):
+        renames = os.path.join(tempfile.mkdtemp(), "renames.csv")
+        naming.save(renames, {BASE: ("FindAddress", "kernel service 0x83, as ps2sdk names it")})
+        names = {BASE: ("RFU083", "kernel service 0x83"),
+                 BASE + 16: ("StringCopy", "signature library (SLUS_210.50)")}
+        self.assertEqual(naming.apply_renames(names, renames), 1)
+        self.assertEqual(names[BASE], ("FindAddress", "renamed - kernel service 0x83, as ps2sdk names it"))
+        self.assertEqual(names[BASE + 16], ("StringCopy", "signature library (SLUS_210.50)"))
+
+    def test_without_a_renames_file_nothing_changes(self):
+        names = {BASE: ("SignalSema", "kernel service 0x42")}
+        self.assertEqual(naming.apply_renames(names, os.path.join(tempfile.mkdtemp(), "renames.csv")), 0)
+        self.assertEqual(names, {BASE: ("SignalSema", "kernel service 0x42")})
+
     def test_the_library_names_kernel_stubs_as_the_service_table_does(self):
         # A stub named in another game must not contradict the service numbers.
         library = signatures.Library.load()

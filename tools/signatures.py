@@ -6,7 +6,8 @@
     python engine/tools/signatures.py compare --elf other.elf
 
 `name` collects every name the evidence supports (kernel stubs, the status table,
-self-identifying diagnostic strings, the cross-game signature library) into the game's `config/names.csv`. `export`
+self-identifying diagnostic strings, the cross-game signature library) into the game's `config/names.csv`,
+and then the game's own `config/renames.csv`, which has the last word. `export`
 adds the game's named functions to `engine/signatures/library.json`, so the next
 game is named from them. `compare` measures how much code the game shares with
 another executable, with no names involved.
@@ -40,6 +41,10 @@ def _names_path(game):
     return game.path(os.path.join(os.path.dirname(game.status), "names.csv"))
 
 
+def _renames_path(game):
+    return game.path(os.path.join(os.path.dirname(game.status), "renames.csv"))
+
+
 def name(game) -> int:
     database = game.load_database()
     image, base = _image(game.load_elf())
@@ -67,6 +72,8 @@ def name(game) -> int:
             seen = ";".join(library.sources(key))
             names[address] = (found, "signature library (%s)" % seen)
             from_library += 1
+    # The game's own decisions come last, so a run never undoes them.
+    naming.apply_renames(names, _renames_path(game))
     path = _names_path(game)
     naming.save(path, names)
     sources = collections.Counter(source.split(" (")[0].split(" - ")[0].split(" 0x")[0].split(" -0x")[0]
