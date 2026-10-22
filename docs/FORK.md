@@ -27,8 +27,7 @@ symbols or libraries.
 
 ## Fixes and additions meant for upstream
 
-None of these changes what the Windows build does but one, made on purpose
-(the float control register kept per fiber, below); the Windows CI
+None of these changes what the Windows build does; the Windows CI
 (`.github/workflows/windows.yml`: MSVC, AVX2 on and off, a port linked from a
 stub dispatch table, every test) checks that it still builds and passes.
 
@@ -72,8 +71,10 @@ stub dispatch table, every test) checks that it still builds and passes.
   Apple's (macOS, iOS) beside them - and `threads.cpp` on it. On Apple's
   arm64 the fibers are a switch of our own with stacks mapped under a guard
   of max(16 KB, a page). The float control register goes with each fiber
-  on Windows as on arm64: Windows' fibers were made without
-  `FIBER_FLAG_FLOAT_SWITCH`, and the layer saves and restores it itself.
+  on Windows as on arm64. On x64, Windows' own fibers - made without
+  `FIBER_FLAG_FLOAT_SWITCH` - were seen in CI to keep MXCSR per fiber
+  already (the platform tests print it); the layer saves and restores the
+  register itself rather than lean on that, so arm64 does the same.
 
 Found and not yet changed, with the evidence in the Tekken 5 repository's
 `games/tekken5/docs/FINDINGS.md` ("Engine findings worth upstreaming"): a call
