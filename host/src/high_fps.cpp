@@ -100,8 +100,9 @@ constexpr double kStepRate = 1e6 / 16683.0;    // the blanks' own, 59.94 (thread
 double g_cap = 0.0;
 int g_sampled = 0;                      // frames since the last look
 
-/* Into a rate above the game's own, the rate rises to it over a moment
-   (PS2HOST_HIGH_FPS_RAMP ms, 600 by default; 0: at once): a laptop's GPU
+/* Into a rate above the game's own, the rate rises to it in eighths
+   (PS2HOST_HIGH_FPS_RAMP ms for all eight at the least, 600 by default; 0:
+   at once; Rise): a laptop's GPU
    idles clocked down through the loading and the 60-a-second screens
    before a race (an RTX 4070 Laptop at 600-900 MHz, its memory at 810),
    and at once at 144 it took half a second to clock up, the race's first
@@ -109,6 +110,7 @@ int g_sampled = 0;                      // frames since the last look
    clocks with it. */
 double g_target = 0.0;                  // the rate risen to (0: not rising)
 std::chrono::steady_clock::time_point g_rise_from;
+bool g_rise_new = false;                // a rise begun: Rise starts its steps
 
 double RiseMs() {
     static const double ms = [] {
@@ -560,19 +562,38 @@ void HighFpsStepped() {
     if (g_rate > 0.0) TakeDown();
 }
 
-/* Rising (g_target): the rate for the time since it began, in eighths of
-   the way from the game's own (a blank rate set each eighth, not each
-   picture); the target once the time is up. */
+/* Rising (g_target): an eighth of the way from the game's own rate at a
+   time, each after RiseMs / 8 - and only when none of the pictures since the
+   last eighth was shown late (LatePictures): a GPU still clocked down holds
+   the rate where it keeps up until its clocks come up (an RTX 4070 Laptop at
+   P5 drew a race's view at about 60 a second, and boosted only after half a
+   second near 100%); never lower. Past 8 RiseMs, the target whatever came. */
 void Rise() {
     if (g_target <= 0.0 || g_rate <= 0.0) return;
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_rise_from).count();
-    const double part = RiseMs() > 0.0 ? std::min(1.0, std::floor(8.0 * ms / RiseMs() + 1.0) / 8.0) : 1.0;
-    const double rate = part >= 1.0 ? g_target : Own() + (g_target - Own()) * part;
+    static std::chrono::steady_clock::time_point step_from;
+    static u64 late_from = 0;
+    static int part = 1;
+    const auto now = std::chrono::steady_clock::now();
+    if (g_rise_new) {
+        g_rise_new = false;
+        step_from = now;
+        late_from = LatePictures();
+        part = 1;
+    }
+    const double step_ms = std::chrono::duration<double, std::milli>(now - step_from).count();
+    const double all_ms = std::chrono::duration<double, std::milli>(now - g_rise_from).count();
+    if (all_ms >= 8.0 * RiseMs()) part = 8;
+    else if (step_ms >= RiseMs() / 8.0) {
+        if (LatePictures() == late_from) ++part;
+        step_from = now;
+        late_from = LatePictures();
+    }
+    const double rate = part >= 8 ? g_target : Own() + (g_target - Own()) * part / 8.0;
     if (rate > g_rate + 0.5) {
         g_rate = rate;
         g_per_picture = Pace(rate);
     }
-    if (part >= 1.0) g_target = 0.0;
+    if (part >= 8) g_target = 0.0;
 }
 
 void HighFpsPicture() {
@@ -596,6 +617,7 @@ void HighFpsPicture() {
             const bool rising = g_rate <= 0.0 && RiseMs() > 0.0;
             g_target = rising ? want : 0.0;
             g_rise_from = std::chrono::steady_clock::now();
+            g_rise_new = rising;
             g_rate = rising ? Own() + (want - Own()) / 8.0 : want;
             g_per_picture = Pace(g_rate);
         } else {
