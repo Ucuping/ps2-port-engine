@@ -27,7 +27,9 @@ symbols or libraries.
 
 ## Fixes and additions meant for upstream
 
-None of these changes what a Windows build compiles or does.
+None of these changes what the Windows build does; the Windows CI
+(`.github/workflows/windows.yml`: MSVC, AVX2 on and off, a port linked from a
+stub dispatch table, every test) checks that it still builds and passes.
 
 - Kernel services 0x4A and 0x4B were swapped in `data/ee_syscalls.csv` (and so
   in the signature library), against ps2sdk, PCSX2 and the host's own
@@ -39,9 +41,24 @@ None of these changes what a Windows build compiles or does.
   runtime calls that differ by platform in `host/src/crt.h`; the SSE2 store
   path in `gs_memory.cpp` only where there is SSE2; a `macos-arm64` CMake
   preset in the game template.
+- The VUs' float mode through `runtime/include/ps2rt/fp_mode.h`: on x86 the
+  same MXCSR values as before, on arm64 FPCR (round toward zero, flush to
+  zero). Tests pin the modes - `runtime/tests/fp_mode_tests.cpp`, run by
+  `ps2rt_tests` and `ps2host_tests`.
+- The compiled checks build outside Windows: `cppcheck.py`, `liftcheck.py`
+  and `equivalence.py` compile their libraries with clang++ (`$CXX`) at
+  `-O3 -ffp-contract=off`, as a Release port is compiled; MSVC's path is
+  unchanged. `derive.py` marks a derivation `verified` only if its emitted
+  C++ was compiled and run against the original - without a compiler it is
+  `reconstructed` - and `lift.py` without a compiler emits its functions
+  marked NOT VERIFIED instead of stopping.
 
 Found and not yet changed, with the evidence in the Tekken 5 repository's
 `games/tekken5/docs/FINDINGS.md` ("Engine findings worth upstreaming"): a call
 that never returns makes the analysis swallow the next function; tables
 outside the code section are invisible to the analysis; only the first
-executable section is analysed.
+executable section is analysed; a derived function's result is modelled,
+compared and emitted as a signed 32-bit value, so one returning a double or a
+64-bit integer in `$v0` is `verified` on the low half of its result and
+emitted returning `s32`; four faults of the C++ rendering, which the compiled
+check catches and drops.
