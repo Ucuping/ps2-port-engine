@@ -233,6 +233,11 @@ void TakeDown() {
         const u8* base = generated::RamPointer(region.begin, region.end - region.begin);
         if (!base) continue;
         for (u32 at = 0; at + 64 <= region.end - region.begin; at += 16) {
+            // The right row's length first, in place: most of 2 MB a step is
+            // no matrix, and the copy of each candidate was most of the scan.
+            float right[3];
+            std::memcpy(right, base + at, sizeof right);
+            if (!(std::fabs(Dot3(right, right) - 1.0f) < 0.01f)) continue;
             Matrix m;
             std::memcpy(m.m, base + at, sizeof m.m);
             if (!Shaped(m.m)) continue;
