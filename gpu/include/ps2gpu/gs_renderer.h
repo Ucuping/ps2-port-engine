@@ -135,7 +135,8 @@ struct GsDrawState {
     /* A game's tag on the draw (the bridge's SetGpuDrawTag, by the texture
        it samples): bit 0 a car's paint sampling a sphere map, its colour
        scaled by a Fresnel term from the texel's place in the map (gs.frag);
-       bit 1 mipmapped textures filtered as a modern GPU does (SampleModern). */
+       bit 1 mipmapped textures filtered as a modern GPU does (SampleModern);
+       bit 2 a soft particle, faded near the scene's depth (kSceneDepth). */
     std::uint32_t tag = 0;
 };
 
@@ -198,6 +199,7 @@ enum class GsEffectId : std::uint32_t {
     kMotionBlur = 2,    /* a camera's motion blur, from the depth */
     kBloom = 3,         /* a glow of the bright parts */
     kGrade = 4,         /* tone and colour */
+    kSceneDepth = 5,    /* the scene's depth saved, for soft particles drawn after (tag bit 2) */
 };
 struct GsEffect {
     GsEffectId id = GsEffectId::kTint;

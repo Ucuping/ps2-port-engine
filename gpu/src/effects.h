@@ -36,6 +36,9 @@ public:
     void Forget();
     /* An image view going: the descriptor sets naming it with it. */
     void ForgetView(VkImageView view);
+    /* The scene's depth the last kSceneDepth saved (GENERAL, the target's
+       size), or null. */
+    VkImageView SceneDepth() const { return scene_.view; }
 
 private:
     struct Scratch {
@@ -51,7 +54,7 @@ private:
         bool made = false;
     };
     enum Pass { kTint, kAo, kAoBlurX, kAoBlurY, kAoApply, kBlur, kCopy, kBloomDown, kBloomUp, kBloomApply, kGrade,
-                kPasses };
+                kSceneDepth, kPasses };
     struct Push {
         std::int32_t rect[4];
         std::int32_t size[4];
@@ -76,6 +79,7 @@ private:
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     VkSampler linear_ = VK_NULL_HANDLE, nearest_ = VK_NULL_HANDLE;
     Scratch dummy_;                         // what a pass does not use is bound to
+    Scratch scene_;                         // the scene's depth (SceneDepth)
     std::map<std::uint64_t, Set> sets_;     // by w << 32 | h
     std::map<std::array<VkImageView, 5>, VkDescriptorSet> descriptors_;
     std::uint32_t frame_ = 0;

@@ -16,6 +16,7 @@
 #include "effects_8.h"
 #include "effects_9.h"
 #include "effects_10.h"
+#include "effects_11.h"
 
 namespace ps2gpu {
 
@@ -34,6 +35,7 @@ constexpr int kBloomLevels = 6;
 GsEffects::~GsEffects() {
     Forget();
     DestroyScratch(dummy_);
+    DestroyScratch(scene_);
     for (int i = 0; i < kPasses; ++i) {
         if (pipelines_[i]) vkDestroyPipeline(g_.device, pipelines_[i], nullptr);
         if (modules_[i]) vkDestroyShaderModule(g_.device, modules_[i], nullptr);
@@ -70,7 +72,7 @@ bool GsEffects::Init(VkPipelineCache cache) {
         {spirv_effects_4, sizeof spirv_effects_4}, {spirv_effects_5, sizeof spirv_effects_5},
         {spirv_effects_6, sizeof spirv_effects_6}, {spirv_effects_7, sizeof spirv_effects_7},
         {spirv_effects_8, sizeof spirv_effects_8}, {spirv_effects_9, sizeof spirv_effects_9},
-        {spirv_effects_10, sizeof spirv_effects_10},
+        {spirv_effects_10, sizeof spirv_effects_10}, {spirv_effects_11, sizeof spirv_effects_11},
     };
     for (int i = 0; i < kPasses; ++i) {
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -159,6 +161,7 @@ void GsEffects::Forget() {
         for (Scratch& s : set.up) DestroyScratch(s);
     }
     sets_.clear();
+    DestroyScratch(scene_);
     descriptors_.clear();
     if (pool_) vkResetDescriptorPool(g_.device, pool_, 0);
 }
@@ -328,6 +331,14 @@ void GsEffects::Record(VkCommandBuffer cmd, const GsEffect& e, const Target& t) 
         }
         case GsEffectId::kGrade:
             Dispatch(cmd, kGrade, Descriptors(t, nullptr, nullptr, nullptr), push, w, h);
+            break;
+        case GsEffectId::kSceneDepth:
+            if (!t.depth_view) return;
+            if (scene_.w != t.pw || scene_.h != t.ph) {
+                DestroyScratch(scene_);
+                MakeScratch(scene_, t.pw, t.ph, cmd);
+            }
+            Dispatch(cmd, kSceneDepth, Descriptors(t, scene_.view, nullptr, nullptr), push, w, h);
             break;
     }
 }

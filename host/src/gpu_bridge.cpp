@@ -97,6 +97,14 @@ void SetGpuModernTextures(bool on) { g_modern_textures = on; }
 std::string g_gpu_name;         // GpuName
 std::string GpuName() { return g_gpu_name; }
 
+// SetGpuSoftParticles' textures (up to four TBPs; 0 none), and whether the
+// frame's view has had its effects (the soft particles' depth saved).
+std::atomic<u32> g_soft_tbp[4] = {};
+bool g_after_effects = false;
+void SetGpuSoftParticles(const u32* tbps, std::size_t count) {
+    for (std::size_t i = 0; i < 4; ++i) g_soft_tbp[i] = i < count ? tbps[i] : 0u;
+}
+
 void SetGpuDrawTag(u32 tbp, u32 tag) {
     g_tag_bits = tag;
     g_tag_tbp = tag ? tbp : ~0u;
@@ -1646,6 +1654,12 @@ void OnEffect(u64 run, const u64* p) {
     }
     ++g_draws;
     s.renderer->RunEffect(e);
+    // The view's scene depth saved (and AO before the fog): what follows its
+    // glow, grade or blur may be a soft particle.
+    if (e.id == ps2gpu::GsEffectId::kSceneDepth || e.id == ps2gpu::GsEffectId::kOcclusion) g_after_effects = false;
+    if (e.id == ps2gpu::GsEffectId::kBloom || e.id == ps2gpu::GsEffectId::kGrade ||
+        e.id == ps2gpu::GsEffectId::kMotionBlur)
+        g_after_effects = true;
     Drew(s, *target, u32(e.x0), u32(e.x1), u32(e.y1), u32(e.y0));
 }
 
@@ -1783,6 +1797,13 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     state.textured = (call.prim >> 4) & 1;
     if (state.textured && Bits(c.tex0, 0, 14) == g_tag_tbp.load(std::memory_order_relaxed)) state.tag = g_tag_bits;
     if (state.textured && g_modern_textures.load(std::memory_order_relaxed)) state.tag |= 2u;
+    // A soft particle: a game's particle texture, blended and depth tested,
+    // drawn after its view's effects (the scene's depth saved then).
+    if (g_after_effects && state.textured && ((call.prim >> 6) & 1) && Bits(c.test, 16, 1)) {
+        const u32 tbp = Bits(c.tex0, 0, 14);
+        for (const auto& soft : g_soft_tbp)
+            if (tbp && soft.load(std::memory_order_relaxed) == tbp) state.tag |= 4u;
+    }
     state.sprite = type == 6 && s.renderer->Scale() > 1;     // (at 1x it would only split batches)
     state.sprite_prim = type == 6;
     if (s.primary && s.Dumping()) {
@@ -2328,6 +2349,7 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
             PresentWaiting();               // the last frame's, nothing having moved it on
             GpuShadowFrame(frame, std::string());
             // The internal resolution, between frames (the GS thread's).
+            g_after_effects = false;
             const u32 scale = WantedScale(WindowDisplay());
             if (scale != g_bridge->renderer->Scale()) Rescale(*g_bridge, scale);
             // The game's scale rule (SetGpuScaleRule), between frames too.

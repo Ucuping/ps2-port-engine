@@ -598,6 +598,10 @@ void SetGpuDrawTag(u32 tbp, u32 tag);
    the footprint on screen (finer at an internal resolution), trilinear,
    anisotropic - not by the GS's depth-based level (GsDrawState::tag bit 1). */
 void SetGpuModernTextures(bool on);
+/* A game's particle textures (TBPs, up to four; none to stop): their draws
+   blended and depth tested after a view's effects are soft particles, faded
+   near the scene's depth the game's kSceneDepth effect saved (tag bit 2). */
+void SetGpuSoftParticles(const u32* tbps, std::size_t count);
 /* The GPU drawing the game ("" before it is started, or with none): its
    name as the driver gives it - a game's defaults may weigh it (an
    integrated GPU's). */

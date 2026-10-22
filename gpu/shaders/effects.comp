@@ -38,6 +38,7 @@ layout(push_constant) uniform Params {
 #define PASS_BLOOM_UP 8
 #define PASS_BLOOM_APPLY 9
 #define PASS_GRADE 10
+#define PASS_SCENE_DEPTH 11
 
 const float kTwoTo32 = 4294967296.0;
 
@@ -357,6 +358,14 @@ void main() {
           texture(src_a, uv + vec2(-t.x, t.y)).rgb + texture(src_a, uv + vec2(t.x, t.y)).rgb;
     up /= 16.0;
     imageStore(dst, at, vec4(texelFetch(src_b, at, 0).rgb + up * pc.p[11], 1.0));
+
+#elif PASS == PASS_SCENE_DEPTH
+    // The scene's depth for what is drawn after (soft particles: gs.frag):
+    // into dst at the target's own pixels, the distance in r, the depth's
+    // mapping in g (a / 1024) and b (b).
+    const ivec2 q = pc.rect.xy + at;
+    if (any(greaterThanEqual(q, pc.rect.zw))) return;
+    imageStore(dst, q, vec4(DepthAt(vec2(q) + 0.5), pc.p[0] / 1024.0, pc.p[1], 1.0));
 
 #elif PASS == PASS_BLOOM_APPLY || PASS == PASS_GRADE
     // The glow (src_a, the chain's top: p1 its strength) added, then the

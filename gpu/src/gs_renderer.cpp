@@ -748,6 +748,7 @@ private:
         std::uint64_t recording = ~0ull;
         VkPipeline pipeline = VK_NULL_HANDLE;
         VkDescriptorSet sets[2] = {};
+        VkDescriptorSet set2 = VK_NULL_HANDLE;     // gs.frag's set 2
         int depth_test = -1, stencil_test = -1, compare = -1, depth_write = -1;
         VkViewport viewport{};
         VkRect2D scissor{};
@@ -819,6 +820,37 @@ private:
     void RecordShuffle();
     /* The PC's effects (RunEffect, effects.cpp). */
     GsEffects effects_{g_};
+    /* The scene's depth GsEffects saved, as gs.frag's set 2 (soft
+       particles): made again when its view changes; null for none. */
+    VkDescriptorSet scene_set_ = VK_NULL_HANDLE;
+    VkImageView scene_view_ = VK_NULL_HANDLE;
+    VkDescriptorSet SceneDepthSet() {
+        const VkImageView view = effects_.SceneDepth();
+        if (!view) return VK_NULL_HANDLE;
+        if (view == scene_view_ && scene_set_) return scene_set_;
+        if (!scene_set_) {
+            VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            ai.descriptorPool = pool_;
+            ai.descriptorSetCount = 1;
+            ai.pSetLayouts = &set_layout_;
+            if (vkAllocateDescriptorSets(g_.device, &ai, &scene_set_) != VK_SUCCESS) return VK_NULL_HANDLE;
+        }
+        // (once the GPU is done with the set as it was: a scale's change, idle)
+        const VkDescriptorImageInfo info[2] = {
+            {samplers_[3], view, VK_IMAGE_LAYOUT_GENERAL},
+            {samplers_[3], blank_.image.words, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+        VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        for (int i = 0; i < 2; ++i) {
+            writes[i].dstSet = scene_set_;
+            writes[i].dstBinding = std::uint32_t(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[i].pImageInfo = &info[i];
+        }
+        vkUpdateDescriptorSets(g_.device, blank_.image.words ? 2 : 1, writes, 0, nullptr);
+        scene_view_ = view;
+        return scene_set_;
+    }
 };
 
 void* VulkanGsRenderer::Vertices(VkDeviceSize bytes, VkBuffer* buffer, VkDeviceSize* offset) {
@@ -1810,6 +1842,7 @@ void VulkanGsRenderer::RunEffect(const GsEffect& e) {
         Transition(cmd, t, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
         effects_.Record(cmd, e, view);
+        MemoryBarrier(cmd);                     // (what it wrote, to the draws after: the scene's depth)
         ++g_dispatches;
         g_.Mark(cmd, kProfEffects);
     });
@@ -3131,6 +3164,8 @@ void VulkanGsRenderer::Flush() {
     if (Is16Bit(state_.psm)) params.blend_ops |= 1u << 16;    // gs.frag: colour cut to five bits a channel
     if (state_.tag & 1u) params.blend_ops |= 1u << 19;          // gs.frag: the paint's Fresnel term
     if (state_.tag & 2u) params.blend_ops |= 1u << 20;          // gs.frag: modern texture filtering
+    if ((state_.tag & 4u) && !ShaderBlend(state_) && SceneDepthSet())
+        params.blend_ops |= 1u << 21;                           // gs.frag: a soft particle
     params.blend_ops |= std::uint32_t(Blender16(state_)) << 17;     // gs.frag: S for the blender
     const std::uint32_t count = std::uint32_t(pending_.size());
     static int complaints = 0;
@@ -3222,9 +3257,14 @@ void VulkanGsRenderer::Flush() {
                 d.sets[1] = clut_set_;
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 2, d.sets, 0, nullptr);
             }
-            if (destination_set)
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 2, 1, &destination_set, 0,
-                                        nullptr);
+            // Set 2: the copy blending in the shader reads, the scene's depth
+            // for a soft particle, or the blank texture (bound all the same).
+            VkDescriptorSet set2 = destination_set;
+            if (!set2) set2 = (state_.tag & 4u) && SceneDepthSet() ? SceneDepthSet() : SampledSet(blank_.image);
+            if (set2 && d.set2 != set2) {
+                d.set2 = set2;
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 2, 1, &set2, 0, nullptr);
+            }
             const VkViewport vp{0, 0, float(t->pw()), float(t->ph()), 0, 1};
             if (std::memcmp(&vp, &d.viewport, sizeof vp) != 0) {
                 d.viewport = vp;
