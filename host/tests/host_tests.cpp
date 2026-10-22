@@ -1792,8 +1792,65 @@ void OverlaysRunWhatIsLoaded() {
     ps2host::RegisterOverlays(nullptr, 0);
 }
 
+// Code met at run time is looked for in every segment the executable loaded,
+// not only the first: a copy of bytes it keeps in its data segment (Tekken 5's
+// kernel extension, copied to kernel RAM), a call into a later segment that no
+// function covers, a copy of its code as before - and nothing for bytes it never
+// had.
+bool Discovered(u32 address, u32* source) {
+    const std::size_t before = ps2host::RunStats().discovered.size();
+    lifted::Context c{};
+    bool refused = false;
+    try {
+        ps2host::Dispatch(c, address);
+    } catch (const ps2host::Unimplemented&) {
+        refused = true;
+    }
+    const auto& found = ps2host::RunStats().discovered;
+    if (!refused || found.size() == before) return false;
+    if (found.back().first != address) return false;
+    *source = found.back().second;
+    return true;
+}
+
+void CopiedCodeIsFoundInEverySegment() {
+    // An executable of two segments: code at 0x00700000, data (and BSS) at 0x00710000.
+    constexpr u32 kCode = 0x00700000u, kData = 0x00710000u, kSize = 0x40;
+    std::vector<u8> elf(0x100 + 2 * kSize);
+    auto put = [&](std::size_t at, u32 v, int bytes) { std::memcpy(&elf[at], &v, std::size_t(bytes)); };
+    std::memcpy(elf.data(), "\x7F" "ELF\x01\x01\x01", 7);
+    put(16, 2, 2), put(18, 8, 2), put(20, 1, 4), put(24, kCode, 4), put(28, 52, 4);    // entry, phoff
+    put(40, 52, 2), put(42, 32, 2), put(44, 2, 2);                                      // ehsize, phentsize, phnum
+    const u32 segments[2][4] = {{0x100, kCode, kSize, kSize}, {0x100 + kSize, kData, kSize, 2 * kSize}};
+    for (int i = 0; i < 2; ++i) {
+        const std::size_t ph = 52 + 32 * std::size_t(i);
+        put(ph, 1, 4), put(ph + 4, segments[i][0], 4), put(ph + 8, segments[i][1], 4), put(ph + 12, segments[i][1], 4);
+        put(ph + 16, segments[i][2], 4), put(ph + 20, segments[i][3], 4), put(ph + 28, 16, 4);
+    }
+    for (u32 i = 0; i < kSize / 4; ++i) {
+        put(0x100 + 4 * i, 0x27BD0000u + i * 0x00010101u, 4);           // words found once each
+        put(0x100 + kSize + 4 * i, 0x3C020000u + i * 0x00030507u, 4);
+    }
+    Check(ps2host::LoadExecutable("test.elf", elf) == kCode, "discovery: the executable's entry");
+    ps2host::Memory& m = ps2host::GuestMemory();
+    u32 source = 0;
+    // Bytes of the data segment copied to kernel RAM.
+    for (u32 i = 0; i < 0x30; i += 4) m.Write(0x80076000u + i, m.Read(kData + 0x10 + i, 4), 4);
+    Check(Discovered(0x80076000u, &source) && source == kData + 0x10,
+          "discovery: code copied out of the data segment is found there");
+    Check(Discovered(kData + 0x20, &source) && source == kData + 0x20,
+          "discovery: a call into a later segment is its own source");
+    for (u32 i = 0; i < kSize; i += 4) m.Write(0x00720000u + i, m.Read(kCode + i, 4), 4);
+    Check(Discovered(0x00720000u, &source) && source == kCode, "discovery: a copy of the code segment, as before");
+    for (u32 i = 0; i < 0x30; i += 4) m.Write(0x00730000u + i, 0x0BADC0DEu + i, 4);
+    Check(!Discovered(0x00730000u, &source), "discovery: bytes the executable never had are no copy");
+    for (const u32 at : {kCode, kData, 0x80076000u, 0x00720000u, 0x00730000u})
+        for (u32 i = 0; i < 2 * kSize; i += 4) m.Write(at + i, 0u, 4);
+}
+
 int main() {
     OverlaysRunWhatIsLoaded();
+    CopiedCodeIsFoundInEverySegment();
     MirrorsReachTheSameRam();
     LoadsExtendAsTheEeDoes();
     OutsideMemoryFaults();

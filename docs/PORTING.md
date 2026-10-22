@@ -364,19 +364,23 @@ Some code is never where the analysis looks for it:
 
 * **copied code** - start-up code keeps kernel extensions as data and copies
   them into kernel RAM (Burnout 3 installs three: the alarm services, and two
-  more), then runs them there;
+  more; Tekken 5 keeps one in its data segment), then runs them there;
 * **unreached code** - functions in the executable that no call reaches and no
-  pointer table names: virtual methods, stored callbacks, tail-call targets.
+  pointer table names: virtual methods, stored callbacks, tail-call targets -
+  and code in an executable section the analysis does not read (it reads the
+  first: Tekken 5's `.y4` is a second).
 
 The analysis recovers what it can of the second kind from the gaps between the
 functions it found (`engine/ps2decomp/gaps.py`). For the rest, the host records
 every call to an address with no translation whose bytes it finds in the
-executable (`--discover`), and `port.py` translates that code at the address it
-runs from and builds again, until a run finds nothing new. A call to a copy of a
-function already translated runs that translation directly.
+executable - in any segment it loaded, code or data (`--discover`) - and
+`port.py` translates that code, from the section that holds it, at the address
+it runs from and builds again, until a run finds nothing new. A call to a copy
+of a function already translated runs that translation directly.
 
 These translations are not verified - the interpreter never runs them - and the
-generated source says so.
+generated source says so, for each one with the section its code came from;
+`port.py` counts them apart from the analysed functions, by section.
 
 **Overlays** - code a game loads from its disc over free memory, several of them
 at the same address in turn - are decompiled as games of their own

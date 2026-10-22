@@ -180,22 +180,30 @@ def discovered_pairs(path: str) -> set:
 
 
 def discovered_functions(game, path: str, pairs=None) -> dict:
-    """{run address: C++} for the code runs found copied at run time, translated
-    at their run addresses from the executable's bytes - or, for an overlay
-    (`game` is one), from the overlay's, given its `pairs`."""
+    """{run address: (source, C++)} for the code runs found copied at run time,
+    translated at their run addresses from the executable's bytes - from whichever
+    of its sections holds the source: the code's own, data a kernel extension is
+    kept in (Tekken 5's .data), a second code section (its .y4) - or, for an
+    overlay (`game` is one), from the overlay's, given its `pairs`."""
     if pairs is None:
         pairs = discovered_pairs(path)
     if not pairs:
         return {}
     elf = game.load_elf()
-    section = elf.exec_sections[0]
-    image = elf.section_data(section)
-    # A run is lifted from a slice of the image; its jump tables lie elsewhere
-    # in it (Burnout 3's 0x00242AA0 reaches 0x00242BD0 through one).
-    lift.use_sections([(image, section.addr)] + [(elf.section_data(s), s.addr) for s in elf.sections
-                                                  if s.is_alloc and s.size and s is not section and s.type != 8])
+    loaded = [s for s in elf.sections if s.is_alloc and s.size and s.occupies_file]
     found = {}
     for run, source in sorted(pairs):
+        section = next((s for s in loaded if s.addr <= source < s.end_addr), None)
+        if section is None:
+            print("  cannot translate the code at 0x%08X (from 0x%08X): no section of the "
+                  "executable holds it" % (run, source))
+            continue
+        image = elf.section_data(section)
+        # A run is lifted from a slice of its section; its jump tables lie
+        # elsewhere in the program (Burnout 3's 0x00242AA0 reaches 0x00242BD0
+        # through one).
+        lift.use_sections([(image, section.addr)] + [(elf.section_data(s), s.addr) for s in loaded
+                                                      if s is not section])
         offset = source - section.addr
         code = image[offset:offset + gaps.MAX_FUNCTION]
         try:
@@ -231,15 +239,21 @@ def generate(game) -> str:
               "using namespace lifted;", "",
               "/* Code found copied at run time, translated at its run address. NOT VERIFIED. */",
               ""]
+    # Where each one's code lies in the executable: counted apart from the
+    # analysed functions, by section.
+    elf = game.load_elf() if discovered else None
+    where = {}
     for run, (source, text) in sorted(discovered.items()):
+        section = elf.section_at(source)
+        where[run] = section.name if section is not None else "?"
         if source == run:
-            copies += ["/* 0x%08X: reached at run time; no function in the analysis starts "
-                       "here */" % run, text]
-            names.setdefault(run, "found at run time")
+            copies += ["/* 0x%08X: reached at run time, in %s; no function in the analysis "
+                       "starts here. NOT VERIFIED. */" % (run, where[run]), text]
+            names.setdefault(run, "found at run time in %s" % where[run])
         else:
-            copies += ["/* 0x%08X: a copy of the executable's code at 0x%08X */" % (run, source),
-                       text]
-            names.setdefault(run, "copy of 0x%08X" % source)
+            copies += ["/* 0x%08X: a copy of the executable's code at 0x%08X, in %s. NOT "
+                       "VERIFIED. */" % (run, source, where[run]), text]
+            names.setdefault(run, "copy of 0x%08X (%s)" % (source, where[run]))
     _write_if_changed(os.path.join(out, "discovered.cpp"), "\n".join(copies) + "\n")
     path = os.path.join(out, "dispatch.cpp")
     sizes = {f["addr"]: f["size"] for f in database["functions"]}
@@ -248,8 +262,11 @@ def generate(game) -> str:
     # Named so that the overlays' own sources (overlay_*.cpp) never take it for one.
     _write_if_changed(os.path.join(out, "dispatch_overlays.cpp"),
                       overlays_source(game, out, in_overlay))
-    print("dispatch table: %d translated functions, %d found at run time, %d without a "
-          "translation" % (len(addresses), len(discovered), len(untranslated)))
+    by_section = ", ".join("%s %d" % (name, list(where.values()).count(name))
+                           for name in sorted(set(where.values())))
+    print("dispatch table: %d translated functions, %d found at run time%s, %d without a "
+          "translation" % (len(addresses), len(discovered),
+                           " (not verified: %s)" % by_section if discovered else "", len(untranslated)))
     # The microprograms runs recorded (--vu-record), compiled ahead of time.
     vurecomp.main(["--manifest", vu_manifest_path(game), "--out-dir", out])
     return out

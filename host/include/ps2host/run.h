@@ -44,6 +44,11 @@ inline lifted::Context NewContext() {
     return c;
 }
 
+/* An executable (ELF) loaded into guest memory, as a run loads its own: each
+   PT_LOAD segment at its address; returns its entry. The segments with bytes in
+   the file are where code met at run time is looked for (--discover). */
+u32 LoadExecutable(const std::string& name, std::vector<u8> data);
+
 /* What the run touched, for the report at the end. */
 struct Stats {
     std::map<u32, u64> calls;                  /* function -> times called */

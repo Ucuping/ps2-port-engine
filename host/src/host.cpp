@@ -191,7 +191,8 @@ namespace {
 
 const FunctionEntry* g_table = nullptr;
 std::size_t g_count = 0;
-u32 g_image_start = 0, g_image_end = 0;       // the executable's bytes, as loaded
+// The executable's bytes as loaded: each segment with bytes in the file, [start, end).
+std::vector<std::pair<u32, u32>> g_image;
 std::unordered_map<u32, FunctionEntry> g_overrides;
 bool g_trace = false;
 bool g_all_notes = false;
@@ -306,25 +307,32 @@ const FunctionEntry* FindCopy(u32 address) {
 }
 
 // Where in the loaded executable the code at `address` came from, or 0: the
-// executable is searched for the bytes there. Code kept as data and copied out at
-// run time (a kernel extension, an overlay) has no translation yet; finding its
-// source lets engine/tools/port.py translate it for the next build.
+// executable is searched for the bytes there - every segment it loaded, not only
+// the code's: Tekken 5 keeps a kernel extension in its data segment. Code kept
+// as data and copied out at run time (a kernel extension, an overlay) has no
+// translation yet; finding its source lets engine/tools/port.py translate it for
+// the next build.
 u32 FindSource(u32 address) {
     // Code in the executable itself that no function starts at - a tail call's
-    // target the analysis missed - is its own source.
-    if (address >= g_image_start && address < g_image_end) return address;
+    // target the analysis missed, code in a section it does not analyse - is its
+    // own source.
+    for (const auto& [start, end] : g_image)
+        if (address >= start && address < end) return address;
     // So is code in an overlay's range: port.py translates it from the overlay.
     for (std::size_t i = 0; i < g_overlay_count; ++i)
         if (address >= g_overlays[i].start && address < g_overlays[i].end) return address;
     constexpr u32 kPattern = 32;
     Memory& memory = GuestMemory();
     const u8* here = memory.Translate(address, kPattern);
-    const u8* image = memory.Translate(g_image_start, g_image_end - g_image_start);
-    if (!here || !image || g_image_end - g_image_start < kPattern) return 0;
-    const u8* end = image + (g_image_end - g_image_start) - kPattern;
-    for (const u8* at = image; at <= end; at += 4) {
-        const u32 source = g_image_start + u32(at - image);
-        if (source != address && std::memcmp(at, here, kPattern) == 0) return source;
+    if (!here) return 0;
+    for (const auto& [start, end] : g_image) {
+        const u8* image = memory.Translate(start, end - start);
+        if (!image || end - start < kPattern) continue;
+        const u8* last = image + (end - start) - kPattern;
+        for (const u8* at = image; at <= last; at += 4) {
+            const u32 source = start + u32(at - image);
+            if (source != address && std::memcmp(at, here, kPattern) == 0) return source;
+        }
     }
     return 0;
 }
@@ -477,6 +485,7 @@ u32 LoadElf(const std::string& path, std::vector<u8> data) {
     const u32 entry = u32at(24), phoff = u32at(28);
     const u16 phentsize = u16at(42), phnum = u16at(44);
     Memory& memory = GuestMemory();
+    g_image.clear();
     for (u16 i = 0; i < phnum; ++i) {
         const std::size_t ph = phoff + std::size_t(i) * phentsize;
         if (u32at(ph) != 1) continue;                       // PT_LOAD
@@ -488,10 +497,7 @@ u32 LoadElf(const std::string& path, std::vector<u8> data) {
             throw Unimplemented{"a segment of " + path + " lies outside guest memory"};
         std::memcpy(target, data.data() + offset, filesz);
         std::memset(target + filesz, 0, memsz - filesz);
-        if (filesz && !g_image_start) {
-            g_image_start = vaddr;
-            g_image_end = vaddr + filesz;
-        }
+        if (filesz) g_image.emplace_back(vaddr, vaddr + filesz);
     }
     return entry;
 }
@@ -601,6 +607,8 @@ void Report(const Options& options, const std::string& outcome) {
 }
 
 }  // namespace
+
+u32 LoadExecutable(const std::string& name, std::vector<u8> data) { return LoadElf(name, std::move(data)); }
 
 namespace {
 
