@@ -168,6 +168,14 @@ if(MSVC)
     target_compile_options(ps2host PRIVATE /Z7)     # symbols for --sample, as the ports'
     target_compile_options(ps2rt PRIVATE /Z7)
     target_link_libraries(ps2host PRIVATE dbghelp winmm)  # ...which resolves them; 1 ms sleeps
+else()
+    # MSVC never fuses a multiply and an add into one rounding, and clang-cl is
+    # told not to (engine/templates/game/port/CMakeLists.txt); clang and GCC do
+    # by default wherever the target has FMA - arm64 always. The game's floats,
+    # the VUs' and the software GS's must be the Windows build's, bit for bit,
+    # or verification on another platform means nothing. PUBLIC: the host, its
+    # tests and the game's translated code all compile with it.
+    target_compile_options(ps2rt PUBLIC -ffp-contract=off)
 endif()
 if(WIN32)
     target_link_libraries(ps2host PRIVATE ws2_32)         # the IOP's inet (iop_inet.cpp)

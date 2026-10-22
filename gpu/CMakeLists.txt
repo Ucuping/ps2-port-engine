@@ -126,6 +126,11 @@ target_compile_features(ps2gpu PUBLIC cxx_std_17)
 target_link_libraries(ps2gpu PUBLIC SDL3::SDL3-static PRIVATE volk::volk Vulkan::Headers)
 if(MSVC)
     target_compile_options(ps2gpu PRIVATE /W3 /Z7)        # symbols for --sample, as ps2host has
+else()
+    # No multiply-add fused into one rounding, as MSVC builds it: the
+    # renderer's own float work gives the Windows build's results (the host
+    # sets the same for ps2rt, engine/host/CMakeLists.txt).
+    target_compile_options(ps2gpu PRIVATE -ffp-contract=off)
 endif()
 
 add_executable(ps2gpu_smoke ${CMAKE_CURRENT_LIST_DIR}/tests/display_smoke.cpp)
