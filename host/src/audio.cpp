@@ -23,8 +23,14 @@
  * PS2HOST_AUDIO_MUTE=1: played (the device measured) but silent.
  * PS2HOST_AUDIO_LATENCY_MS=n: the ring's target, 20 to 250 ms.
  * PS2HOST_AUDIO_WAVEOUT=1: the wave device even where WASAPI would open.
+ *
+ * Outside Windows there is no device yet: OpenAudio says none opened and the
+ * run is silent, as one without --audio is. The SPU2 keeps the engine's clock
+ * whether anything plays it (spu2.cpp), so the game's timing is the same;
+ * --audio-wav records it here too.
  */
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -33,6 +39,7 @@
 #include <audioclient.h>
 #include <mmdeviceapi.h>
 #undef small            // rpcndr.h's, through the COM headers; run.h names a parameter so
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -49,8 +56,10 @@
 #include "ps2host/run.h"
 #include "ps2host/timeline.h"
 
+#ifdef _WIN32
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "ole32.lib")
+#endif
 
 namespace ps2host {
 
@@ -233,6 +242,7 @@ void LogStats(Device& d) {
                  s.stretch_min.exchange(1), s.stretch_max.exchange(1));
 }
 
+#ifdef _WIN32
 // ---------------------------------------------------------------- WASAPI
 
 // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, without ksuser.lib.
@@ -379,6 +389,7 @@ void RunWaveOut(Device& d) {
     waveOutClose(out);
     CloseHandle(event);
 }
+#endif  // _WIN32
 
 }  // namespace
 
@@ -391,16 +402,21 @@ bool OpenAudio() {
     if (const char* ms = std::getenv("PS2HOST_AUDIO_LATENCY_MS"))
         d.target_frames = unsigned(kRate * std::clamp(std::atoi(ms), 20, 250) / 1000);
     const bool wave_only = std::getenv("PS2HOST_AUDIO_WAVEOUT") != nullptr;
+#ifdef _WIN32
     d.thread = std::thread([&d, wave_only] {
         timeline::NameThread("audio");
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         if (wave_only || !RunWasapi(d)) RunWaveOut(d);
     });
+#else
+    (void)wave_only;
+    d.opened = -1;                      // no device here yet: silent
+#endif
     // Until the thread says whether a device opened.
     while (d.opened.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     if (d.opened.load() < 0) {
         d.stop = true;
-        d.thread.join();
+        if (d.thread.joinable()) d.thread.join();
         return false;
     }
     d.open = true;
