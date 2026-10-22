@@ -1564,6 +1564,10 @@ void OnEffect(u64 run, const u64* p) {
     if (!s.primary || !s.renderer->CanRunEffects()) return skip("no effects here");
     static const bool off = std::getenv("PS2HOST_GPU_NO_EFFECTS") != nullptr;
     if (off) return;
+    // PS2HOST_EFFECT_SKIP=1,3: those effects not run (what each costs).
+    static const std::string skips = std::getenv("PS2HOST_EFFECT_SKIP") ? std::getenv("PS2HOST_EFFECT_SKIP") : "";
+    if (!skips.empty() && ("," + skips + ",").find("," + std::to_string(run & 0xFF) + ",") != std::string::npos)
+        return;
     if (psm != gs::PSMCT32 && psm != gs::PSMCT24) return skip("its format");
     u32 down = 0;
     Owned* target = nullptr;

@@ -156,7 +156,7 @@ void main() {
     const vec3 sun = vec3(pc.p[7], pc.p[8], pc.p[9]);
     const float lit = dot(n, sun);
     if (pc.p[10] > 0.0 && lit > 0.0 && on_car < 0.99) {
-        const int kSteps = 20;
+        const int kSteps = 14;
         const vec3 start = c + n * (0.02 + 0.002 * z);
         float shade = 0.0;
         float t = 0.06;
@@ -261,10 +261,10 @@ void main() {
     if (len > most) motion *= most / len;
     const vec4 here = texture(target_tex, pixel * texel);
     if (len * pc.p[16] < 0.75) {
-        imageStore(dst, at, here);
+        imageStore(dst, at, vec4(here.rgb, -1.0));        // (unblurred: the copy leaves it)
         return;
     }
-    const int kTaps = 16;
+    const int kTaps = 12;
     const float jitter = Noise(pixel) - 0.5;
     vec3 sum = here.rgb;
     float weight = 1.0;
@@ -285,8 +285,10 @@ void main() {
     // dst's colour back into the target (its alpha kept).
     const ivec2 q = pc.rect.xy + at;
     if (any(greaterThanEqual(q, pc.rect.zw))) return;
+    const vec4 s = texelFetch(src_a, at, 0);
+    if (s.a < 0.0) return;                                  // the blur left it as it was
     const vec4 c = imageLoad(target, q);
-    imageStore(target, q, vec4(texelFetch(src_a, at, 0).rgb, c.a));
+    imageStore(target, q, vec4(s.rgb, c.a));
 
 #elif PASS == PASS_BLOOM_DOWN
     // A level of the glow's chain (dst), half the one above (src_a, or the
