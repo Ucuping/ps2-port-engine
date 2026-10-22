@@ -745,8 +745,12 @@ struct VuCore {
     // ------------------------------------------------------------ the pair's end
     /* As Run after the two halves: the lower's held writes (giving way to the
        upper's fields), when the fields land, the flags on their way, Q and P. */
+    /* `times_lower` / `times_upper` false: the lower's / the upper's write
+       lands with no time noted (vurecomp's untimed_writes: nothing can read
+       it before it has landed). */
     static PS2HOST_VU_INLINE void Finish(Vu& v, u64& cycle, Vu::Pending& pending, int written, u32 lanes,
-                                         bool set_flags, bool sets_mac, bool sets_clip, bool vi0 = true) {
+                                         bool set_flags, bool sets_mac, bool sets_clip, bool vi0 = true,
+                                         bool times_lower = true, bool times_upper = true) {
         const u64 ready = cycle + kFmacLatency;
         if (pending.vf > 0) {
             const u32 landing = pending.lanes & ~(written == pending.vf ? lanes : 0u);
@@ -761,11 +765,11 @@ struct VuCore {
 #if !PS2RT_VU_SSE
                     v.regs.vf[pending.vf][lane] = pending.value[lane];
 #endif
-                    v.vf_ready_[pending.vf][lane] = ready;
+                    if (times_lower) v.vf_ready_[pending.vf][lane] = ready;
                 }
             }
         }
-        FinishUpper(v, cycle, written, lanes, set_flags, sets_mac, sets_clip);
+        FinishUpper(v, cycle, written, lanes, set_flags, sets_mac, sets_clip, times_upper);
         if (pending.q_latency) {
             v.q_next_ = pending.q_set ? pending.q_value
                       : pending.vc    ? pending.vc_after[lifted::kRegQ] : v.regs.vc[lifted::kRegQ];
@@ -786,8 +790,9 @@ struct VuCore {
     }
     /* The same for a pair whose lower left nothing (FinishUpper, then End). */
     static PS2HOST_VU_INLINE void FinishUpper(Vu& v, u64 cycle, int written, u32 lanes, bool set_flags,
-                                              bool sets_mac, bool sets_clip) {
+                                              bool sets_mac, bool sets_clip, bool times = true) {
         const u64 ready = cycle + kFmacLatency;
+        if (!times) written = 0;                // (untimed: Finish's times_upper)
 #if defined(__AVX2__)
         if (written > 0 && lanes == 15)         // all four in a store
             _mm256_storeu_si256(reinterpret_cast<__m256i*>(v.vf_ready_[written]), _mm256_set1_epi64x(static_cast<long long>(ready)));

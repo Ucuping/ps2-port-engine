@@ -966,6 +966,85 @@ def quiet_blocks(blocks: list, pairs: dict) -> set:
             not any(reads_flags(*pairs[pc]) for pc in b[:3])}
 
 
+def untimed_writes(bodies: list) -> None:
+    """Leaves out the landing times (vf_ready_) of the block's writes that
+    nothing can read them for - in place, in the pairs' C++ (`bodies`, a list
+    of each pair's lines). A write's time is read only by a stall check on
+    its field: one of the block's within the three pairs after it (from the
+    fourth on, needless_wait leaves them out), with no write of the field
+    between; or one after the block leaves - and a pair takes a cycle at
+    least, so a write three or more pairs before the pair it leaves after
+    has landed by the next pair's issue whatever stalls came between (a
+    result lands four cycles after its pair's issue, the next pair issues a
+    cycle after that one at the earliest). A time left out stays as the
+    write before left it, earlier: a later check passes as it would have.
+    (The pipeline's times then differ from the interpreter's only where both
+    are past - Vu::SameState compares them so.)"""
+    exits = [i for i, lines in enumerate(bodies)
+             if any("return;" in line or "PS2HOST_VU_NEXT(" in line for line in lines)]
+    waits = []          # per pair: the (register, lane) it waits on
+    writes = []         # per pair: [(register, lanes, "lower"/"upper", sure)]
+    for lines in bodies:
+        w = set()
+        for line in lines:
+            t = line.strip()
+            if t.startswith("C::Wait(t, v, "):
+                r, lane = t[len("C::Wait(t, v, "):].rstrip(");").split(", ")
+                w.add((int(r), int(lane)))
+        waits.append(w)
+        # A held lower write lands for certain only from a load; the others
+        # (MOVE, MR32, MFIR, macro mode's COP2 - HoldVf) only where the value
+        # changes, leaving the time before (no later wait's write: `sure`).
+        pair_writes = [(r, d, "lower", any(line.strip().startswith("C::Load(v, pd, ") for line in lines))
+                       for r, d in lower_writes(lines) if r > 0]
+        for line in lines:
+            t = line.strip()
+            if t.startswith("C::Finish(v, cyc, pd, ") or t.startswith("C::FinishUpper(v, cyc, "):
+                args = t.split("(", 1)[1].rstrip(");").split(", ")
+                at = 3 if t.startswith("C::Finish(") else 2
+                r, lanes = int(args[at]), int(args[at + 1].rstrip("u"))
+                if r > 0 and lanes:
+                    pair_writes.append((r, lanes, "upper", True))
+        writes.append(pair_writes)
+
+    def needed(j: int, r: int, dest: int) -> bool:
+        if any(j <= e <= j + 2 for e in exits):
+            return True
+        for lane in range(4):
+            if not dest & (8 >> lane):
+                continue
+            for i in range(j + 1, min(j + 4, len(bodies))):
+                if (r, lane) in waits[i]:
+                    return True
+                if any(rr == r and dd & (8 >> lane) and sure for rr, dd, _, sure in writes[i]):
+                    break
+        return False
+
+    for j, lines in enumerate(bodies):
+        lower_keep = any(needed(j, r, d) for r, d, k, _ in writes[j] if k == "lower") or not any(
+            k == "lower" for _, _, k, _ in writes[j])
+        upper_keep = any(needed(j, r, d) for r, d, k, _ in writes[j] if k == "upper") or not any(
+            k == "upper" for _, _, k, _ in writes[j])
+        if lower_keep and upper_keep:
+            continue
+        for n, line in enumerate(lines):
+            t = line.strip()
+            indent = line[:len(line) - len(line.lstrip())]
+            if t.startswith("C::Finish(v, cyc, pd, "):
+                args = t[len("C::Finish("):].rstrip(");").split(", ")
+                if len(args) == 8:
+                    args.append("true")
+                args += ["true" if lower_keep else "false", "true" if upper_keep else "false"]
+                lines[n] = indent + "C::Finish(%s);" % ", ".join(args)
+            elif t.startswith("C::FinishUpper(v, cyc, ") and not upper_keep:
+                args = t[len("C::FinishUpper("):].rstrip(");").split(", ")
+                lines[n] = indent + "C::FinishUpper(%s, false);" % ", ".join(args)
+
+
+# PS2_VU_ALL_TIMES=1: every write's landing time kept (untimed_writes off), to compare.
+TIMES_PASS = os.environ.get("PS2_VU_ALL_TIMES", "") != "1"
+
+
 def emit_block(name: str, block: list, pairs: dict, mask: int, drops: set = frozenset(),
                chain: dict = None, quiet: set = frozenset(), no_status: bool = False) -> list:
     # The run's state and the cycle as locals, written back where the block
@@ -987,10 +1066,14 @@ def emit_block(name: str, block: list, pairs: dict, mask: int, drops: set = froz
     dead = dead_flags(block, pairs) - {0}
     fl = Flags()
     head = len(out)
-    for i, pc in enumerate(block):
-        out += emit_pair(pc, pairs[pc][0], pairs[pc][1], mask, i == len(block) - 1, i, written, clean,
-                         i in dead, pairs[block[i - 1]] if i else None, pc in drops, chain, fl, quiet,
-                         no_status)
+    bodies = [emit_pair(pc, pairs[pc][0], pairs[pc][1], mask, i == len(block) - 1, i, written, clean,
+                        i in dead, pairs[block[i - 1]] if i else None, pc in drops, chain, fl, quiet,
+                        no_status)
+              for i, pc in enumerate(block)]
+    if TIMES_PASS:
+        untimed_writes(bodies)
+    for lines in bodies:
+        out += lines
     out[head:head] = ["    " + line for line in fl.declared]
     out.append("}")
     # The blocks it goes on into, declared before it (they may be in another file).

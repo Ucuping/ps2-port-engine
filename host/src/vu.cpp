@@ -282,13 +282,37 @@ void Vu::RecordPrograms(const std::string& path) {
 }
 
 bool Vu::SameState(const Vu& o, bool flags) const {
+    // PS2HOST_VU_SAY_DIFF: what differs, on stderr (the host tests' failures).
+    static const bool say = std::getenv("PS2HOST_VU_SAY_DIFF") != nullptr;
+    if (say) {
+        for (int r = 0; r < 32; ++r)
+            for (int lane = 0; lane < 4; ++lane) {
+                if (regs.vf[r][lane] != o.regs.vf[r][lane]) std::fprintf(stderr, "  vf%d.%d %08X %08X\n", r, lane, regs.vf[r][lane], o.regs.vf[r][lane]);
+                if (std::max(vf_ready_[r][lane], cycle_) != std::max(o.vf_ready_[r][lane], o.cycle_))
+                    std::fprintf(stderr, "  ready vf%d.%d %llu %llu (cycles %llu %llu)\n", r, lane,
+                                 (unsigned long long)vf_ready_[r][lane], (unsigned long long)o.vf_ready_[r][lane],
+                                 (unsigned long long)cycle_, (unsigned long long)o.cycle_);
+            }
+        for (int r = 0; r < 32; ++r)
+            if (regs.vc[r] != o.regs.vc[r]) std::fprintf(stderr, "  vc%d %X %X\n", r, regs.vc[r], o.regs.vc[r]);
+        if (cycle_ != o.cycle_) std::fprintf(stderr, "  cycle %llu %llu\n", (unsigned long long)cycle_, (unsigned long long)o.cycle_);
+        if (mac != o.mac || status != o.status || clip != o.clip) std::fprintf(stderr, "  flags\n");
+        if (std::memcmp(data.data(), o.data.data(), data.size())) std::fprintf(stderr, "  data\n");
+        if (resume != o.resume) std::fprintf(stderr, "  resume %X %X\n", resume, o.resume);
+    }
     auto same = [](const void* a, const void* b, std::size_t n) { return std::memcmp(a, b, n) == 0; };
     if (!same(regs.vf, o.regs.vf, sizeof regs.vf) || !same(regs.vc, o.regs.vc, sizeof regs.vc) ||
         !same(regs.vacc, o.regs.vacc, sizeof regs.vacc))
         return false;
     if ((flags && (mac != o.mac || status != o.status)) || clip != o.clip || p != o.p || resume != o.resume)
         return false;
-    if (cycle_ != o.cycle_ || !same(vf_ready_, o.vf_ready_, sizeof vf_ready_) || q_next_ != o.q_next_ ||
+    // Landing times as far as they can still stall: past ones are all alike
+    // (compiled code leaves out the times nothing reads - vurecomp's
+    // untimed_writes - and a time left out stays an earlier, past one).
+    for (int r = 0; r < 32; ++r)
+        for (int lane = 0; lane < 4; ++lane)
+            if (std::max(vf_ready_[r][lane], cycle_) != std::max(o.vf_ready_[r][lane], o.cycle_)) return false;
+    if (cycle_ != o.cycle_ || q_next_ != o.q_next_ ||
         p_next_ != o.p_next_ || q_ready_ != o.q_ready_ || p_ready_ != o.p_ready_ || q_busy_ != o.q_busy_ ||
         p_busy_ != o.p_busy_)
         return false;
