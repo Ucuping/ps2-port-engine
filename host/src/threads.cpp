@@ -732,10 +732,15 @@ void PostDmac(u32 channel) {
 void DeliverIopPacketNow() {
     Scheduler& s = S();
     // RunHandlers has one interrupt context: never inside a handler. The IOP
-    // answers in order: what is due before the packet goes first.
-    if (s.in_interrupt) return;
-    while (DeliverIopReply()) {
-    }
+    // answers in order, so only a packet with nothing before it goes now: the
+    // EE's threads cannot run inside the IOP's run, and every answer its
+    // threads had queued, delivered here with it, reached the EE's handler
+    // with none of them taken in between - Burnout 3's RenderWare Audio
+    // keeps 24 and drops the rest; a dropped state of its music stream left
+    // a loading screen waiting for ever. What waits goes at the next loop
+    // head, its thread let run after each.
+    if (s.in_interrupt || IopRepliesQueued() != 1) return;
+    DeliverIopReply();
 }
 
 void RequestDelivery() {

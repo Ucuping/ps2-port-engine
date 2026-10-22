@@ -106,15 +106,18 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result);
    one queued answer to the EE (false when none waits). */
 void SifDma(u32 transfers, u32 count);
 bool DeliverIopReply();
+/* The answers queued for the EE, delivered or not yet due. */
+size_t IopRepliesQueued();
 /* Whether an answer from the IOP waits to be delivered. */
 bool IopReplyPending();
 /* A packet from the IOP to the EE (a module's sceSifSendCmd): queued, and
    delivered as the SIF0 interrupt at the next safe point. */
 void QueueIopPacket(std::vector<u8> packet);
 /* A module's command sent from an IOP interrupt handler (sceSifSendCmd in
-   one): delivered now, with the answers due before it, unless the EE is in
-   an interrupt itself - so the EE's handler for it runs before the IOP goes
-   on, as on the console, where it takes microseconds. */
+   one): delivered now when nothing waits before it, unless the EE is in an
+   interrupt itself - so the EE's handler for it runs before the IOP goes
+   on, as on the console, where it takes microseconds. Behind other answers
+   it waits its turn (at the next loop head, the EE's threads let run). */
 void DeliverIopPacketNow();
 /* A host RPC server's: its answer (the RPC end) reaches the EE `ns` later, on
    the host clock (virtual under --virtual-time) - a device's time, such as a
