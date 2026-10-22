@@ -119,8 +119,8 @@ void Path3Kept(const u32* words, u32 count, u32 from, std::shared_ptr<const void
 }
 
 void ReleasePath3(bool all) {
-    g_path3_held.ReleaseBlock(all, [](const u32* words, std::size_t count) {
-        GsWords(3, words, u32(count));
+    g_path3_held.ReleaseBlockKept(all, [](const u32* words, std::size_t count, std::shared_ptr<const void> keep) {
+        GsWordsKept(3, words, u32(count), std::move(keep));
     });
 }
 

@@ -22,7 +22,10 @@ namespace ps2host {
 class Path3Queue {
 public:
     void Push(std::uint32_t word) {
-        if (spans_.empty() || !spans_.back().own || spans_.back().own->size() != spans_.back().offset + spans_.back().count) {
+        // A new vector also where the last is shared (ReleaseBlockKept handed
+        // part of it on: growing it would move the words from under that).
+        if (spans_.empty() || !spans_.back().own || spans_.back().own.use_count() != 1 ||
+            spans_.back().own->size() != spans_.back().offset + spans_.back().count) {
             Span s;
             s.own = std::make_shared<std::vector<std::uint32_t>>();
             spans_.push_back(std::move(s));
@@ -62,6 +65,40 @@ public:
        of them). */
     template <typename Sink>
     void ReleaseBlock(bool all, Sink&& sink) {
+        for (const Span& s : Take(all)) sink(s.Words(), s.count);
+    }
+
+    /* ReleaseBlock's runs with what keeps each alive (sink: words, count,
+       keep) - for a sink that hands them on rather than copies them. */
+    template <typename Sink>
+    void ReleaseBlockKept(bool all, Sink&& sink) {
+        std::vector<Span> going = Take(all);
+        for (Span& s : going)
+            sink(s.Words(), s.count, s.own ? std::shared_ptr<const void>(s.own) : s.owner);
+    }
+
+    /* The same, a word at a time. */
+    template <typename Sink>
+    void Release(bool all, Sink&& sink) {
+        ReleaseBlock(all, [&](const std::uint32_t* words, std::size_t count) {
+            for (std::size_t i = 0; i < count; ++i) sink(words[i]);
+        });
+    }
+
+private:
+    /* Words held: borrowed (data, kept by owner) or the queue's own. */
+    struct Span {
+        const std::uint32_t* data = nullptr;
+        std::shared_ptr<const void> owner;
+        std::shared_ptr<std::vector<std::uint32_t>> own;
+        std::size_t offset = 0, count = 0;
+        const std::uint32_t* Words() const { return (own ? own->data() : data) + offset; }
+    };
+
+    /* The spans up to the end of the first packet with EOP set (or all),
+       taken off the queue - before a sink runs: what it does may hold more
+       (the spans keep their words alive, wherever they are). */
+    std::vector<Span> Take(bool all) {
         std::size_t end = size_;
         if (!all) {
             // The tags, read where they are: a quadword's four words may lie
@@ -98,26 +135,8 @@ public:
             }
         }
         size_ -= end;
-        for (const Span& s : going) sink(s.Words(), s.count);
+        return going;
     }
-
-    /* The same, a word at a time. */
-    template <typename Sink>
-    void Release(bool all, Sink&& sink) {
-        ReleaseBlock(all, [&](const std::uint32_t* words, std::size_t count) {
-            for (std::size_t i = 0; i < count; ++i) sink(words[i]);
-        });
-    }
-
-private:
-    /* Words held: borrowed (data, kept by owner) or the queue's own. */
-    struct Span {
-        const std::uint32_t* data = nullptr;
-        std::shared_ptr<const void> owner;
-        std::shared_ptr<std::vector<std::uint32_t>> own;
-        std::size_t offset = 0, count = 0;
-        const std::uint32_t* Words() const { return (own ? own->data() : data) + offset; }
-    };
 
     /* The word at an index, the indices asked for never going back. */
     struct Cursor {
