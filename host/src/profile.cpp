@@ -25,6 +25,8 @@
 #include <dbghelp.h>
 #include <intrin.h>
 #include <timeapi.h>
+#else
+#include "platform/platform.h"
 #endif
 
 namespace ps2host {
@@ -593,7 +595,9 @@ void InstallCrashReport() { SetUnhandledExceptionFilter(CrashFilter); }
 
 #else
 
-void InstallCrashReport() {}
+// A signal handler's report, then the handler that was there before
+// (platform/fault.cpp). The sampler stays Windows': no samples here.
+void InstallCrashReport() { platform::InstallCrashHandler(); }
 void StartSampler() {}
 std::string SampleReport(int) { return ""; }
 

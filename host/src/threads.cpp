@@ -26,12 +26,7 @@
  * rethrown by the scheduler, on the host's own stack.
  */
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#include <timeapi.h>
-#pragma comment(lib, "synchronization.lib")
-
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -51,6 +46,7 @@
 #include "ps2host/memory.h"
 #include "ps2host/run.h"
 #include "ps2host/profile.h"
+#include "platform/platform.h"
 
 namespace ps2host {
 
@@ -82,10 +78,10 @@ struct Thread {
     u64 runs = 0;                   // times the scheduler switched to it, for the report
     lifted::Context context = NewContext();
     std::vector<u32> calls;         // the guest call stack, for the report
-    LPVOID fiber = nullptr;         // the fiber it runs on now (a coroutine's, while one runs)
+    platform::Fiber* fiber = nullptr;   // the fiber it runs on now (a coroutine's, while one runs)
     // Guest coroutines (run.h): the thread's own fiber while one of them runs,
     // which runs, and the thread's own call stack meanwhile.
-    LPVOID home = nullptr;
+    platform::Fiber* home = nullptr;
     Coroutine* coroutine = nullptr;
     std::vector<u32> home_calls;
     // RequestDelivery: its budget was zeroed to deliver an interrupt at its
@@ -97,7 +93,7 @@ struct Thread {
 }  // namespace
 
 struct Coroutine {
-    LPVOID fiber = nullptr;
+    platform::Fiber* fiber = nullptr;
     std::function<void()> body;
     std::vector<u32> calls;         // its guest call stack, while it is not running
     bool finished = false;
@@ -122,7 +118,7 @@ struct Scheduler {
     std::map<u32, std::unique_ptr<Thread>> threads;
     u32 next_thread = 1;
     Thread* current = nullptr;
-    LPVOID host_fiber = nullptr;
+    platform::Fiber* host_fiber = nullptr;
     u64 counter = 0;
     std::exception_ptr stop;
     std::map<u32, Semaphore> semaphores;
@@ -176,7 +172,7 @@ Thread* Find(u32 id) {
 void GiveWay() {
     Scheduler& s = S();
     if (s.in_interrupt || !s.current) return;     // handlers never block
-    SwitchToFiber(s.host_fiber);
+    platform::SwitchFiber(s.host_fiber);
 }
 
 // Called after a thread became ready: run it now if it is better than this one.
@@ -187,7 +183,7 @@ void Preempt(Thread& woken) {
     GiveWay();
 }
 
-void CALLBACK ThreadMain(void* parameter) {
+void ThreadMain(void* parameter) {
     Thread& t = *static_cast<Thread*>(parameter);
     try {
         Dispatch(t.context, t.entry);
@@ -195,7 +191,7 @@ void CALLBACK ThreadMain(void* parameter) {
     } catch (...) {
         S().stop = std::current_exception();
     }
-    SwitchToFiber(S().host_fiber);              // never resumed
+    platform::SwitchFiber(S().host_fiber);      // never resumed
 }
 
 Thread* PickReady() {
@@ -415,32 +411,18 @@ std::atomic<u64> g_fast_until{0};           // SetFastUntil: blanks faster befor
 std::atomic<unsigned> g_fast_until_factor{8};   // ...this many times
 std::atomic<int> g_interrupt_waits{0};      // InterruptWait
 // Counted up as the timer marks a blank or a timer due (or looks at the EE's
-// loop heads): what an idle loop's wait sleeps on (WaitOnAddress), woken at
+// loop heads): what an idle loop's wait sleeps on (platform::WaitOnU32), woken at
 // once - a sleep of 200 us was a millisecond or more, the frame late with it.
 std::atomic<u32> g_timer_seq{0};
 void TimerTick() {
     g_timer_seq.fetch_add(1, std::memory_order_release);
-    WakeByAddressAll(&g_timer_seq);
+    platform::WakeAllU32(g_timer_seq);
 }
 std::atomic<u64> g_last_vblank_ns{0};       // LastVblankNs
 
-/* Asleep until `when`, to a tenth of a millisecond or so: a high-resolution
-   waitable timer (Windows 10 1803 on), not Sleep's millisecond steps that can
-   overshoot by more; sleep_until where there is none. */
-void SleepUntil(std::chrono::steady_clock::time_point when) {
-    thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                                                       TIMER_ALL_ACCESS);
-    const auto left = when - std::chrono::steady_clock::now();
-    if (left <= std::chrono::steady_clock::duration::zero()) return;
-    if (!timer) {
-        std::this_thread::sleep_until(when);
-        return;
-    }
-    LARGE_INTEGER due;
-    due.QuadPart = -std::max<long long>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(left).count() / 100);
-    if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) WaitForSingleObject(timer, INFINITE);
-    else std::this_thread::sleep_until(when);
-}
+/* Asleep until `when`, to a tenth of a millisecond or so, not to a sleep's
+   millisecond steps that can overshoot by more (platform::SleepUntil). */
+void SleepUntil(std::chrono::steady_clock::time_point when) { platform::SleepUntil(when); }
 
 /* Whether a deadline may be waited for by spinning its last stretch (a
    sleep's wake-up can be late by a little): only with cores to spare - more
@@ -456,15 +438,8 @@ bool SpareCores() {
     if (forced) return forced[0] == '1';
     static std::atomic<int> looks{0};
     static std::atomic<bool> spare{true};
-    if (looks.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
-        DWORD_PTR process = 0, system = 0;
-        int cores = int(std::thread::hardware_concurrency());
-        if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) && process) {
-            cores = 0;
-            for (DWORD_PTR m = process; m; m &= m - 1) ++cores;
-        }
-        spare.store(cores >= 4, std::memory_order_relaxed);
-    }
+    if (looks.fetch_add(1, std::memory_order_relaxed) % 64 == 0)
+        spare.store(platform::ProcessCores() >= 4, std::memory_order_relaxed);
     return spare.load(std::memory_order_relaxed);
 }
 
@@ -598,7 +573,7 @@ void LoopHead(lifted::Context& c, u32 address) {
             if (s.vblank_due || s.timer_due || s.current->delivery_requested || StopRequested() ||
                 IopReplyPending())
                 break;
-            WaitOnAddress(&g_timer_seq, &seen, sizeof seen, 2);
+            platform::WaitOnU32(g_timer_seq, seen, 2);
         }
         g_idle_ns.fetch_add(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                     std::chrono::steady_clock::now() - idle_from).count()),
@@ -730,14 +705,12 @@ void RequestDelivery() {
 }
 
 namespace {
-// GuestCallsNow's read, apart: no C++ objects, so it can be guarded.
+// GuestCallsNow's read, apart: a copy that may fail (the vector can be
+// moving as it is read), then innermost first.
 int ReadCalls(const u32* data, std::size_t size, u32* out, int max) {
-    int n = 0;
-    __try {
-        for (std::size_t i = size; i > 0 && n < max; --i) out[n++] = data[i - 1];
-    } __except (1) {
-        n = 0;
-    }
+    const int n = int(std::min<std::size_t>(size, std::size_t(max > 0 ? max : 0)));
+    if (n == 0 || !platform::SafeCopy(out, data + (size - std::size_t(n)), std::size_t(n) * sizeof(u32))) return 0;
+    std::reverse(out, out + n);
     return n;
 }
 }  // namespace
@@ -760,13 +733,13 @@ std::vector<u32>& CurrentCalls() {
 
 namespace {
 
-void CALLBACK CoroutineMain(void* parameter) {
+void CoroutineMain(void* parameter) {
     Coroutine& co = *static_cast<Coroutine*>(parameter);
     try {
         co.body();
     } catch (...) {
         S().stop = std::current_exception();
-        SwitchToFiber(S().host_fiber);          // never resumed
+        platform::SwitchFiber(S().host_fiber);  // never resumed
     }
     co.finished = true;
     SwitchCoroutine(nullptr);                   // never resumed
@@ -778,7 +751,7 @@ Coroutine* CreateCoroutine(std::function<void()> body) {
     if (!S().current || S().in_interrupt) throw Unimplemented{"a guest coroutine outside a thread"};
     auto* co = new Coroutine;
     co->body = std::move(body);
-    co->fiber = CreateFiber(1 << 20, CoroutineMain, co);
+    co->fiber = platform::NewFiber(1 << 20, CoroutineMain, co);
     return co;
 }
 
@@ -794,7 +767,7 @@ void SwitchCoroutine(Coroutine* to) {
     t->calls = std::move(to ? to->calls : t->home_calls);
     t->coroutine = to;
     t->fiber = to ? to->fiber : t->home;
-    SwitchToFiber(t->fiber);
+    platform::SwitchFiber(t->fiber);
 }
 
 Coroutine* CurrentCoroutine() {
@@ -807,7 +780,7 @@ bool CoroutineFinished(const Coroutine* co) { return co->finished; }
 void DeleteCoroutine(Coroutine* co) {
     if (!co) return;
     if (co == CurrentCoroutine()) throw Unimplemented{"a guest coroutine deleted while it runs"};
-    DeleteFiber(co->fiber);
+    platform::FreeFiber(co->fiber);
     delete co;
 }
 
@@ -826,15 +799,9 @@ namespace {
 /* The run's real time (RunThreads, or StartRealTime): the blanks' timer,
    VIF1's worker. */
 void StartRealTimeThreads() {
-    timeBeginPeriod(1);             // sleeps to the millisecond, not Windows' 15.6 ms
-    // ...even with the window hidden behind others: Windows 11 drops a
-    // process's timer resolution then (a 200 us sleep took 15 ms, a blank
-    // seen 14 ms late), unless told not to; and the process not throttled.
-    PROCESS_POWER_THROTTLING_STATE process{};
-    process.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-    process.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
-    process.StateMask = 0;
-    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &process, sizeof process);
+    // Sleeps to the millisecond (Windows: not its 15.6 ms), even with the
+    // window hidden behind others.
+    platform::HoldTimerResolution();
     FastThread();
     // The EE above the threads it feeds (VIF1's worker, the GS thread): it
     // takes the blanks, and what they do waits for it - queued, at most two
@@ -842,14 +809,14 @@ void StartRealTimeThreads() {
     // blank waited for the EE's turn behind them: on two cores (Resident
     // Evil Outbreak, J's Bar, 30 s) 200 blanks taken late and 82 pictures a
     // period late; above them, 14-23 and 1-6. No change with cores to spare.
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    platform::SetThreadRole(platform::ThreadRole::Emulation);
     if (!TimerThread().joinable()) {
         TimerThread() = std::thread([] {
             timeline::NameThread("vertical blank timer");
             // Asleep almost always, it must wake on time with every core busy
             // (a blank 13 ms late was a frame shown late): the highest priority.
             FastThread();
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            platform::SetThreadRole(platform::ThreadRole::Timer);
             VblankTimer();
         });
         std::atexit(StopTimer);
@@ -883,13 +850,13 @@ void RunThreads(const lifted::Context& initial, u32 entry, s64 loop_budget) {
     s.realtime = loop_budget == INT64_MAX && !s.virtual_time;
     if (s.realtime) StartRealTimeThreads();
     s.next_vblank_ns = ClockNs() + kFrameNs;
-    s.host_fiber = ConvertThreadToFiber(nullptr);
+    s.host_fiber = platform::ThreadFiber();
     auto main = std::make_unique<Thread>();
     main->id = s.next_thread++;
     main->entry = entry;
     main->context = initial;
     main->context.budget = s.virtual_time ? kSliceIterations : loop_budget;
-    main->fiber = CreateFiber(1 << 20, ThreadMain, main.get());
+    main->fiber = platform::NewFiber(1 << 20, ThreadMain, main.get());
     Thread& first = *main;
     s.threads[first.id] = std::move(main);
     MakeReady(first);
@@ -938,7 +905,7 @@ void RunThreads(const lifted::Context& initial, u32 entry, s64 loop_budget) {
                     // second - half a core in the kernel through gameplay -
                     // and a longer one took the blanks late.
                     u32 seen = g_timer_seq.load(std::memory_order_acquire);
-                    if (!s.vblank_due && !s.timer_due) WaitOnAddress(&g_timer_seq, &seen, sizeof seen, 1);
+                    if (!s.vblank_due && !s.timer_due) platform::WaitOnU32(g_timer_seq, seen, 1);
                 }
                 g_idle_ns.fetch_add(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                             std::chrono::steady_clock::now() - idle_from).count()),
@@ -965,7 +932,7 @@ void RunThreads(const lifted::Context& initial, u32 entry, s64 loop_budget) {
         ++next->runs;
         next->state = State::Running;
         s.running = &next->context;
-        SwitchToFiber(next->fiber);
+        platform::SwitchFiber(next->fiber);
         s.running = nullptr;
         s.current = nullptr;
         if (TakeVblank(s)) DeliverFrame();
@@ -1062,8 +1029,8 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
             if (t->home) t->fiber = t->home;    // a coroutine's fiber stays its owner's
             t->home = nullptr;
             t->coroutine = nullptr;
-            if (t->fiber) DeleteFiber(t->fiber);
-            t->fiber = CreateFiber(1 << 20, ThreadMain, t);
+            if (t->fiber) platform::FreeFiber(t->fiber);
+            t->fiber = platform::NewFiber(1 << 20, ThreadMain, t);
             MakeReady(*t);
             result = a0;
             Preempt(*t);
@@ -1342,17 +1309,13 @@ bool BlankDue() { return S().vblank_due.load(std::memory_order_relaxed); }
 u64 LastVblankNs() { return g_last_vblank_ns.load(std::memory_order_relaxed); }
 
 void FastThread() {
-    THREAD_POWER_THROTTLING_STATE throttling{};
-    throttling.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
-    throttling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
-    throttling.StateMask = 0;               // never throttled
-    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &throttling, sizeof throttling);
+    platform::SetThreadRole(platform::ThreadRole::Worker);     // never slowed for power
     // Above the rest only with cores to spare (SpareCores): on a machine
     // with few, the EE, the GS thread and VIF1's worker together keep every
     // core busy, and at a higher priority the threads they depend on - the
     // GPU driver's, the window's - waited seconds for one (until Windows
     // lifts a starved thread, after about four).
-    if (SpareCores()) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    if (SpareCores()) platform::SetThreadRole(platform::ThreadRole::FastWorker);
 }
 
 }  // namespace ps2host
