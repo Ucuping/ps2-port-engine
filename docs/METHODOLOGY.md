@@ -167,10 +167,11 @@ C++ promotion rules quietly narrowed 64-bit register arithmetic: `ReadU8(p) << 2
 was an `int` shift, and 419 shifts in the file were undefined behaviour. It all
 compiled without a single error.
 
-So `derive.py --emit` now compiles the generated file with MSVC (`/O2`, so the
-optimiser gets its chance to exploit undefined behaviour) into a library with a
-dispatch table, and runs every function on the same cases its derivation was
-verified on, with memory routed back to the interpreter
+So `derive.py --emit` now compiles the generated file - with MSVC on Windows
+(`/O2`), with clang++ elsewhere (`-O3 -ffp-contract=off`, as a Release port
+build), so the optimiser gets its chance to exploit undefined behaviour - into
+a library with a dispatch table, and runs every function on the same cases its
+derivation was verified on, with memory routed back to the interpreter
 (`engine/ps2decomp/cppcheck.py`). A function whose compiled form disagrees is dropped
 and the file re-emitted. Where no compiler is installed the check says it was
 skipped; it never passes by default.

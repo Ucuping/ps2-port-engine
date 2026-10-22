@@ -192,7 +192,8 @@ Each of these has already produced plausible wrong output once:
   arguments (`$f12`-`$f19`). Liveness decides which ones a function reads.
 - In emitted C++, operator precedence and store order are where bugs hide. The
   tree can be right while the printed C means something else. This is why the
-  compiled check exists; never skip it when MSVC is available.
+  compiled check exists; never skip it when a compiler is available (MSVC on
+  Windows, clang++ elsewhere).
 
 ## Working practices that paid off
 

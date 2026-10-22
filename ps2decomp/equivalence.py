@@ -44,6 +44,12 @@ HARNESS = r'''
 #include <vector>
 #include "ps2rt/lifted.h"
 
+#if defined(_WIN32)
+#define PS2_CHECK_EXPORT extern "C" __declspec(dllexport)
+#else
+#define PS2_CHECK_EXPORT extern "C" __attribute__((visibility("default")))
+#endif
+
 namespace {
 std::unordered_map<u32, u8> g_written;
 std::vector<u64> g_calls;           // each call: its target, then its argument registers
@@ -178,8 +184,8 @@ int Differ(const Outcome& a, const Outcome& b, int abi, u32 sp) {
 /* For each pair, the first case that differs and what differs (case * 1000 +
    Differ's code), or -1 if none did; and how many cases ran - fewer than asked
    when a pair's cases took longer than `seconds`. */
-extern "C" __declspec(dllexport) int equiv_run(int cases, double seconds, long long* first_difference,
-                                               int* ran, int first, int last) {
+PS2_CHECK_EXPORT int equiv_run(int cases, double seconds, long long* first_difference,
+                               int* ran, int first, int last) {
     const int count = int(sizeof kPairs / sizeof kPairs[0]);
     for (int i = first; i < last && i < count; ++i) {
         first_difference[i] = -1;
@@ -247,7 +253,10 @@ def _build(paths, work: str) -> str:
     all_sources = list(paths) + [os.path.join(runtime, name) for name in
                                  ("eefpu.cpp", "eeint.cpp", "lifted_support.cpp", "vu0.cpp")]
     cppcheck._BUILDS += 1
-    dll = os.path.join(work, "equivalence_%d_%d.dll" % (os.getpid(), cppcheck._BUILDS))
+    dll = os.path.join(work, "equivalence_%d_%d%s" % (os.getpid(), cppcheck._BUILDS, cppcheck.SHARED_SUFFIX))
+    if os.name != "nt":
+        cppcheck.clang_build(all_sources, [os.path.join(cppcheck.RUNTIME, "include")], dll, parallel=4)
+        return dll
     # The sources go in a response file: a hundred and more paths are longer than
     # the 8,191 characters a cmd command line may be.
     response = os.path.join(work, "sources.rsp")

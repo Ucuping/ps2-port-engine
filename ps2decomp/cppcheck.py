@@ -12,8 +12,9 @@ together with a dispatch table and memory helpers that call back into Python,
 and every function is run on the same cases the derivation was verified on,
 against the interpreter. A function only counts if its *compiled* form agrees.
 
-The compiler is MSVC, found through vswhere. Where none is installed the check
-reports itself unavailable rather than passing.
+The compiler is MSVC, found through vswhere, on Windows, and clang++ elsewhere
+(`$CXX` names another), built with the port's own float rule. Where none is
+installed the check reports itself unavailable rather than passing.
 """
 
 from __future__ import annotations
@@ -21,7 +22,10 @@ from __future__ import annotations
 import ctypes
 import os
 import re
+import shutil
 import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
 
 # The runtime rounds floats as the console does (toward zero, denormals
 # flushed: eefpu.cpp, vu0.cpp); the interpreter it is compared against rounds
@@ -72,6 +76,84 @@ class CompilerUnavailable(Exception):
 
 class CompileError(Exception):
     pass
+
+
+def find_compiler() -> str:
+    """What builds the check libraries here: MSVC's vcvars64.bat on Windows,
+    clang++ elsewhere; CompilerUnavailable where there is none."""
+    if os.name == "nt":
+        return find_vcvars()
+    found = shutil.which(os.environ.get("CXX") or "clang++")
+    if not found:
+        raise CompilerUnavailable("no clang++ on the path (or in $CXX)")
+    return found
+
+
+# A check library: a DLL on Windows, a shared library elsewhere.
+SHARED_SUFFIX = ".dll" if os.name == "nt" else ".dylib" if sys.platform == "darwin" else ".so"
+
+# What the harnesses export, and the pragma that keeps a harness's dispatch
+# switch out of the optimiser - MSVC's and clang's spellings of each.
+HARNESS_PREAMBLE = [
+    "#if defined(_MSC_VER) && !defined(__clang__)",
+    '#pragma optimize("", off)',
+    "#elif defined(__clang__)",
+    "#pragma clang optimize off",
+    "#endif",
+]
+EXPORT_DEFINITION = [
+    "#if defined(_WIN32)",
+    '#define PS2_CHECK_EXPORT extern "C" __declspec(dllexport)',
+    "#else",
+    '#define PS2_CHECK_EXPORT extern "C" __attribute__((visibility("default")))',
+    "#endif",
+]
+
+# Outside Windows, the check libraries are compiled as the port is: its float
+# rule - no multiply-add fused into one rounding (engine/host/CMakeLists.txt) -
+# and the optimisation a Release build gives clang, -O3, as /O2 is MSVC's: the
+# optimiser gets the same chance at undefined behaviour here as in the port.
+CLANG_FLAGS = ["-std=c++17", "-O3", "-fPIC", "-ffp-contract=off", "-Wno-unknown-pragmas"]
+
+_CLANG_ERROR = re.compile(r"^(.*?):(\d+):\d+: (?:fatal )?error: (.*)$")
+
+
+def clang_build(sources, include_dirs, library: str, parallel: int = 4) -> None:
+    """Compile `sources` with clang++, `parallel` at a time, and link them into the
+    shared `library`. A failure raises CompileError with each error as MSVC
+    writes it - file(line): error ... - which is what the callers read to find
+    the functions to drop."""
+    compiler = find_compiler()
+    work = os.path.dirname(os.path.abspath(library))
+    stem = os.path.splitext(os.path.basename(library))[0]
+    includes = ["-I" + os.path.abspath(path) for path in include_dirs]
+
+    def compile_one(item):
+        index, path = item
+        obj = os.path.join(work, "%s.%d.o" % (stem, index))
+        result = subprocess.run([compiler] + CLANG_FLAGS + includes + ["-c", os.path.abspath(path), "-o", obj],
+                                capture_output=True, text=True)
+        return obj, result.returncode, result.stderr
+
+    with ThreadPoolExecutor(max_workers=max(1, parallel)) as pool:
+        results = list(pool.map(compile_one, enumerate(sources)))
+    if any(code for _obj, code, _log in results):
+        raise CompileError(_msvc_form("".join(log for _obj, _code, log in results)))
+    result = subprocess.run([compiler, "-shared", "-o", os.path.abspath(library)] + [obj for obj, _c, _l in results],
+                            capture_output=True, text=True)
+    if result.returncode:
+        raise CompileError(_msvc_form(result.stderr))
+
+
+def _msvc_form(log: str) -> str:
+    lines = []
+    for line in log.splitlines():
+        match = _CLANG_ERROR.match(line)
+        if match:
+            lines.append("%s(%s): error : %s" % match.groups())
+        elif "error" in line:
+            lines.append(line)
+    return "\n".join(lines) or log[-2000:]
 
 
 def find_vcvars() -> str:
@@ -138,7 +220,7 @@ def harness_source(functions, typed: bool, externs=()) -> str:
     # The dispatch switch has a case per function - over two thousand - and
     # optimising it ran the compiler out of heap. Only the generated code has to be
     # checked at /O2; the harness that calls it does not.
-    lines = ['#pragma optimize("", off)', '#include "ps2rt/generated.h"']
+    lines = HARNESS_PREAMBLE + EXPORT_DEFINITION + ['#include "ps2rt/generated.h"']
     if typed:
         lines.append('#include "types.h"')
     lines += ["", "namespace generated {"]
@@ -188,14 +270,14 @@ def harness_source(functions, typed: bool, externs=()) -> str:
     lines += [
         "}",
         "",
-        'extern "C" __declspec(dllexport) void b3_set_memory(ReadFn r, WriteFn w, CallFn c) {',
+        'PS2_CHECK_EXPORT void b3_set_memory(ReadFn r, WriteFn w, CallFn c) {',
         "    g_read = r;",
         "    g_write = w;",
         "    g_call = c;",
         "}",
         "",
         "/* Returns 1 with *result set, 2 for a void function, 0 if unknown. */",
-        'extern "C" __declspec(dllexport) int b3_call(u32 address, const u64* args, s32* result) {',
+        'PS2_CHECK_EXPORT int b3_call(u32 address, const u64* args, s32* result) {',
         # Every case starts at the stack top: a path that traps returns without
         # its StackLeave.
         "    g_sp = 0x%08X;" % layout.CURRENT.stack_top,
@@ -212,8 +294,9 @@ def harness_source(functions, typed: bool, externs=()) -> str:
 
 
 def build(generated_path: str, runtime_sources, include_dir: str, work_dir: str) -> tuple:
-    """Compile the generated file into a DLL; returns (dll path, functions)."""
-    vcvars = find_vcvars()
+    """Compile the generated file into a shared library (a DLL on Windows);
+    returns (its path, functions)."""
+    vcvars = find_vcvars() if os.name == "nt" else find_compiler()
     # Absolute: the build script changes into work_dir before compiling, so a
     # relative path (a relative --game) would name a file that is not there.
     work_dir = os.path.abspath(work_dir)
@@ -232,10 +315,13 @@ def build(generated_path: str, runtime_sources, include_dir: str, work_dir: str)
     # the same process under the same name would fail.
     global _BUILDS
     _BUILDS += 1
-    dll = os.path.join(work_dir, "generated_check_%d_%d.dll" % (os.getpid(), _BUILDS))
+    dll = os.path.join(work_dir, "generated_check_%d_%d%s" % (os.getpid(), _BUILDS, SHARED_SUFFIX))
     sources = [os.path.abspath(generated_path), harness] + [
         os.path.abspath(path) for path in runtime_sources
     ]
+    if os.name != "nt":
+        clang_build(sources, [include_dir, generated_dir], dll, parallel=len(sources))
+        return dll, functions
     # /O2 on purpose: an optimiser is what turns undefined behaviour into wrong
     # answers, so checking an unoptimised build would hide exactly the problems
     # this exists to find.
