@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -35,9 +36,39 @@ struct Event {
     u64 value;
 };
 
+/* A lane's events in fixed chunks: a vector's growth copied the GS thread's
+   ~100 MB of them at once, a 16 ms stall in the middle of the run - the
+   profile's own worst "late picture". */
+class Events {
+public:
+    static constexpr std::size_t kChunk = 1 << 16;
+    bool empty() const { return size_ == 0; }
+    Event& front() { return chunks_[0][0]; }
+    const Event& front() const { return chunks_[0][0]; }
+    Event& back() { return chunks_[(size_ - 1) / kChunk][(size_ - 1) % kChunk]; }
+    void push_back(const Event& e) {
+        if (size_ % kChunk == 0) chunks_.emplace_back(new Event[kChunk]);
+        chunks_.back()[size_ % kChunk] = e;
+        ++size_;
+    }
+    struct Iter {
+        const Events* of;
+        std::size_t i;
+        const Event& operator*() const { return of->chunks_[i / kChunk][i % kChunk]; }
+        Iter& operator++() { ++i; return *this; }
+        bool operator!=(const Iter& o) const { return i != o.i; }
+    };
+    Iter begin() const { return {this, 0}; }
+    Iter end() const { return {this, size_}; }
+
+private:
+    std::vector<std::unique_ptr<Event[]>> chunks_;
+    std::size_t size_ = 0;
+};
+
 struct Lane {
     std::string name;
-    std::vector<Event> events;
+    Events events;
 };
 
 std::mutex g_lanes_mutex;
@@ -85,7 +116,6 @@ Lane& ThisLane() {
     thread_local Lane* lane = nullptr;
     if (!lane) {
         lane = new Lane;
-        lane->events.reserve(1 << 16);
         std::lock_guard<std::mutex> hold(g_lanes_mutex);
         lane->name = "thread " + std::to_string(Lanes().size());
         Lanes().push_back(lane);
