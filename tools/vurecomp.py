@@ -949,14 +949,57 @@ def reads_mac_only(lower: int, upper: int) -> bool:
     return not (upper & 0x80000000) and (lower >> 25) in (0x18, 0x1A, 0x1B)
 
 
-def mac_live(pairs: dict, mask: int, start: int) -> bool:
+class PairFacts:
+    """What the timing of a pair depends on, for mac_live: the vector fields
+    its stall checks read (as emit_pair has them), the fields it writes (the
+    upper's result, the lower's held write), and whether it waits for Q or P."""
+
+    def __init__(self, pairs: dict, mask: int):
+        self.pairs, self.mask, self.cache = pairs, mask, {}
+
+    def of(self, pc: int):
+        if pc not in self.cache:
+            lower, upper = self.pairs[pc]
+            immediate = bool(upper & 0x80000000)
+            reads = set()
+            for r, lanes in upper_reads(upper) + ([] if immediate else lower_reads(lower)):
+                for lane in range(4):
+                    if r and lanes & (8 >> lane):
+                        reads.add((r, lane))
+            writes = set()
+            _lines, written, lanes, _flags = emit_upper(upper)
+            if written > 0:
+                writes |= {(written, lane) for lane in range(4) if lanes & (8 >> lane)}
+            if not immediate:
+                for r, dest in lower_writes(emit_lower(lower, pc, self.mask)[0]):
+                    writes |= {(r, lane) for lane in range(4) if r > 0 and dest & (8 >> lane)}
+            qp = not immediate and (is_divide(lower) or is_wait(lower, 0x3B) or is_efu(lower) or
+                                    is_wait(lower, 0x7B))
+            self.cache[pc] = (frozenset(reads), frozenset(writes), qp)
+        return self.cache[pc]
+
+
+# PS2_VU_OLD_MAC_LIVE=1: mac_live without the timing of a path that cannot
+# stall (any reader before a later FMAC's flags landed keeps them).
+OLD_MAC_LIVE = os.environ.get("PS2_VU_OLD_MAC_LIVE", "") == "1"
+
+
+def mac_live(pairs: dict, mask: int, start: int, entries: set = None, facts: PairFacts = None) -> bool:
     """Whether a reader of MAC can see the flags of the FMAC at `start`: a
     walk of the program from the pair after it, branches and delay slots as
     they run, until a later FMAC's flags have landed for certain - four
     pairs after it, a pair taking a cycle at least - or the program ends.
-    A reader met before then (even one it reaches before `start`'s own
-    flags land) sees them; so does code not recorded, or a jump to a
-    register's address (where it goes is not known)."""
+    A reader met before then sees them - unless it issues before they land
+    (four cycles after `start`'s issue) whatever the stalls on the way: the
+    walk keeps a bound on each pair's issue, from `start`'s - a cycle after
+    the pair before, or when a field it reads, written in the three pairs
+    before it, lands (four after its writer's issue: needless_wait), the
+    later; none where it waits for Q or P, or reads a field whose writer is
+    not known. Before `start` they are the three pairs before it in the
+    program's order where none of them or `start` is a branch target or an
+    entry (`entries`: the program's entries and static targets), issued a
+    cycle apart at least. Code not recorded, or a jump to a register's
+    address (where it goes is not known), sees them too."""
     END = "end"
     seen = set()
     todo = []
@@ -992,33 +1035,73 @@ def mac_live(pairs: dict, mask: int, start: int) -> bool:
         if slot is None:
             return True                             # JR, JALR: anywhere
         first += after(start, slot[0][1])
-    todo = [(pc, pending, None) for pc, pending in first]
+    # A path's state: the pair's place after `start` (depth, capped at 4) and
+    # the three pairs before it - (writes, a bound on its issue cycle from
+    # `start`'s) each, None not known - or no bound (exact False).
+    INF = 99
+    exact0 = not OLD_MAC_LIVE and facts is not None
+    history = None
+    if exact0:
+        befores = [(start - 8 * k) & mask for k in (2, 1)]
+        straight = entries is not None and all(pc in pairs for pc in befores) and not any(
+            pc in entries for pc in [start] + befores[1:])
+        history = tuple((facts.of(pc)[1], -k) if straight else None for pc, k in zip(befores, (2, 1)))
+        history += ((facts.of(start)[1], 0),)
+    todo = [(pc, pending, None, 1, exact0, history, 0) for pc, pending in first]
     while todo:
-        pc, pending, since = todo.pop()
+        pc, pending, since, depth, exact, history, bound = todo.pop()
         if since is not None:
             since += 1
             if since >= 4:
                 continue                            # a later FMAC's flags have landed
-        if (pc, pending, since) in seen:
+        if (pc, pending, since, depth, exact, history, bound) in seen:
             continue
-        seen.add((pc, pending, since))
+        seen.add((pc, pending, since, depth, exact, history, bound))
         if pc not in pairs:
             return True
         lower, upper = pairs[pc]
         if pending is not None and pending != END and is_branch(lower, upper)[0]:
             return True                             # a branch in a delay slot: not followed
-        if reads_mac_only(lower, upper):
+        issue = INF
+        if exact:
+            reads, writes, qp = facts.of(pc)
+            issue = bound + 1
+            if qp:
+                issue = INF
+            for h in history:
+                if h is None:
+                    if reads:
+                        issue = INF
+                elif reads & h[0]:
+                    issue = max(issue, h[1] + 4)
+        if reads_mac_only(lower, upper) and issue >= 4:
             return True
-        if sets_mac(upper):
+        # Counted from the first later FMAC: once its flags land, MAC is
+        # never `start`'s again (every one that sets it replaces it whole).
+        if sets_mac(upper) and (since is None or OLD_MAC_LIVE):
             since = 0
         nexts = after(pc, pending)
         if nexts is None:
             return True
-        todo += [(n, np, since) for n, np in nexts]
+        if issue >= 4:                              # from here on as without bounds
+            todo += [(n, np, since, 4, False, None, 0) for n, np in nexts]
+        else:
+            history = history[1:] + ((facts.of(pc)[1], issue),)
+            todo += [(n, np, since, depth + 1, True, history, issue) for n, np in nexts]
     return False
 
 
-def fast_drops(unit: int, pairs: dict, mask: int) -> set:
+def static_targets(pairs: dict, mask: int) -> set:
+    """Where the program's branches with a target of their own go."""
+    out = set()
+    for pc, (lower, upper) in pairs.items():
+        branch, static, _conditional = is_branch(lower, upper)
+        if branch and static:
+            out.add((pc + 8 + imm11(lower) * 8) & mask)
+    return out
+
+
+def fast_drops(unit: int, pairs: dict, mask: int, entries: list = ()) -> set:
     """The pairs whose MAC and STATUS flags --vu-fast leaves out, or None
     where it runs the program exact. A VU1 program only (the EE reads VU0's
     flags, CFC2; never VU1's), and one that never reads or sets STATUS
@@ -1028,7 +1111,10 @@ def fast_drops(unit: int, pairs: dict, mask: int) -> set:
     before an FMAC of its own lands."""
     if unit != 1 or any(reads_status(lower, upper) for lower, upper in pairs.values()):
         return None
-    return {pc for pc, (lower, upper) in pairs.items() if sets_mac(upper) and not mac_live(pairs, mask, pc)}
+    targets = set(entries) | static_targets(pairs, mask)
+    facts = PairFacts(pairs, mask)
+    return {pc for pc, (lower, upper) in pairs.items()
+            if sets_mac(upper) and not mac_live(pairs, mask, pc, targets, facts)}
 
 
 def reads_flags(lower: int, upper: int) -> bool:
@@ -1226,7 +1312,7 @@ def generate_files(programs: list, what: str, single: str = None) -> dict:
         name = "Vu%dProgram%d" % (unit, number)
         blocks = blocks_of(pairs, entries, mask)
         names = []
-        drops = fast_drops(unit, pairs, mask)
+        drops = fast_drops(unit, pairs, mask, entries)
         # A fast variant wherever STATUS is never read: its MAC left out where
         # no one sees it (drops), its STATUS everywhere (no_status).
         fast = drops is not None

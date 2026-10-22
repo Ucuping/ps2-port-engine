@@ -76,6 +76,17 @@ comparison with a profiled build).
    out: more versions (221-256 files), and slower - fast bench 53.8 ->
    56.6-58.7 ms at 6 or 16 versions a block. The code's size costs more
    than the clamps.
+6. **MAC flags only where a reader can see them, timed** (done). Fast
+   mode's walk (mac_live) kept an FMAC's flags for any MAC reader met
+   before a later FMAC's had landed - counting from the newest later FMAC.
+   Now it counts from the first (once its flags land MAC is never the
+   older one's: every FMAC that sets MAC replaces it whole), and keeps a
+   bound on each pair's issue along the path (a reader that issues before
+   the flags land cannot see them). Burnout 3's flag-computing FMACs 6,073
+   -> 2,243; fast bench 52.7 -> 46.0 ms (-13%), its flag-free hash the same
+   (the full hash differs: what fast mode gives up, the flags a run ends
+   with). `PS2_VU_OLD_MAC_LIVE=1` for the walk as before. With steps 1 and
+   3: 60.8 -> 46.0 ms, -24%.
 5. **Superblocks for loops.** A loop body chained into itself (most of the
    hot code) compiled as one function with the loop kept, so the steps above
    hold from one iteration to the next.
