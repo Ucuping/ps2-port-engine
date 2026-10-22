@@ -1795,8 +1795,57 @@ void OverlaysRunWhatIsLoaded() {
     ps2host::RegisterOverlays(nullptr, 0);
 }
 
+// A minimal ELF32 executable: its PT_LOAD segments in order - each an address,
+// the words it holds in the file and its size in memory - entered at the first.
+struct TestSegment {
+    u32 address;
+    std::vector<u32> words;
+    u32 memsz;
+};
+
+std::vector<u8> TestElf(const std::vector<TestSegment>& segments) {
+    std::size_t size = 0x100;
+    for (const TestSegment& s : segments) size += 4 * s.words.size();
+    std::vector<u8> elf(size);
+    auto put = [&](std::size_t at, u32 v, int bytes) { std::memcpy(&elf[at], &v, std::size_t(bytes)); };
+    std::memcpy(elf.data(), "\x7F" "ELF\x01\x01\x01", 7);
+    put(16, 2, 2), put(18, 8, 2), put(20, 1, 4), put(24, segments.at(0).address, 4), put(28, 52, 4);
+    put(40, 52, 2), put(42, 32, 2), put(44, u32(segments.size()), 2);       // ehsize, phentsize, phnum
+    u32 offset = 0x100;
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+        const TestSegment& s = segments[i];
+        const std::size_t ph = 52 + 32 * i;
+        const u32 filesz = u32(4 * s.words.size());
+        put(ph, 1, 4), put(ph + 4, offset, 4), put(ph + 8, s.address, 4), put(ph + 12, s.address, 4);
+        put(ph + 16, filesz, 4), put(ph + 20, s.memsz, 4), put(ph + 28, 16, 4);
+        for (std::size_t w = 0; w < s.words.size(); ++w) put(offset + 4 * w, s.words[w], 4);
+        offset += filesz;
+    }
+    return elf;
+}
+
+// A segment with no bytes in the file laid over another - Tekken 5's .dmh over
+// its .y4 - leaves the other's bytes as the file has them, whichever comes
+// first; what no segment's file covers is zeroed.
+void SegmentsKeepTheirBytes() {
+    ps2host::Memory& m = ps2host::GuestMemory();
+    constexpr u32 kLow = 0x00740000u, kWide = 0x00738000u, kWideSize = 0x10000u;
+    for (u32 at : {kWide, kLow, kWide + kWideSize - 4}) m.Write(at, 0xDEADBEEFu, 4);
+    const TestSegment bytes{kLow, {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u}, 0x10};
+    const TestSegment none{kWide, {}, kWideSize};
+    ps2host::LoadExecutable("test.elf", TestElf({bytes, none}));
+    Check(m.Read(kLow, 4) == 0x11111111u && m.Read(kLow + 12, 4) == 0x44444444u,
+          "ELF: a segment's bytes stay under a later one with none");
+    Check(m.Read(kWide, 4) == 0 && m.Read(kWide + kWideSize - 4, 4) == 0, "ELF: the rest of the wide one zeroed");
+    for (u32 at : {kWide, kLow}) m.Write(at, 0xDEADBEEFu, 4);
+    ps2host::LoadExecutable("test.elf", TestElf({none, bytes}));
+    Check(m.Read(kLow + 4, 4) == 0x22222222u && m.Read(kWide, 4) == 0, "ELF: the same with the wide one first");
+    for (u32 i = 0; i < kWideSize; i += 4) m.Write(kWide + i, 0u, 4);
+}
+
 int main() {
     OverlaysRunWhatIsLoaded();
+    SegmentsKeepTheirBytes();
     MirrorsReachTheSameRam();
     LoadsExtendAsTheEeDoes();
     OutsideMemoryFaults();
