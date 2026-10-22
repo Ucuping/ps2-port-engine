@@ -19,13 +19,13 @@
 #include <cstring>
 #include <functional>
 #include <unordered_map>
-#include <xmmintrin.h>
 #include <unordered_set>
 #include <vector>
 
 #include "ps2host/memory.h"
 #include "ps2host/profile.h"
 #include "ps2host/vu_core.h"
+#include "ps2rt/fp_mode.h"
 #include "ps2rt/generated.h"
 #include "ps2rt/vu_math.h"
 
@@ -880,16 +880,13 @@ int Vu::Bench(const std::string& path, int passes, bool fast) {
 
 namespace {
 /* The VUs' arithmetic as the console's: rounded toward zero, denormals flushed
-   (inputs and results) - the host's SSE control word, for a run. Burnout 3's
-   particles reduce an angle by adding 2^23 and taking it away again: rounded
-   to nearest it came out in [0, 1], not [-0.5, 0.5], and the sine polynomial
-   after it gave corners twelve times too long - huge smoke puffs lit with
-   wrapped colours (the race's white-outs and stretched textures). */
-struct VuRounding {
-    unsigned saved = _mm_getcsr();
-    VuRounding() { _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u); }
-    ~VuRounding() { _mm_setcsr(saved); }
-};
+   (inputs and results) - the host's float control (ps2rt/fp_mode.h), for a run.
+   Burnout 3's particles reduce an angle by adding 2^23 and taking it away
+   again: rounded to nearest it came out in [0, 1], not [-0.5, 0.5], and the
+   sine polynomial after it gave corners twelve times too long - huge smoke
+   puffs lit with wrapped colours (the race's white-outs and stretched
+   textures). */
+using VuRounding = ps2rt::VuFloatMode;
 }  // namespace
 
 Vu::u64 Vu::Run(u32 pc, u64 limit) {
