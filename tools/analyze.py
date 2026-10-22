@@ -24,12 +24,12 @@ sys.path[:0] = [HERE, os.path.dirname(HERE)]
 from ps2decomp import game as game_config
 from ps2decomp.elf import ElfFile
 from ps2decomp.analysis import ImageAnalyzer
-from ps2decomp import gaps, lift, overlay
+from ps2decomp import ehframe, gaps, lift, overlay
 from ps2decomp.r5900 import DISASM
 from ps2decomp.symbols import SymbolRecovery
 
 
-def build_database(elf_path: str, verbose: bool = True, keep=()) -> dict:
+def build_database(elf_path: str, verbose: bool = True, keep=(), bounds=()) -> dict:
     started = time.time()
     elf = ElfFile.load(elf_path)
     exec_sections = elf.exec_sections
@@ -215,8 +215,28 @@ def build_database(elf_path: str, verbose: bool = True, keep=()) -> dict:
         external = [{k: f[k] for k in ("addr", "end", "size", "label", "confidence", "calls")}
                     for f in functions if not overlay.in_code(keep, f["addr"])]
         functions = kept
+    # The executable's FDEs, where the game takes them as the truth
+    # (ps2decomp/ehframe.py): each function they describe gets its extent, and
+    # what started inside one - a switch's cases the pointer pass took for
+    # functions, entries a data word decoding as a jal made up - goes.
+    bounded = {}
+    if bounds:
+        def in_code(address):
+            if keep:
+                return overlay.in_code(keep, address)
+            return section.addr <= address < section.addr + len(data)
+
+        def padding(start, end):
+            return not any(data[start - section.addr:end - section.addr])
+
+        functions, bounded = ehframe.apply_bounds(functions, bounds, describe, in_code, padding)
+        log("  %d functions bounded by the executable's .eh_frame: %d given its extent, %d starts "
+            "inside one dropped, %d kept (code calls them), %d added past one"
+            % (sum(1 for f in functions if f.get("bounds")), len(bounded["changed"]),
+               len(bounded["dropped"]), len(bounded["kept_inner"]), len(bounded["added"])))
     for f in functions:
-        f["chunks"] = [list(c) for c in analyzer.chunks(f["addr"], f["end"], entries)]
+        f["chunks"] = ([] if f.get("bounds") else
+                       [list(c) for c in analyzer.chunks(f["addr"], f["end"], entries)])
     log("  %d functions have out-of-line pieces (%s bytes)"
         % (sum(1 for f in functions if f["chunks"]),
            format(sum(e - s for f in functions for s, e in f["chunks"]), ",")))
@@ -252,6 +272,11 @@ def build_database(elf_path: str, verbose: bool = True, keep=()) -> dict:
         ],
         "renderware": [{"addr": addr, "path": path} for addr, path in rw_tags],
     }
+    if bounded:
+        database["bounds"] = {"source": ".eh_frame",
+                              "changed": [list(c) for c in bounded["changed"]],
+                              "dropped": bounded["dropped"], "kept_inner": bounded["kept_inner"],
+                              "added": bounded["added"]}
     if keep:
         # The overlay's own numbers, not the combined image's.
         database["meta"]["image_size"] = sum(high - low for low, high in keep)
@@ -272,8 +297,15 @@ def main(argv=None) -> int:
     game = game_config.from_args(args)
     output = args.output or game.database_path
     os.makedirs(os.path.dirname(output), exist_ok=True)
+    bounds = ()
+    if game.eh_frame_boundaries:
+        # An overlay's FDEs are in the executable that loads it (Tekken 5's).
+        source = ElfFile.load((game.base or game).elf_path)
+        eh_frame = source.section(".eh_frame")
+        if eh_frame is not None:
+            bounds = ehframe.fde_ranges(source.section_data(eh_frame), eh_frame.addr)
     database = build_database(game.elf_path, verbose=not args.quiet,
-                              keep=game.code_ranges)
+                              keep=game.code_ranges, bounds=bounds)
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     with open(output, "w", encoding="utf-8") as handle:
         json.dump(database, handle, indent=1)

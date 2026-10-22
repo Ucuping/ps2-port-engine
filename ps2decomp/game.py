@@ -43,8 +43,10 @@ CONFIDENT = ("entry", "called", "pointer")
 
 
 def confidence_label(function: dict) -> str:
-    """"high" for a function the analysis is sure of, "low" for one it guessed."""
-    return "high" if function.get("confidence") in CONFIDENT else "low"
+    """"high" for a function the analysis is sure of - or that an FDE in the
+    executable's .eh_frame describes (ehframe.py) - "low" for one it guessed."""
+    sure = function.get("confidence") in CONFIDENT or function.get("bounds") == "eh_frame"
+    return "high" if sure else "low"
 
 
 DEFAULTS = {
@@ -58,6 +60,9 @@ DEFAULTS = {
     "vu_regions": [],
     "overlay": None,
     "overlays": [],
+    # The executable's .eh_frame as the truth about the functions it describes
+    # (ps2decomp/ehframe.py): their extent, and no function inside one.
+    "eh_frame_boundaries": False,
 }
 
 
@@ -80,6 +85,8 @@ class Game:
     base: "Game | None" = None
     # A game's: the directories of its overlays, relative to its own.
     overlays: list = dataclasses.field(default_factory=list)
+    # Whether the analysis takes the executable's FDEs as the functions' bounds.
+    eh_frame_boundaries: bool = False
 
     def path(self, relative: str) -> str:
         return os.path.normpath(os.path.join(self.directory, relative))
@@ -132,7 +139,8 @@ def load(directory: str) -> Game:
                 vu_regions=[tuple(_number(v) for v in pair) for pair in values["vu_regions"]],
                 code_ranges=[tuple(_number(v) for v in pair)
                              for pair in (values["overlay"] or {}).get("code", [])],
-                base=base, overlays=list(values["overlays"]))
+                base=base, overlays=list(values["overlays"]),
+                eh_frame_boundaries=bool(values["eh_frame_boundaries"]))
     configure_layout(game)
     return game
 
