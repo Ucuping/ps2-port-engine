@@ -1458,12 +1458,14 @@ bool SpareCores() {
     static std::atomic<int> looks{0};
     static std::atomic<bool> spare{true};
     if (looks.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
-        DWORD_PTR process = 0, system = 0;
         int cores = int(std::thread::hardware_concurrency());
+#ifdef _WIN32
+        DWORD_PTR process = 0, system = 0;
         if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) && process) {
             cores = 0;
             for (DWORD_PTR m = process; m; m &= m - 1) ++cores;
         }
+#endif
         spare.store(cores >= 4, std::memory_order_relaxed);
     }
     return spare.load(std::memory_order_relaxed);
