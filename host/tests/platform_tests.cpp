@@ -324,6 +324,15 @@ void SleepsLastToTheDeadline() {
     Check(slept >= 19.9 && slept < 1000, "a sleep to a deadline wakes no earlier than it");
 }
 
+// ------------------------------------------------------------------ files
+
+void TheExecutableIsFound() {
+    const std::string path = platform::ExecutablePath().string();
+    std::FILE* file = path.empty() ? nullptr : std::fopen(path.c_str(), "rb");
+    Check(file != nullptr, "the running executable's path names a file");
+    if (file) std::fclose(file);
+}
+
 // ------------------------------------------------------------------ faults
 
 void CopiesThatMayFail() {
@@ -449,6 +458,7 @@ int main() {
     MostOfTheStackIsThere();
     WaitsEnd();
     SleepsLastToTheDeadline();
+    TheExecutableIsFound();
     CopiesThatMayFail();
 #if !defined(_WIN32)
     CrashReportThenTheHandlerBefore();

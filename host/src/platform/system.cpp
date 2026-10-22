@@ -11,6 +11,8 @@
 #include "platform.h"
 
 #include <algorithm>
+#include <cstring>
+#include <filesystem>
 #include <thread>
 
 #if defined(_WIN32)
@@ -20,6 +22,7 @@
 #include <timeapi.h>
 #pragma comment(lib, "synchronization.lib")
 #elif defined(__APPLE__)
+#include <mach-o/dyld.h>
 #include <mach/mach_time.h>
 #include <os/clock.h>
 #include <os/os_sync_wait_on_address.h>
@@ -87,6 +90,16 @@ void HoldTimerResolution() {
     SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &process, sizeof process);
 }
 
+bool HoldProcessToCores(std::uint64_t mask) {
+    return mask && SetProcessAffinityMask(GetCurrentProcess(), DWORD_PTR(mask));
+}
+
+std::filesystem::path ExecutablePath() {
+    wchar_t exe[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return {};
+    return std::filesystem::path(exe);
+}
+
 int ProcessCores() {
     DWORD_PTR process = 0, system = 0;
     int cores = int(std::thread::hardware_concurrency());
@@ -143,6 +156,20 @@ void SetThreadRole(ThreadRole role) {
 void HoldTimerResolution() {}           // timers here are precise without asking
 
 int ProcessCores() { return int(std::thread::hardware_concurrency()); }
+
+// Apple's systems let a thread hint at its processors, not a process choose them.
+bool HoldProcessToCores(std::uint64_t) { return false; }
+
+std::filesystem::path ExecutablePath() {
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::string path(size, '\0');
+    if (_NSGetExecutablePath(path.data(), &size) != 0) return {};
+    path.resize(std::strlen(path.c_str()));
+    std::error_code error;
+    const auto canonical = std::filesystem::weakly_canonical(path, error);   // the links resolved
+    return error ? std::filesystem::path(path) : canonical;
+}
 
 #endif
 

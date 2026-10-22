@@ -1,9 +1,5 @@
 #include "ps2host/host.h"
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -32,6 +28,7 @@
 #include "ps2host/run.h"
 #include "ps2host/settings.h"
 #include "ps2host/timeline.h"
+#include "platform/platform.h"
 
 namespace ps2host {
 
@@ -687,9 +684,7 @@ int Run(const Options& options) {
         if (!options.memcard.empty()) {
             where = std::filesystem::absolute(options.memcard).parent_path();
         } else {
-            wchar_t exe[MAX_PATH] = {};
-            GetModuleFileNameW(nullptr, exe, MAX_PATH);
-            where = std::filesystem::path(exe).parent_path();
+            where = platform::ExecutablePath().parent_path();
         }
         LoadSettings((where / "pc_settings.ini").string());
     }
@@ -801,15 +796,17 @@ int Main(int argc, char** argv) {
     // mask (0x5: logical cores 0 and 2 - two physical cores where the first
     // ones are hyperthreaded pairs).
     if (const char* cores = std::getenv("PS2HOST_CORES")) {
-        DWORD_PTR mask = 0;
+        std::uint64_t mask = 0;
         if (cores[0] == '0' && (cores[1] == 'x' || cores[1] == 'X')) {
-            mask = DWORD_PTR(std::strtoull(cores + 2, nullptr, 16));
+            mask = std::strtoull(cores + 2, nullptr, 16);
         } else {
             const int n = std::atoi(cores);
-            if (n > 0 && n < int(8 * sizeof(DWORD_PTR))) mask = (DWORD_PTR(1) << n) - 1;
+            if (n > 0 && n < int(8 * sizeof(void*))) mask = (std::uint64_t(1) << n) - 1;
         }
-        if (mask && SetProcessAffinityMask(GetCurrentProcess(), mask))
+        if (platform::HoldProcessToCores(mask))
             std::fprintf(stderr, "[host] held to cores 0x%llX (PS2HOST_CORES)\n", (unsigned long long)mask);
+        else if (mask)
+            std::fprintf(stderr, "[host] PS2HOST_CORES: not held to cores (the system refused, or has no such call)\n");
     }
     Options options;
     for (int i = 1; i < argc; ++i) {

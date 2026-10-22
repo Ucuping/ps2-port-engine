@@ -16,6 +16,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <string>
 
 namespace ps2host::platform {
 
@@ -62,6 +64,14 @@ void SetThreadRole(ThreadRole role);
 void HoldTimerResolution();
 // Processors the process may run on.
 int ProcessCores();
+// The process held to the processors in `mask` (bit n: logical processor n),
+// where the system lets a process choose them; false where it does not.
+bool HoldProcessToCores(std::uint64_t mask);
+
+// ------------------------------------------------------------------ files
+// The running executable's full path (empty if the system will not say) - a
+// path, not a string: Windows' wide one kept whole.
+std::filesystem::path ExecutablePath();
 
 // ------------------------------------------------------------------ faults
 // `bytes` from `source` into `target`; false, and no fault, where the source
