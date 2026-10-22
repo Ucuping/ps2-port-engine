@@ -8,7 +8,6 @@
 
 #include <atomic>
 #include <map>
-#include <memory>
 #include <string>
 #include <functional>
 #include <vector>
@@ -209,8 +208,6 @@ void SyncGs();
 void GsQword(int path, u64 low, u64 high);
 void GsWord(int path, u32 word);
 void GsWords(int path, const u32* words, u32 count, u32 from = ~0u);
-/* The same, the words left where they are while `keep` lives (not copied). */
-void GsWordsKept(int path, const u32* words, u32 count, std::shared_ptr<const void> keep);
 void GsPrivileged(u32 address, u64 value);
 /* The end of frame N, in the GS's stream: the handler (the GPU bridge's, when
    the GPU draws: hand the frame to the GPU, show its picture) runs on the GS

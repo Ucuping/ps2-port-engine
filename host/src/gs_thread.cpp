@@ -54,7 +54,7 @@ constexpr u32 kRing = 1u << 22;                 // words (16 MB)
 constexpr u32 kWakeWords = 4096;
 constexpr int kLookMs = 1;
 constexpr u32 kMaxRun = kRing / 8;              // the longest run of words one entry carries
-enum : u32 { kQword = 1, kWord = 2, kWords = 3, kPrivileged = 4, kWrap = 5, kFrame = 6, kWordsKept = 7 };
+enum : u32 { kQword = 1, kWord = 2, kWords = 3, kPrivileged = 4, kWrap = 5, kFrame = 6 };
 
 std::atomic<u64> g_gs_busy_us{0};       // the GS thread at work, not waiting for more (--frame-times)
 
@@ -254,16 +254,6 @@ struct Feed {
                             g.Words(path, e + 2, count, e[1]);
                             size = 2 + count;
                             break;
-                        case kWordsKept: {           // GsWordsKept: words elsewhere, and what keeps them
-                            const u32* words = nullptr;
-                            std::shared_ptr<const void>* keep = nullptr;
-                            std::memcpy(&words, e + 1, sizeof words);
-                            std::memcpy(&keep, e + 4, sizeof keep);
-                            g.Words(path, words, e[3], gs::Gs::kNoSource);
-                            delete keep;
-                            size = 6;
-                            break;
-                        }
                         case kPrivileged:
                             g.SetPrivileged(e[1], u64(e[2]) | u64(e[3]) << 32);
                             size = 4;
@@ -380,22 +370,6 @@ void GsWords(int path, const u32* words, u32 count, u32 from) {
         count -= run;
         if (from != gs::Gs::kNoSource) from += 4 * run;
     }
-}
-
-/* GsWords for words `keep` keeps alive: handed over as they are, not copied
-   into the ring (PATH3's held textures, released on VIF1's worker - their
-   copy was a twentieth of its time in a race). */
-void GsWordsKept(int path, const u32* words, u32 count, std::shared_ptr<const void> keep) {
-    if (!count) return;
-    if (!g_feed) return gs::TheGs().Words(path, words, count, gs::Gs::kNoSource);
-    Producing producing;
-    auto* holder = new std::shared_ptr<const void>(std::move(keep));
-    u32* e = g_feed->Reserve(6);
-    e[0] = Header(kWordsKept, path, 0);
-    std::memcpy(e + 1, &words, sizeof words);
-    e[3] = count;
-    std::memcpy(e + 4, &holder, sizeof holder);
-    g_feed->Publish(6, count >= kWakeWords);
 }
 
 void SetGsFrameHandler(std::function<void(u64)> handler) { g_frame_handler = std::move(handler); }
