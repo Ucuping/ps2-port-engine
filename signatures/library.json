@@ -46,11 +46,6 @@
     "SLUS_210.50"
    ]
   },
-  "197:517cbfc5a1d5b983": {
-   "sceGsSyncPath": [
-    "SLUS_210.50"
-   ]
-  },
   "21:33515352acf0c103": {
    "lgDevEnumHint": [
     "SLUS_210.50"
@@ -91,11 +86,6 @@
   },
   "301:cec25417a8086180": {
    "lgAudInit": [
-    "SLUS_210.50"
-   ]
-  },
-  "319:c1e8097aceb79d4c": {
-   "sceGsExecStoreImage": [
     "SLUS_210.50"
    ]
   },
@@ -464,18 +454,8 @@
     "SLUS_210.50"
    ]
   },
-  "6:6adfc71f60532163": {
-   "EnableIntr": [
-    "SLUS_210.50"
-   ]
-  },
   "75:21a2559f6feba9dd": {
    "StringAppend": [
-    "SLUS_210.50"
-   ]
-  },
-  "75:2f8f032142079a9c": {
-   "sceDbcSendData": [
     "SLUS_210.50"
    ]
   },
@@ -489,23 +469,8 @@
     "SLUS_210.50"
    ]
   },
-  "82:3a4821cbae80399b": {
-   "sceDbcSRData": [
-    "SLUS_210.50"
-   ]
-  },
-  "82:714e65199859a560": {
-   "sceDbcGetDepNumber": [
-    "SLUS_210.50"
-   ]
-  },
   "83:7fdb4946a6703a95": {
    "lgDevAUpdateForceEffect": [
-    "SLUS_210.50"
-   ]
-  },
-  "87:43dc05dfcbca8549": {
-   "sceDbcSendData2": [
     "SLUS_210.50"
    ]
   },
