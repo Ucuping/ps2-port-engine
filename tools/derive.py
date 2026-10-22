@@ -1086,7 +1086,7 @@ def _derive_worker(connection, game_directory, seeds):
         results = []
         for address in addresses:
             func = functions[address]
-            counts = {"unsupported": 0, "untestable": 0, "mismatch": 0}
+            counts = {"unsupported": 0, "untestable": 0, "mismatch": 0, "wide": 0}
             outcome = _attempt(func, image, section.addr, machine, read, known, counts,
                                parameters)
             if outcome is None and counts["unsupported"]:
@@ -1097,7 +1097,7 @@ def _derive_worker(connection, game_directory, seeds):
                 callees = direct_callees(image, section.addr, func)
                 if callees & known.keys():
                     plain = {a: d for a, d in known.items() if a not in callees}
-                    counts = {"unsupported": 0, "untestable": 0, "mismatch": 0}
+                    counts = {"unsupported": 0, "untestable": 0, "mismatch": 0, "wide": 0}
                     outcome = _attempt(func, image, section.addr, machine, read, plain,
                                        counts, parameters)
             if outcome is not None:
@@ -1211,10 +1211,11 @@ def collect_parallel(database: dict, image: bytes, base: int, machine: Machine,
         machine.memory.map_page(page)
 
     verified.sort(key=lambda item: item[0]["addr"])
-    rejected = {"unsupported": 0, "untestable": 0, "mismatch": 0}
+    rejected = {"unsupported": 0, "untestable": 0, "mismatch": 0, "wide": 0}
     for category in last.values():
         rejected[category] += 1
     rejected["mismatched"] = sorted(a for a in set(mismatched) if last.get(a) == "mismatch")
+    rejected["wide_results"] = sorted(a for a, category in last.items() if category == "wide")
     rejected["untestable_reasons"] = collections.Counter(
         reasons.get(address) or "unknown"
         for address, category in last.items() if category == "untestable")
@@ -1244,7 +1245,7 @@ def collect(database: dict, image: bytes, base: int, machine: Machine,
     def read(addr, size, signed):
         return machine.memory.read_int(addr, size, signed)
 
-    verified, rejected = [], {"unsupported": 0, "untestable": 0, "mismatch": 0}
+    verified, rejected = [], {"unsupported": 0, "untestable": 0, "mismatch": 0, "wide": 0}
     # Which arguments each function reads, so a call to one that is not derived can
     # be made rather than refused.
     parameters = calls.parameters(database, image, base)
@@ -1268,7 +1269,7 @@ def collect(database: dict, image: bytes, base: int, machine: Machine,
                 continue
             if newly_known is not None and not (callees[func["addr"]] & newly_known):
                 continue
-            outcome_counts = {"unsupported": 0, "untestable": 0, "mismatch": 0}
+            outcome_counts = {"unsupported": 0, "untestable": 0, "mismatch": 0, "wide": 0}
             outcome = _attempt(func, image, base, machine, read, known, outcome_counts,
                                parameters)
             if outcome is None:
@@ -1295,10 +1296,11 @@ def collect(database: dict, image: bytes, base: int, machine: Machine,
         newly_known = fresh
         if added == 0 or not fresh:
             break
-    rejected = {"unsupported": 0, "untestable": 0, "mismatch": 0}
+    rejected = {"unsupported": 0, "untestable": 0, "mismatch": 0, "wide": 0}
     for category in last.values():
         rejected[category] += 1
     rejected["mismatched"] = sorted(a for a in set(mismatched) if last.get(a) == "mismatch")
+    rejected["wide_results"] = sorted(a for a, category in last.items() if category == "wide")
     rejected["untestable_reasons"] = collections.Counter(
         reasons.get(address) or "unknown"
         for address, category in last.items() if category == "untestable")
@@ -1357,6 +1359,19 @@ def _attempt(func, image, base, machine, read, known, rejected, parameters=None)
                 profile, record = fuller, []
                 outcome, tested = run_cases(func, machine, arg_sets, profile, evaluate,
                                             record, float_result=derivation.returns_float)
+        # The model's result is 32 bits wide. One the original returns wider - a
+        # double, a long long - would be verified on its low half, and the C++
+        # would return only that half (testplan.wide_result): such a function
+        # is not derived, and its lifted copy, verified on the whole state,
+        # stands. Even if no caller in the analysis reads the result: code it
+        # does not hold may (Tekken 5's modules, loaded at run time, call the
+        # executable's double routines).
+        if outcome == "ok" and not derivation.is_void and not derivation.returns_float:
+            wide = testplan.wide_result(func, machine, arg_sets, profile)
+            if wide is not None:
+                rejected["wide"] += 1
+                rejected["reason"] = "returns more than 32 bits ($v0 0x%016X)" % wide
+                return None
         # A disagreement and an untestable function are different findings and are
         # counted once each. An earlier version fell through from one to the other
         # and so reported every disagreement twice.
@@ -1813,6 +1828,10 @@ def main(argv=None) -> int:
         rejected["mismatch"],
         "  (%s)" % ", ".join("0x%08X" % a for a in rejected.get("mismatched", [])[:8])
         if rejected.get("mismatched") else ""))
+    print("  rejected, result over 32 bits   : %d%s" % (
+        rejected["wide"],
+        "  (%s)" % ", ".join("0x%08X" % a for a in rejected.get("wide_results", [])[:8])
+        if rejected.get("wide_results") else ""))
     print("  elapsed                         : %.1fs" % (time.time() - started))
     refusals = {a: list(v) for a, v in rejected.get("by_function", {}).items()}
 

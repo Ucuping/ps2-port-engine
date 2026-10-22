@@ -131,5 +131,55 @@ class TestFullerProfile(unittest.TestCase):
                                                   testplan.ARG_SETS))
 
 
+def r_type(funct, rs=0, rt=0, rd=0, sa=0):
+    return (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | funct
+
+
+JR_RA = (RA << 21) | 0x08
+FUNCTIONS = {
+    # return (u64)n << 32: as wide as a result gets, on any argument but 0
+    "shifted": [JR_RA, r_type(0x3C, rt=A0, rd=V0)],              # dsll32 $v0, $a0, 0
+    # return n + 1, as a 32-bit add: sign-extended, whatever $a0 holds
+    "word_add": [JR_RA, i_type(0x09, A0, V0, 1)],                # addiu $v0, $a0, 1
+    # return n: as wide as its argument - narrow on the plan's, not on a double
+    "passed": [JR_RA, r_type(0x25, rs=A0, rt=ZERO, rd=V0)],      # or $v0, $a0, $zero
+}
+
+
+class TestWideResult(unittest.TestCase):
+    """A $v0 wider than 32 bits (testplan.wide_result), which a derivation's
+    32-bit result cannot hold."""
+
+    def machine_for(self, name):
+        words = FUNCTIONS[name]
+        func = {"addr": BASE, "end": BASE + 4 * len(words), "size": 4 * len(words)}
+        return Machine(BASE, struct.pack("<%dI" % len(words), *words), 0x02000000 - BASE), func
+
+    def wide(self, name):
+        machine, func = self.machine_for(name)
+        arg_sets = [(n,) + (0,) * 15 for n in (1, 2, 0x7FFFFFFF, 0xFFFFFFFFFFFFFFFF)]
+        return testplan.wide_result(func, machine, arg_sets, "zero")
+
+    def test_a_64_bit_result_is_wide(self):
+        self.assertEqual(self.wide("shifted"), 1 << 32)
+
+    def test_a_32_bit_result_is_not(self):
+        self.assertIsNone(self.wide("word_add"))
+
+    def test_an_argument_handed_back_is_wide_on_a_double(self):
+        self.assertEqual(self.wide("passed"), 0x3FF0000000000000)        # 1.0
+
+    def test_derive_refuses_a_wide_result_and_keeps_a_narrow_one(self):
+        for name, derived in (("shifted", False), ("passed", False), ("word_add", True)):
+            machine, func = self.machine_for(name)
+            image = struct.pack("<%dI" % len(FUNCTIONS[name]), *FUNCTIONS[name])
+            counts = {"unsupported": 0, "untestable": 0, "mismatch": 0, "wide": 0}
+            outcome = derive._attempt(func, image, BASE, machine,
+                                      lambda a, s, signed: machine.memory.read_int(a, s, signed),
+                                      {}, counts, None)
+            self.assertEqual(outcome is not None, derived, name)
+            self.assertEqual(counts["wide"], 0 if derived else 1, name)
+
+
 if __name__ == "__main__":
     unittest.main()

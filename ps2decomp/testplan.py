@@ -13,6 +13,7 @@ import bisect
 import hashlib
 import random
 import re
+import struct
 import time
 
 from . import layout, structs, testmem
@@ -346,3 +347,86 @@ def run_cases(func, machine, arg_sets, profile, evaluate, record=None, recorded=
 def reset_failure() -> None:
     global _LAST_FAILURE
     _LAST_FAILURE = None
+
+
+def _double(value: float) -> int:
+    return struct.unpack("<Q", struct.pack("<d", value))[0]
+
+
+def _single(value: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+# Arguments a routine with a 64-bit result takes: doubles - soft-float, in the
+# integer argument registers - and 64-bit integers, with floats in the float
+# registers; and magnitudes past 2^32, which a conversion to a 64-bit integer
+# needs before its result is wider than 32 bits. The plan's integer arguments
+# are 32-bit values, addresses in scratch, which read as doubles are tiny
+# denormals: a double add or multiply returns a result whose upper half is
+# zero on every one of them (Tekken 5: 0x00123240, 0x00123300), and so looks
+# 32 bits wide; its floats are small, so a float's conversion to a long long
+# returns a small one (0x001219B0).
+WIDE_PROBES = tuple(
+    tuple(integers) + tuple(_single(f) for f in floats)
+    for integers, floats in (
+        ((_double(1.0), _double(2.0), _double(3.0), _double(-0.5),
+          _double(65536.0), _double(1.5), _double(1e10), _double(-3.25)),
+         (1.5, -2.0, 3.0, 0.25, 100.0, -1.0, 7.5, 0.5)),
+        ((_double(3.0), _double(1.0), _double(65536.0), _double(1.5),
+          _double(-2.5), _double(0.1), _double(4.0), _double(8.0)),
+         (2.0, 0.5, -3.0, 1.0, 10.0, -0.25, 6.0, 1.0)),
+        ((0x0000000100000003, 0x0000000200000001, 0x0000000300000007, 5,
+          0x0000000123456789, 7, 0xFFFFFFFF00000001, 3),
+         (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0)),
+        ((_double(1e10), _double(-3e12), _double(2.5e15), _double(4294967296.0),
+          _double(6e9), _double(-7e9), _double(1e18), _double(8589934592.0)),
+         (1e10, -3e12, 2.5e15, 4294967296.0, 6e9, -7e9, 1e18, 8589934592.0)),
+    ))
+
+
+_MASK64 = (1 << 64) - 1
+
+
+def _narrow(value: int) -> bool:
+    """Whether a register holds a 32-bit value, sign-extended as the EE keeps
+    every 32-bit value in its 64-bit registers."""
+    low = value & 0xFFFFFFFF
+    extended = low - (1 << 32) if low & 0x80000000 else low
+    return value & _MASK64 == extended & _MASK64
+
+
+def wide_result(func, machine, arg_sets, profile):
+    """The first $v0 wider than 32 bits the original returns, or None.
+
+    A derivation's result is modelled, compared and emitted as 32 bits
+    (paths.PathDerivation.evaluate, Machine.call, the s32 the C++ returns), so
+    a function returning a double or a long long in the whole 64-bit $v0 would
+    be verified on the low half of its result, and its C++ would return only
+    that half. The original is run on the plan's cases, on the memory they
+    had, and on WIDE_PROBES; a case it cannot finish is left out, as in
+    run_cases. A function that returns an argument unchanged is wide on the
+    probes too: what it hands back is as wide as what it is given.
+    """
+    memory = machine.memory
+    memory.end_journal()
+    # The probes' doubles, read as addresses, reach pages nothing else maps:
+    # given back afterwards, as testplan's search does.
+    mark = memory.page_mark()
+    cases = [(args, func["addr"] + case) for case, args in enumerate(arg_sets)]
+    cases += [(args, func["addr"] + len(arg_sets) + n) for n, args in enumerate(WIDE_PROBES)]
+    found = None
+    for args, seed in cases:
+        memory.write(layout.CURRENT.scratch, testmem.build(profile, seed))
+        memory.begin_journal()
+        try:
+            machine.call(func["addr"], args, max_instructions=VERIFY_BUDGET)
+            value = machine.get(2)
+        except Exception:
+            value = None
+        memory.rollback()
+        memory.end_journal()
+        if value is not None and not _narrow(value):
+            found = value & _MASK64
+            break
+    memory.unmap_to(mark)
+    return found
