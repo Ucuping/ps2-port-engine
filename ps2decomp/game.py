@@ -30,6 +30,23 @@ from . import overlay as overlay_module
 from .elf import ElfFile
 from .r5900 import DISASM
 
+# The status table's columns (config/functions.csv): what each function's
+# translation is - status, source, notes - and how sure the analysis is that it
+# is a function at all.
+STATUS_FIELDS = ["address", "name", "status", "source", "notes", "confidence"]
+
+# What the analysis is sure of (analysis.py): the ELF's entry, a jal's target,
+# a pointer's target that ends in a return. The prologue scan and the recovery
+# from the gaps guess; their functions are counted apart (progress.py), whatever
+# their tests say.
+CONFIDENT = ("entry", "called", "pointer")
+
+
+def confidence_label(function: dict) -> str:
+    """"high" for a function the analysis is sure of, "low" for one it guessed."""
+    return "high" if function.get("confidence") in CONFIDENT else "low"
+
+
 DEFAULTS = {
     "iso": None,
     "extracted": "extracted",

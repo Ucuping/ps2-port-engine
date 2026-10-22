@@ -374,7 +374,7 @@ def structure_unverified(plain, functions, image, base, game, strings, cache) ->
     return result
 
 
-def update_status(path: str, verified, outcomes, names=None, unverified=None) -> None:
+def update_status(path: str, verified, outcomes, names=None, unverified=None, confidence=None) -> None:
     """Rebuild the `lifted` rows; any other row - derived, hand-written - stays.
 
     A function verified both ways keeps its derived row: readable source that is
@@ -422,8 +422,11 @@ def update_status(path: str, verified, outcomes, names=None, unverified=None) ->
             "source": "src/lifted/",
             "notes": "lifted; not verified: %s" % reason,
         }
+    # How sure the analysis is of each (game.confidence_label), on every row.
+    for address, row in rows.items():
+        row["confidence"] = (confidence or {}).get(address, row.get("confidence", ""))
     with open(path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["address", "name", "status", "source", "notes"])
+        writer = csv.DictWriter(handle, fieldnames=game_config.STATUS_FIELDS)
         writer.writeheader()
         writer.writerows(rows[key] for key in sorted(rows))
     print("updated %s (%d lifted rows)" % (path, added))
@@ -586,7 +589,8 @@ def main(argv=None) -> int:
         print("wrote %d files to %s (%d functions, %d not verified)"
               % (len(paths), out, len(chosen), len(unverified)))
     if args.csv:
-        update_status(game.path(game.status), verified, outcomes, names, unverified)
+        update_status(game.path(game.status), verified, outcomes, names, unverified,
+                      {f["addr"]: game_config.confidence_label(f) for f in database["functions"]})
     print("  elapsed %.0fs" % (time.time() - started))
     return 0
 

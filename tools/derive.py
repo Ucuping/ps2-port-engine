@@ -1944,11 +1944,12 @@ def main(argv=None) -> int:
                 "notes": notes,
             }
         rows = [existing[key] for key in sorted(existing)]
+        sure = {f["addr"]: game_config.confidence_label(f) for f in database["functions"]}
+        for row in rows:
+            row["confidence"] = sure.get(int(row["address"], 16), row.get("confidence", ""))
         os.makedirs(os.path.dirname(os.path.abspath(args.csv)), exist_ok=True)
         with open(args.csv, "w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(
-                handle, fieldnames=["address", "name", "status", "source", "notes"]
-            )
+            writer = csv.DictWriter(handle, fieldnames=game_config.STATUS_FIELDS)
             writer.writeheader()
             writer.writerows(rows)
         print("updated %s (%d rows)" % (args.csv, len(rows)))

@@ -20,6 +20,12 @@ the same bytes".
 The tiers are never folded into one headline percentage: a project that reports
 "80% done" on the strength of untested source is lying to itself.
 
+Nor is a function the analysis guessed - found by the prologue scan or
+recovered from the gaps rather than called, pointed to or entered
+(game.confidence_label) - counted with the others: it may not be a function at
+all. Such functions are counted apart, tier by tier, and the figures above leave
+them out.
+
     python engine/tools/progress.py
     python engine/tools/progress.py --markdown > games/burnout3/docs/PROGRESS.md
 """
@@ -61,17 +67,23 @@ def load_status(path: str) -> dict:
     return out
 
 
-def summarise(database: dict, status: dict) -> dict:
-    functions = database["functions"]
-    total_functions = len(functions)
-    total_code = sum(f["size"] for f in functions)
-
+def _by_tier(functions, status: dict) -> dict:
     by_tier = {tier: {"count": 0, "bytes": 0} for tier in TIERS}
     for func in functions:
         entry = status.get(func["addr"])
         tier = entry["status"] if entry and entry["status"] in TIERS else "undecompiled"
         by_tier[tier]["count"] += 1
         by_tier[tier]["bytes"] += func["size"]
+    return by_tier
+
+
+def summarise(database: dict, status: dict) -> dict:
+    # What the analysis is sure is a function, and what it guessed: counted apart.
+    functions = [f for f in database["functions"] if game_config.confidence_label(f) == "high"]
+    guessed = [f for f in database["functions"] if game_config.confidence_label(f) != "high"]
+    total_functions = len(functions)
+    total_code = sum(f["size"] for f in functions)
+    by_tier = _by_tier(functions, status)
 
     meta = database["meta"]
     stats = database["stats"]
@@ -85,6 +97,9 @@ def summarise(database: dict, status: dict) -> dict:
         "total_functions": total_functions,
         "total_code": total_code,
         "by_tier": by_tier,
+        "guessed_functions": len(guessed),
+        "guessed_code": sum(f["size"] for f in guessed),
+        "guessed_by_tier": _by_tier(guessed, status),
         "strings": len(database.get("strings", [])),
         "xrefs": len(database.get("xrefs", [])),
         "pointer_tables": len(database.get("pointer_tables", [])),
@@ -107,7 +122,8 @@ def render_text(summary: dict, title: str) -> str:
     lines.append("proven code      : %s bytes (%.1f%%)"
                  % (format(summary["code_bytes"], ","), summary["coverage"]))
     lines.append("non-code         : %s bytes" % format(summary["data_bytes"], ","))
-    lines.append("functions found  : %s" % format(summary["total_functions"], ","))
+    lines.append("functions found  : %s, and %s guessed (counted apart, below)"
+                 % (format(summary["total_functions"], ","), format(summary["guessed_functions"], ",")))
     lines.append("")
     lines.append("%-14s %9s %7s %14s %8s" % ("tier", "functions", "share", "bytes", "share"))
     lines.append("-" * 62)
@@ -130,6 +146,13 @@ def render_text(summary: dict, title: str) -> str:
     checked = verified["bytes"] + summary["by_tier"]["lifted"]["bytes"]
     lines.append("MACHINE-CHECKED: %.4f%% of code bytes are verified or lifted"
                  % _pct(checked, summary["total_code"]))
+    if summary["guessed_functions"]:
+        lines.append("")
+        lines.append("COUNTED APART: %s functions (%s bytes) the analysis guessed - the prologue "
+                     "scan's, the gaps' - which may not be functions:"
+                     % (format(summary["guessed_functions"], ","), format(summary["guessed_code"], ",")))
+        lines.append("  " + ", ".join("%s %s" % (tier, format(summary["guessed_by_tier"][tier]["count"], ","))
+                                      for tier in TIERS))
     return "\n".join(lines)
 
 
@@ -170,7 +193,10 @@ def render_markdown(summary: dict) -> str:
     lines.append("| proven code | %s bytes (%.1f%%) |"
                  % (format(summary["code_bytes"], ","), summary["coverage"]))
     lines.append("| non-code (rodata/data/padding) | %s bytes |" % format(summary["data_bytes"], ","))
-    lines.append("| functions discovered | %s |" % format(summary["total_functions"], ","))
+    lines.append("| functions discovered | %s |"
+                 % format(summary["total_functions"] + summary["guessed_functions"], ","))
+    lines.append("| - the analysis is sure of (counted below) | %s |" % format(summary["total_functions"], ","))
+    lines.append("| - guessed (counted apart) | %s |" % format(summary["guessed_functions"], ","))
     lines.append("| - found via direct calls | %s |" % format(summary["conf_called"], ","))
     lines.append("| - found via prologue scan | %s |" % format(summary["conf_prologue"], ","))
     lines.append("| functions using VU0 macro mode | %s |" % format(summary["uses_vu"], ","))
@@ -195,6 +221,21 @@ def render_markdown(summary: dict) -> str:
             )
         )
     lines.append("")
+    if summary["guessed_functions"]:
+        lines.append("## Counted apart")
+        lines.append("")
+        lines.append("%s functions (%s code bytes) the analysis guessed - found by the prologue "
+                     "scan or recovered from the gaps, not called, pointed to or entered. They may "
+                     "not be functions at all, so none of the figures above counts them, whatever "
+                     "their tests say." % (format(summary["guessed_functions"], ","),
+                                           format(summary["guessed_code"], ",")))
+        lines.append("")
+        lines.append("| tier | functions | code bytes |")
+        lines.append("| --- | ---: | ---: |")
+        for tier in TIERS:
+            row = summary["guessed_by_tier"][tier]
+            lines.append("| `%s` | %s | %s |" % (tier, format(row["count"], ","), format(row["bytes"], ",")))
+        lines.append("")
     lines.append("Tier meanings are defined in [METHODOLOGY.md](../../../engine/docs/METHODOLOGY.md).")
     return "\n".join(lines) + "\n"
 

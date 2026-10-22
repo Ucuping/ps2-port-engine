@@ -76,6 +76,18 @@ nothing else. A second figure, "machine-checked", adds the `lifted` tier: how
 much of the program exists as C++ proven to behave like the original, readable or
 not.
 
+### Counted apart: functions the analysis guessed
+
+A tier says what is known about a function's translation, not whether the
+function is one. The analysis is sure of a function the ELF enters, a `jal`
+calls, or a pointer names and that ends in a return. A function found only by
+the prologue scan, or recovered from the gaps between others, is a guess: it
+may be data that decodes, or a piece of another function. The status table
+marks each row `high` or `low` (its `confidence` column, from the analysis).
+`progress.py` leaves the `low` ones out of every figure above and counts them
+apart, tier by tier, whatever their tests say: a translation of something that
+is not a function can still agree with the interpreter.
+
 ## Why functional reconstruction, and what it does and does not prove
 
 The original compiler is known - Metrowerks CodeWarrior MIPS 2.4.1.01, named in
