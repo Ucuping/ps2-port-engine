@@ -51,7 +51,9 @@ stub dispatch table, every test) checks that it still builds and passes.
   unchanged. `derive.py` marks a derivation `verified` only if its emitted
   C++ was compiled and run against the original - without a compiler it is
   `reconstructed` - and `lift.py` without a compiler emits its functions
-  marked NOT VERIFIED instead of stopping.
+  marked NOT VERIFIED instead of stopping. A structured form the equivalence
+  check could not build is left out of it, not the check; and a function
+  with no verification of its own keeps its plain form unless the check ran.
 
 Found and not yet changed, with the evidence in the Tekken 5 repository's
 `games/tekken5/docs/FINDINGS.md` ("Engine findings worth upstreaming"): a call
@@ -61,4 +63,6 @@ executable section is analysed; a derived function's result is modelled,
 compared and emitted as a signed 32-bit value, so one returning a double or a
 64-bit integer in `$v0` is `verified` on the low half of its result and
 emitted returning `s32`; four faults of the C++ rendering, which the compiled
-check catches and drops.
+check catches and drops; structured forms with a `goto` past an
+initialisation, which MSVC accepts and clang refuses, so those functions keep
+their plain form outside Windows.
