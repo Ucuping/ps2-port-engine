@@ -62,5 +62,8 @@ jobs:
       - name: Host tests (the GPU's skip without a Vulkan device)
         run: ./build/stub-port/ps2host/ps2host_tests.exe
 
+      - name: Platform tests (fibers and their float control, waits, guarded reads)
+        run: ./build/stub-port/ps2host/ps2platform_tests.exe
+
       - name: Toolchain tests
         run: python -m unittest discover -s engine/tests -v

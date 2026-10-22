@@ -14,6 +14,18 @@ add_library(ps2rt STATIC
 target_include_directories(ps2rt PUBLIC ${PS2_ENGINE_DIR}/runtime/include)
 target_compile_features(ps2rt PUBLIC cxx_std_17)
 
+# What the host asks of the operating system (src/platform): fibers, waits,
+# priorities, guarded reads, the crash report - apart, with tests of its own
+# that run on a platform before the rest of the host builds there.
+add_library(ps2platform STATIC
+    ${CMAKE_CURRENT_LIST_DIR}/src/platform/fiber.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/platform/system.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/platform/fault.cpp)
+target_link_libraries(ps2platform PUBLIC ps2rt)        # ps2rt/fp_mode.h: a fiber's float control
+if(WIN32)
+    target_link_libraries(ps2platform PRIVATE winmm)   # timeBeginPeriod
+endif()
+
 add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/host.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/memory.cpp
@@ -70,7 +82,7 @@ configure_file(${CMAKE_CURRENT_BINARY_DIR}/generated/iop_exports.inc.new
 target_include_directories(ps2host PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${PS2_ENGINE_DIR}/data/iop_exports.csv)
 target_include_directories(ps2host PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include)
-target_link_libraries(ps2host PUBLIC ps2rt)
+target_link_libraries(ps2host PUBLIC ps2rt ps2platform)
 
 # Texture packs (texture_pack.cpp): single headers, pinned by hash - xxHash
 # (BSD-2-Clause; PCSX2's names are XXH3 hashes), bcdec (MIT or Unlicense; DDS
@@ -207,6 +219,13 @@ target_include_directories(ps2host_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src $
 add_executable(ps2rt_tests ${PS2_ENGINE_DIR}/runtime/tests/runtime_tests.cpp
                            ${PS2_ENGINE_DIR}/runtime/tests/fp_mode_tests.cpp)
 target_link_libraries(ps2rt_tests PRIVATE ps2rt)
+
+# The platform layer's own tests: fibers (the float control kept per fiber,
+# the stack's alignment and guard), waits, sleeps, guarded reads, the crash
+# report - the same checks on Windows as elsewhere.
+add_executable(ps2platform_tests ${CMAKE_CURRENT_LIST_DIR}/tests/platform_tests.cpp)
+target_link_libraries(ps2platform_tests PRIVATE ps2platform)
+target_include_directories(ps2platform_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
 
 # ps2_add_port(<target>
 #     GENERATED <dir with dispatch.cpp from engine/tools/port.py>
