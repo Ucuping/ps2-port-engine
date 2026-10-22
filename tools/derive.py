@@ -1692,8 +1692,9 @@ def _functions_at_errors(source: str, errors: str) -> set:
 
 
 def check_compiled(verified, machine, out_dir: str, database: dict, work: str,
-                   catalog=None) -> list:
-    """Compile the emitted C++, run it on every function's cases, keep what agrees.
+                   catalog=None) -> tuple:
+    """Compile the emitted C++, run it on every function's cases, keep what agrees;
+    returns (what agrees, whether the check ran at all).
 
     The derivations were verified as expression trees; this verifies the source
     that is actually shipped. A function whose compiled form disagrees with the
@@ -1718,7 +1719,7 @@ def check_compiled(verified, machine, out_dir: str, database: dict, work: str,
         except cppcheck.CompilerUnavailable as exc:
             print("compiled check SKIPPED: %s" % exc)
             print("  the emitted source has NOT been run; only its trees were verified")
-            return verified
+            return verified, False
         except cppcheck.CompileError as exc:
             broken = _functions_at_errors(source, str(exc))
             if not broken:
@@ -1768,7 +1769,7 @@ def check_compiled(verified, machine, out_dir: str, database: dict, work: str,
         print("  could not run: func_%08X" % address)
     if len(kept) != len(verified):
         emit(kept, out_dir, database["meta"]["source"], catalog)
-    return kept
+    return kept, True
 
 
 def main(argv=None) -> int:
@@ -1854,6 +1855,9 @@ def main(argv=None) -> int:
         args.emit = game.path(game.generated)
     if args.csv == "":
         args.csv = game.path(game.status)
+    # Whether the emitted C++ was compiled and run against the original: a
+    # function is `verified` only if it was (METHODOLOGY.md).
+    compiled_checked = False
     if args.emit:
         catalog = None
         if not args.untyped:
@@ -1868,9 +1872,9 @@ def main(argv=None) -> int:
         print("  emission took %.0fs" % (time.time() - stage))
         if not args.no_compile:
             stage = time.time()
-            verified = check_compiled(verified, machine, args.emit, database,
-                                      game.path(os.path.join(game.build, "cppcheck")),
-                                      catalog)
+            verified, compiled_checked = check_compiled(
+                verified, machine, args.emit, database,
+                game.path(os.path.join(game.build, "cppcheck")), catalog)
             print("  compiled check took %.0fs" % (time.time() - stage))
     save_refusals()
     if args.csv:
@@ -1878,7 +1882,9 @@ def main(argv=None) -> int:
 
         existing = {}
         derived = {func["addr"] for func, _d, _t, _s in verified}
-        weak = {func["addr"] for func, _d, _t, strong in verified if not strong}
+        # Without the compiled check no derivation is verified, so none displaces
+        # a verified lifted copy.
+        weak = {func["addr"] for func, _d, _t, strong in verified if not (strong and compiled_checked)}
         if os.path.exists(args.csv):
             with open(args.csv, newline="", encoding="utf-8") as handle:
                 for row in csv.DictReader(handle):
@@ -1899,18 +1905,24 @@ def main(argv=None) -> int:
         for func, _derivation, tested, strong in verified:
             if func["addr"] in existing:
                 continue
+            if not strong:
+                status, notes = "reconstructed", (
+                    "symbolically derived; result ignores its arguments, so the "
+                    "differential test is near-vacuous - derived, not verified")
+            elif not compiled_checked:
+                status, notes = "reconstructed", (
+                    "symbolically derived; differential-tested over %d argument sets as an "
+                    "expression tree, but the emitted C++ was not compiled and run - not "
+                    "verified" % tested)
+            else:
+                status, notes = "verified", (
+                    "symbolically derived; differential-tested over %d argument sets" % tested)
             existing[func["addr"]] = {
                 "address": "0x%08X" % func["addr"],
                 "name": "generated::func_%08X" % func["addr"],
-                "status": "verified" if strong else "reconstructed",
+                "status": status,
                 "source": "src/generated/accessors.cpp",
-                "notes": (
-                    "symbolically derived; differential-tested over %d argument sets"
-                    % tested
-                ) if strong else (
-                    "symbolically derived; result ignores its arguments, so the "
-                    "differential test is near-vacuous - derived, not verified"
-                ),
+                "notes": notes,
             }
         rows = [existing[key] for key in sorted(existing)]
         os.makedirs(os.path.dirname(os.path.abspath(args.csv)), exist_ok=True)
