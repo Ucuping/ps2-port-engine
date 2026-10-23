@@ -148,6 +148,9 @@ void StoreRight(u32 address, u64 value, u32 size);
    Cop2 (below, inline) runs the FMAC operations itself; Cop2Slow every one,
    decoded as it runs. */
 void Cop2Slow(Context& c, u32 word);
+/* The same without macro mode's flags: for a microprogram's VU, which keeps
+   its own (ps2host::Vu) and shares only the arithmetic. */
+void Cop2SlowUnflagged(Context& c, u32 word);
 /* PS2RT_EE_ROUND_NEAREST: macro mode left rounding to nearest (vu0.cpp). */
 extern const bool kMacroNearest;
 /* COP2's FMAC operations (ADD, SUB, MUL, MADD, MSUB, MAX, MINI, with their
@@ -249,12 +252,28 @@ constexpr PS2RT_VU_INLINE FmacForm FmacFormOf(u32 word) {
     return funct < 0x3C ? Special1Form(funct) : AccumulatorFormOf((word & 3) | ((word >> 4) & 0x7C));
 }
 
+/* VU0's status flag after an FMAC operation in macro mode wrote `out` to the
+   fields `dest` names (vu0.py's status_after): Z when one is zero, S when one
+   is negative, each into its sticky copy (bits 6, 7) as well; the rest as it
+   was. MAX and MINI set no flags; their callers leave this out. */
+PS2RT_VU_INLINE void MacroStatus(Context& c, u32 dest, const u32 out[4]) {
+    u32 zero = 0, sign = 0;
+    for (int lane = 0; lane < 4; ++lane) {
+        if (!(dest & (8u >> lane))) continue;
+        zero |= (out[lane] & 0x7FFFFFFFu) == 0 ? 1u : 0u;
+        sign |= out[lane] >> 31;
+    }
+    const u32 now = zero | (sign << 1);
+    c.vc[kRegStatus] = (c.vc[kRegStatus] & ~3u) | now | (now << 6);
+}
+
 #if PS2RT_VU_SSE
 /* An FMAC as Cop2Slow runs it (RunFmac's Lanes: LanesSse<Op>, every lane
    read before any is written; dest's lanes stored), in the same rounding. */
 template <int Op>
 inline __m128i MacroLanes(__m128i a, __m128i b, __m128i acc) { return LanesSse<Op>(a, b, acc); }
 
+template <bool Flags>
 inline void MacroFmac(Context& c, u32 word, FmacForm f) {
     const u32 fd = (word >> 6) & 0x1F, fs = (word >> 11) & 0x1F, ft = (word >> 16) & 0x1F;
     const u32 dest = (word >> 21) & 0xF;
@@ -281,6 +300,9 @@ inline void MacroFmac(Context& c, u32 word, FmacForm f) {
     if (to)
         for (int lane = 0; lane < 4; ++lane)
             if (dest & (8u >> lane)) to[lane] = out[lane];
+    if constexpr (Flags) {
+        if (f.op != kMax_ && f.op != kMini) MacroStatus(c, dest, out);
+    }
     if (!kMacroNearest) _mm_setcsr(saved);
 }
 #endif
@@ -293,11 +315,23 @@ PS2RT_VU_INLINE void Cop2(Context& c, u32 word) {
 #if PS2RT_VU_SSE
     const FmacForm f = FmacFormOf(word);
     if (f.valid) {
-        MacroFmac(c, word, f);
+        MacroFmac<true>(c, word, f);
         return;
     }
 #endif
     Cop2Slow(c, word);
+}
+
+/* Cop2 without macro mode's flags, for a microprogram's VU (Cop2SlowUnflagged). */
+PS2RT_VU_INLINE void Cop2Unflagged(Context& c, u32 word) {
+#if PS2RT_VU_SSE
+    const FmacForm f = FmacFormOf(word);
+    if (f.valid) {
+        MacroFmac<false>(c, word, f);
+        return;
+    }
+#endif
+    Cop2SlowUnflagged(c, word);
 }
 
 }  // namespace lifted

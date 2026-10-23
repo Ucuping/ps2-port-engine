@@ -24,9 +24,12 @@ That follows PCSX2's interpreter rather than the hardware, which truncates
 rather than rounds in places, so a result can differ from the console's in the
 last bit. A port that needs bit-exact physics must revisit this model.
 
-The FMAC operations do not compute the MAC, status or clip flags. A program that
-reads them (`cfc2` of control registers 16-18) is refused rather than handed a
-flag that was never set, and so is `vcallms`, which runs VU0 microcode.
+Of the flags, the model keeps the clip flag - vclipw's judgements, the last
+four (clip_after) - and the status flag's Z and S, with their sticky copies,
+which the FMAC operations set but MAX and MINI (status_after). It does not keep
+the MAC flag, which `cfc2` of control register 17 is refused rather than handed
+one never set, nor the status flag's O, U, I and D, which read 0. `vcallms`,
+which runs VU0 microcode, is refused.
 """
 
 from __future__ import annotations
@@ -45,7 +48,11 @@ REG_STATUS, REG_MAC, REG_CLIP, REG_R, REG_I, REG_Q = 16, 17, 18, 20, 21, 22
 # (vcallms is refused) and transfers to VU1 complete when they start, so both are
 # always idle: it reads 0. Code that waits for VU1 polls it, so it is modelled.
 REG_VPU_STAT = 29
-UNREADABLE = {REG_STATUS, REG_MAC, REG_CLIP, 26}
+# The flag registers; of them `cfc2` reads the status and clip flags, which the
+# model keeps, and is refused the MAC flag, which it does not (nor 26).
+FLAGS = (REG_STATUS, REG_MAC, REG_CLIP)
+UNREADABLE = {REG_MAC, 26}
+STATUS_ZS, STATUS_STICKY = 0x3, 0xFC0       # Z and S; the sticky bits, which ctc2 sets
 
 
 # The operations execute() implements (mnemonics without their mask suffix).
@@ -139,6 +146,31 @@ def vu_rsqrt(num: int, den: int) -> int:
     return result(value(num) / root)
 
 
+def status_after(status: int, lanes, out) -> int:
+    """The status flag after an FMAC operation that wrote `out` to the fields
+    `lanes`: Z when one of them is zero, S when one is negative - each into its
+    sticky copy (bits 6, 7) as well - and the rest as it was."""
+    zero = any((out[lane] & 0x7FFFFFFF) == 0 for lane in lanes)
+    sign = any(out[lane] & SIGN for lane in lanes)
+    now = int(zero) | int(bool(sign)) << 1
+    return (status & ~STATUS_ZS & MASK32) | now | now << 6
+
+
+def clip_after(clip: int, fs, ft_w: int) -> int:
+    """The clip flag after vclipw of `fs`'s x, y and z against |w| of ft: the
+    history moves up six bits, and the judgements come in below it - x above
+    +|w| bit 0, below -|w| bit 1, then y's and z's; 24 bits are kept."""
+    limit = abs(value(ft_w))
+    judgement = 0
+    for lane in range(3):
+        x = value(fs[lane])
+        if x > limit:
+            judgement |= 1 << 2 * lane
+        if x < -limit:
+            judgement |= 2 << 2 * lane
+    return ((clip << 6) | judgement) & 0xFFFFFF
+
+
 def _fields(word: int):
     dest = (word >> 21) & 0xF
     return [lane for lane, bit in enumerate((8, 4, 2, 1)) if dest & bit]
@@ -216,6 +248,8 @@ def execute(m, word: int, mnemonic: str) -> None:
                 m.vacc[lane] = out[lane]
         else:
             write(fd, out)
+        if op not in ("max", "mini"):
+            vc[REG_STATUS] = status_after(vc[REG_STATUS], lanes, out)
         return
 
     if base == "vopmula":
@@ -225,6 +259,7 @@ def execute(m, word: int, mnemonic: str) -> None:
         for lane in lanes:
             if lane < 3:
                 m.vacc[lane] = out[lane]
+        vc[REG_STATUS] = status_after(vc[REG_STATUS], [lane for lane in lanes if lane < 3], out)
         return
     if base == "vopmsub":
         a, b, acc = vf[fs], vf[ft], m.vacc
@@ -234,6 +269,7 @@ def execute(m, word: int, mnemonic: str) -> None:
             for lane in lanes:
                 if lane < 3:
                     vf[fd][lane] = out[lane]
+        vc[REG_STATUS] = status_after(vc[REG_STATUS], [lane for lane in lanes if lane < 3], out)
         return
     if base == "vmove":
         write(ft, list(vf[fs]))
@@ -251,8 +287,11 @@ def execute(m, word: int, mnemonic: str) -> None:
     if base.startswith("vftoi"):
         write(ft, [vu_ftoi(x, int(base[5:])) for x in vf[fs]])
         return
-    if base in ("vnop", "vwaitq", "vclipw"):
-        return          # vclipw sets only the clip flag, which is not modelled
+    if base == "vclipw":
+        vc[REG_CLIP] = clip_after(vc[REG_CLIP], vf[fs], vf[ft][3])
+        return
+    if base in ("vnop", "vwaitq"):
+        return
     fsf, ftf = (word >> 21) & 3, (word >> 23) & 3
     if base == "vdiv":
         vc[REG_Q] = vu_div(vf[fs][fsf], vf[ft][ftf])
@@ -330,6 +369,11 @@ def move_to(m, word: int, mnemonic: str, rt_value: int, rt_high: int) -> None:
             m.vc[index] = rt_value & 0xFFFF
     elif index == REG_R:
         m.vc[REG_R] = ONE | (rt_value & 0x7FFFFF)
+    elif index == REG_STATUS:
+        # Its sticky bits are written; the rest are the last operation's.
+        m.vc[index] = (m.vc[index] & 0x3F) | (rt_value & STATUS_STICKY)
+    elif index == REG_CLIP:
+        m.vc[index] = rt_value & 0xFFFFFF
     else:
         m.vc[index] = rt_value & MASK32
 
@@ -341,7 +385,7 @@ def move_from(m, word: int, mnemonic: str):
         v = m.vf[index]
         return v[0] | (v[1] << 32), v[2] | (v[3] << 32)
     if index in UNREADABLE:
-        raise Refused("cfc2 of control register %d (flags are not modelled)" % index)
+        raise Refused("cfc2 of control register %d (not modelled)" % index)
     if index == REG_VPU_STAT:
         return 0, None
     return m.vc[index], None

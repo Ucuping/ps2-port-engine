@@ -401,7 +401,7 @@ void Vu::Upper(u32 word, int* written_reg, u32* written_lanes, bool* set_flags, 
         else flags = true;                                  // the accumulator forms
     }
     if (fmac) lifted::RunFmac(regs, *fmac);
-    else lifted::Cop2(regs, kCop2 | (word & 0x01FFFFFF));
+    else lifted::Cop2Unflagged(regs, kCop2 | (word & 0x01FFFFFF));
     if (target > 0) {
         *written_reg = target;
         *written_lanes = dest;
@@ -463,7 +463,7 @@ void Vu::Lower(u32 word, u32 pc, Pending& out, u32* branch) {
         u32 before_vc[32], before_vf[4];
         std::memcpy(before_vc, regs.vc, sizeof before_vc);
         std::memcpy(before_vf, regs.vf[it], sizeof before_vf);
-        lifted::Cop2(regs, kCop2 | (word & 0x01FFFFFF));
+        lifted::Cop2Unflagged(regs, kCop2 | (word & 0x01FFFFFF));
         if (std::memcmp(before_vf, regs.vf[it], sizeof before_vf) != 0) {
             out.vf = int(it);
             out.lanes = dest;

@@ -1,7 +1,8 @@
 /*
  * VU0 macro mode for lifted code: a line-for-line mirror of engine/ps2decomp/vu0.py,
- * which documents the arithmetic model (and where it departs from the hardware).
- * The two are tested against each other through the lifted-code check.
+ * which documents the arithmetic model (and where it departs from the hardware),
+ * the flags it keeps among it. The two are tested against each other through
+ * the lifted-code check.
  */
 
 #include "ps2rt/fp_mode.h"
@@ -198,6 +199,43 @@ void RunFmac(Context& c, const FmacOp& f) {
         if (f.dest & (8u >> lane)) to[lane] = out[lane];
 }
 
+namespace {
+
+/* An FMAC in macro mode: as RunFmac, and the status flag after it (MAX and
+   MINI set none) - from its result even when it goes into VF0, which keeps
+   0, 0, 0, 1. */
+void RunFmacMacro(Context& c, const FmacOp& f) {
+    u32 out[4] = {};
+    switch (f.op) {
+        case kAdd: Lanes<kAdd>(c, f, out); break;
+        case kSub: Lanes<kSub>(c, f, out); break;
+        case kMul: Lanes<kMul>(c, f, out); break;
+        case kMadd: Lanes<kMadd>(c, f, out); break;
+        case kMsub: Lanes<kMsub>(c, f, out); break;
+        case kMax_: Lanes<kMax_>(c, f, out); break;
+        default: Lanes<kMini>(c, f, out); break;
+    }
+    u32* to = f.to_acc ? c.vacc : f.fd ? c.vf[f.fd] : nullptr;
+    for (int lane = 0; lane < 4; ++lane)
+        if (to && (f.dest & (8u >> lane))) to[lane] = out[lane];
+    if (f.op != kMax_ && f.op != kMini) MacroStatus(c, f.dest, out);
+}
+
+/* vclipw: fs's x, y and z judged against |w| of ft (vu0.py's clip_after) - the
+   clip flag's history moves up six bits and the judgements come in below. */
+void MacroClip(Context& c, const u32 fs[4], u32 ft_w) {
+    const double limit = std::fabs(Value(ft_w));
+    u32 judgement = 0;
+    for (int lane = 0; lane < 3; ++lane) {
+        const double x = Value(fs[lane]);
+        if (x > limit) judgement |= 1u << (2 * lane);
+        if (x < -limit) judgement |= 2u << (2 * lane);
+    }
+    c.vc[kRegClip] = ((c.vc[kRegClip] << 6) | judgement) & 0xFFFFFFu;
+}
+
+}  // namespace
+
 /* The VU's float arithmetic rounds toward zero and flushes denormals: the
    host's float control set so for an instruction (ps2rt/fp_mode.h), as
    ps2host's Vu::Run sets it for a microprogram - macro mode is the same VU0,
@@ -210,7 +248,9 @@ struct MacroRounding {
     ps2rt::VuFloatMode mode{!kMacroNearest};
 };
 
-void Cop2Slow(Context& c, u32 word) {
+namespace {
+
+void Cop2Run(Context& c, u32 word, bool flags) {
     MacroRounding rounding;
     const u32 fd = (word >> 6) & 0x1F, fs = (word >> 11) & 0x1F, ft = (word >> 16) & 0x1F;
     const u32 dest = (word >> 21) & 0xF;
@@ -225,7 +265,8 @@ void Cop2Slow(Context& c, u32 word) {
     const u32 index = funct < 0x3C ? 0 : (word & 3) | ((word >> 4) & 0x7C);
     FmacOp fmac;
     if (DecodeFmac(word, &fmac)) {
-        RunFmac(c, fmac);
+        if (flags) RunFmacMacro(c, fmac);
+        else RunFmac(c, fmac);
         return;
     }
 
@@ -238,6 +279,8 @@ void Cop2Slow(Context& c, u32 word) {
         if (fd != 0)
             for (int lane = 0; lane < 3; ++lane)
                 if (lane_on[lane]) c.vf[fd][lane] = out[lane];
+        const u32 written[4] = {out[0], out[1], out[2], 0};
+        if (flags) MacroStatus(c, dest & 0xE, written);
         return;
     }
     if (funct >= 0x30 && funct <= 0x35) {                  /* integer unit */
@@ -261,6 +304,8 @@ void Cop2Slow(Context& c, u32 word) {
                                 Result(Value(a[0]) * Value(bb[1]))};
             for (int lane = 0; lane < 3; ++lane)
                 if (lane_on[lane]) c.vacc[lane] = out[lane];
+            const u32 written[4] = {out[0], out[1], out[2], 0};
+            if (flags) MacroStatus(c, dest & 0xE, written);
             return;
         }
         case 0x30: { const u32 v[4] = {a[0], a[1], a[2], a[3]}; write(ft, v); return; }
@@ -287,7 +332,10 @@ void Cop2Slow(Context& c, u32 word) {
             write(ft, v);
             return;
         }
-        case 0x2F: case 0x3B: case 0x1F:                   /* vnop, vwaitq, vclipw */
+        case 0x1F:                                         /* vclipw */
+            if (flags) MacroClip(c, a, c.vf[ft][3]);
+            return;
+        case 0x2F: case 0x3B:                              /* vnop, vwaitq */
             return;
         case 0x38: {                                       /* vdiv */
             const u32 num = c.vf[fs][fsf], den = c.vf[ft][ftf];
@@ -335,6 +383,11 @@ void Cop2Slow(Context& c, u32 word) {
     throw Abort{word, 5};
 }
 
+}  // namespace
+
+void Cop2Slow(Context& c, u32 word) { Cop2Run(c, word, true); }
+void Cop2SlowUnflagged(Context& c, u32 word) { Cop2Run(c, word, false); }
+
 void Cop2Move(Context& c, u32 word, u32 rt) {
     const u32 kind = (word >> 21) & 0x1F, index = (word >> 11) & 0x1F;
     switch (kind) {
@@ -351,6 +404,11 @@ void Cop2Move(Context& c, u32 word, u32 rt) {
                 if (index) c.vc[index] = (u32)c.r[rt] & 0xFFFF;
             } else if (index == (u32)kRegR) {
                 c.vc[kRegR] = kOne | ((u32)c.r[rt] & 0x7FFFFF);
+            } else if (index == (u32)kRegStatus) {
+                /* Its sticky bits are written; the rest are the last operation's. */
+                c.vc[kRegStatus] = (c.vc[kRegStatus] & 0x3Fu) | ((u32)c.r[rt] & 0xFC0u);
+            } else if (index == (u32)kRegClip) {
+                c.vc[kRegClip] = (u32)c.r[rt] & 0xFFFFFFu;
             } else {
                 c.vc[index] = (u32)c.r[rt];
             }

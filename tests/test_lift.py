@@ -246,6 +246,24 @@ def programs():
         cop2 | (2 << 21) | (V1 << 16) | (2 << 11),                   # cfc2 $v1, vi2
         JR_RA, cop2 | (1 << 21) | (T2 << 16) | (9 << 11),            # qmfc2 $t2, vf9
     ])
+    # VU0's flags in macro mode: the status flag's Z and S (and sticky copies)
+    # from FMAC results - into VF0 too, not from MAX - the clip flag's history
+    # from vclipw, and both read with cfc2 and written with ctc2 ($t0, $t1).
+    add("vu0_flags", [
+        r_type(0x09, A1, A0, T2, 0x0E, op=0x1C), cop2 | (5 << 21) | (T2 << 16) | (1 << 11),
+        r_type(0x09, A3, A2, T3, 0x0E, op=0x1C), cop2 | (5 << 21) | (T3 << 16) | (2 << 11),
+        s1(0x2C, 3, 1, 1), s1(0x2C, 0, 0, 1),                         # vsub: zeros; into vf0
+        s1(0x2B, 4, 1, 2),                                             # vmax
+        s2(0x1F, 1, 2, dest=0b1110), s2(0x1F, 2, 1, dest=0b1110),      # vclipw.xyz, twice
+        cop2 | (2 << 21) | (V0 << 16) | (16 << 11),                    # cfc2 $v0, vi16
+        cop2 | (2 << 21) | (V1 << 16) | (18 << 11),                    # cfc2 $v1, vi18
+        cop2 | (6 << 21) | (T0 << 16) | (16 << 11),                    # ctc2 $t0, vi16
+        cop2 | (6 << 21) | (T1 << 16) | (18 << 11),                    # ctc2 $t1, vi18
+        s1(0x2A, 5, 1, 2, dest=0b1110), s2(0x2E, 1, 2, dest=0b1110),   # vmul.xyz, vopmula
+        s2(0x1F, 3, 2, dest=0b1110), s2(0x1F, 3, 3, dest=0b1110),      # vclipw vf3: vf2; on the bound (0, |0|)
+        cop2 | (2 << 21) | (T2 << 16) | (16 << 11),                    # cfc2 $t2, vi16
+        JR_RA, cop2 | (2 << 21) | (T3 << 16) | (18 << 11),            # cfc2 $t3, vi18
+    ])
     # Its join is reached from inside a branch whose delay slot changes the
     # test's register - kept as `{ ...t...; slot; if (t)` - and from the other
     # arm of the branch around it, by a goto into that block: legal C++ only if
@@ -300,7 +318,7 @@ class TestLift(unittest.TestCase):
                 args[0] = scratch + 16 * rng.randrange(64)
             if name == "unaligned":
                 args[0] = scratch + rng.randrange(1024)
-            if name == "vu0":
+            if name in ("vu0", "vu0_flags"):
                 args[:4] = [struct.unpack("<Q", struct.pack("<2f", rng.uniform(-50, 50),
                                                             rng.uniform(-50, 50)))[0]
                             for _ in range(4)]
@@ -379,6 +397,10 @@ class TestLift(unittest.TestCase):
 
     def test_vu0_macro_mode(self):
         self.check("vu0")
+
+    def test_vu0_flags_in_macro_mode(self):
+        # The clip and status flags, set and read, against the interpreter.
+        self.check("vu0_flags")
 
     def test_a_goto_into_a_branch_with_its_test_kept(self):
         self.check("goto_into_branch")

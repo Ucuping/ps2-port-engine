@@ -44,6 +44,7 @@ inline constexpr u32 kSign = 0x80000000u;
 inline constexpr u32 kMax = 0x7F7FFFFFu;
 inline constexpr u32 kOne = 0x3F800000u;
 inline constexpr int kRegR = 20, kRegI = 21, kRegQ = 22;
+inline constexpr int kRegStatus = 16, kRegClip = 18;      /* the flags macro mode keeps (vu0.py) */
 
 PS2RT_VU_INLINE u32 Clean(u32 bits) {
     const u32 exponent = bits & 0x7F800000u;

@@ -1573,8 +1573,9 @@ def _apply_vu0(regs: dict, ins, get) -> None:
     if m in ("ctc2", "cfc2"):
         index = (word >> 11) & 0x1F
         if m == "cfc2":
-            if index in vu0.UNREADABLE:
-                raise Unsupported("cfc2 of an unmodelled VU0 flag register")
+            if index in vu0.UNREADABLE or index in vu0.FLAGS:
+                # The symbolic model keeps no flags (the interpreter does).
+                raise Unsupported("cfc2 of a VU0 flag register")
             if ins.rt:
                 regs[ins.rt] = SignExtend32(get(VC_BASE + index)) if index else Const(0)
             return

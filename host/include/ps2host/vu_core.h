@@ -252,7 +252,7 @@ struct VuCore {
         u32 before_vc[32], before_vf[4];
         std::memcpy(before_vc, v.regs.vc, sizeof before_vc);
         std::memcpy(before_vf, v.regs.vf[it], sizeof before_vf);
-        lifted::Cop2(v.regs, 0x4A000000u | (word & 0x01FFFFFF));
+        lifted::Cop2Unflagged(v.regs, 0x4A000000u | (word & 0x01FFFFFF));
         if (std::memcmp(before_vf, v.regs.vf[it], sizeof before_vf) != 0) {
             out.vf = it;
             out.lanes = dest;
@@ -625,7 +625,7 @@ struct VuCore {
     }
     /* Any other upper operation, as macro mode's COP2 runs it. */
     static void Cop2(Vu& v, u32 word) {
-        lifted::Cop2(v.regs, 0x4A000000u | (word & 0x01FFFFFF));
+        lifted::Cop2Unflagged(v.regs, 0x4A000000u | (word & 0x01FFFFFF));
     }
     /* CLIP: fs.xyz against |ft.w| - compared as Clean leaves them: the
        magnitudes of clean floats are in the order of their bits (a

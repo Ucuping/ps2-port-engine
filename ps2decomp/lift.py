@@ -368,7 +368,7 @@ def _cop2(ins) -> str:
         return "lifted::Vcallms(c, (c.vc[27] & 0xFFFFu) * 8);  /* vcallmsr */"
     if m in ("qmtc2", "ctc2", "qmfc2", "cfc2"):
         if m == "cfc2" and ((ins.raw >> 11) & 0x1F) in vu0.UNREADABLE:
-            raise Refused("cfc2 of an unmodelled VU0 flag register")
+            raise Refused("cfc2 of an unmodelled VU0 control register")
         return "lifted::Cop2Move(c, 0x%08Xu, %d);  /* %s */" % (ins.raw, ins.rt, m)
     if m.split(".")[0] not in vu0.SUPPORTED:
         raise Refused("unsupported instruction %s" % m.split(".")[0])

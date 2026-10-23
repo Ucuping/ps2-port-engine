@@ -6,7 +6,8 @@
  * A microinstruction is a pair: an upper instruction for the FMAC units and a
  * lower one for everything else, issued together. The upper encodes exactly as
  * VU0 macro mode's COP2 operations do, so it runs through the runtime's
- * lifted::Cop2 - the arithmetic verified against vu0.py - as do the lower
+ * lifted::Cop2Unflagged - the arithmetic verified against vu0.py, without macro
+ * mode's flags, which a microprogram keeps here - as do the lower
  * operations macro mode shares (MOVE, MR32, DIV, SQRT, RSQRT, MTIR, MFIR, the
  * R register, and the integer ALU). Loads, stores, branches, the flags, the
  * elementary functions and XGKICK are here.
