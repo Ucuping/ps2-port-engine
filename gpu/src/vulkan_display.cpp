@@ -566,9 +566,20 @@ bool VulkanDisplay::CreateSwapchain() {
     vkGetPhysicalDeviceSurfaceFormatsKHR(gpu_, surface_, &n, nullptr);
     std::vector<VkSurfaceFormatKHR> formats(n);
     vkGetPhysicalDeviceSurfaceFormatsKHR(gpu_, surface_, &n, formats.data());
+    // B8G8R8A8 in sRGB's colour space, which is what the picture's bytes are.
+    // A device may offer the format in other spaces too - MoltenVK in twelve,
+    // Display P3 linear last - which would show the same bytes otherwise.
     VkSurfaceFormatKHR chosen = formats.empty() ? VkSurfaceFormatKHR{} : formats[0];
-    for (const auto& f : formats)
-        if (f.format == VK_FORMAT_B8G8R8A8_UNORM) chosen = f;
+    int best = -1;
+    for (const auto& f : formats) {
+        const int score = f.format != VK_FORMAT_B8G8R8A8_UNORM                ? 0
+                          : f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR ? 2
+                                                                              : 1;
+        if (score > best) {
+            best = score;
+            chosen = f;
+        }
+    }
     format_ = chosen.format;
 
     vkGetPhysicalDeviceSurfacePresentModesKHR(gpu_, surface_, &n, nullptr);
