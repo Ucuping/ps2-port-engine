@@ -54,6 +54,13 @@ void Free(std::uint32_t address);
    server's address and its receive buffers, false if no module serves `sid`. */
 bool RpcServer(std::uint32_t sid, std::uint32_t* server, std::uint32_t* buffer,
                std::uint32_t* cbuffer);
+/* A server a module the host runs will register, named by the port (its own
+   modules' IDs). Until a module has registered it, a bind to it is answered
+   with no server, as an IOP answers one, and the EE binds again; a server no
+   port names, that no module serves, binds the EE to the host's stand-in as
+   before. */
+void AwaitServer(std::uint32_t sid);
+bool AwaitsServer(std::uint32_t sid);
 bool OwnsServer(std::uint32_t server);
 /* The EE's end of an RPC a module made (an RPC-end packet, 0x80000008): the
    client's fields filled, its thread woken. False if no module's client

@@ -1388,17 +1388,20 @@ constexpr s32 KE_UNKNOWN_MODULE = -202, KE_ILLEGAL_FLAG = -220, KE_LIBRARY_NOTFO
 
 // SearchModuleByName(name): the latest module of that name loaded, by its id.
 // A name no module recorded has - a BIOS module's (rom0:), whose image the
-// host does not have - is answered 1 and noted, as DirtySock's search was
-// before modules were recorded (iop_inet.cpp): KE_UNKNOWN_MODULE would tell
-// a module that one it needs is missing when it may be the BIOS's.
+// host does not have - is answered 1, as DirtySock's search was before
+// modules were recorded (iop_inet.cpp), and logged each time:
+// KE_UNKNOWN_MODULE would tell a module that one it needs is missing when it
+// may be the BIOS's.
 Outcome SearchModuleByName(Vm& vm, Context& c) {
     const std::string name = vm.String(A(vm, c, 0), 56);
     s32 found = 0;
     for (const auto& [id, module] : vm.modules)
         if (module.name == name && id > found) found = id;
     if (found) return Ret(c, u32(found));
-    Note("iop module search " + name, "IOP: SearchModuleByName(\"" + name +
-         "\"): no module loaded by that name is recorded; answered 1");
+    // Every time: a module that takes a module for loaded when none of that
+    // name is recorded shows in the log.
+    std::fprintf(stderr, "[iop] SearchModuleByName(\"%s\") from 0x%08X: no module loaded by that name "
+                 "is recorded; answered 1\n", name.c_str(), unsigned(c.r[31] - 8));
     return Ret(c, 1);
 }
 

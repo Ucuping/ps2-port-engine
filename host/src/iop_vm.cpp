@@ -704,6 +704,13 @@ bool RpcServer(u32 sid, u32* server, u32* buffer, u32* cbuffer) {
 
 bool OwnsServer(u32 server) { return TheVm().rpc_servers.count(server) != 0; }
 
+void AwaitServer(u32 sid) { TheVm().awaited_servers.insert(sid); }
+
+bool AwaitsServer(u32 sid) {
+    u32 server = 0, buffer = 0, cbuffer = 0;
+    return TheVm().awaited_servers.count(sid) != 0 && !RpcServer(sid, &server, &buffer, &cbuffer);
+}
+
 void RpcCall(u32 server, u32 procedure, u32 size, u32 receive, u32 receive_size,
              const std::vector<u8>& packet) {
     Vm& vm = TheVm();

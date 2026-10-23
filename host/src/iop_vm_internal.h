@@ -11,6 +11,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -186,6 +187,7 @@ struct Vm {
     std::map<u32, u32> rpc_queues;                        // queue address -> thread
     std::map<u32, std::deque<RpcRequest>> rpc_pending;    // queue address -> requests
     std::map<u32, RpcClient> rpc_clients;                 // client data -> its RPC to the EE in flight
+    std::set<u32> awaited_servers;                        // AwaitServer's: a module will register them
     u32 call_into = 0;                           // guest code a library function runs next (ExecRequest)
     std::map<u32, Pool> pools;                   // vpl and fpl ids -> their pools
     std::map<s32, ModuleRecord> modules;         // loadfile's module ids -> what each is

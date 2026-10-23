@@ -149,6 +149,14 @@ void Command(const std::vector<u8>& packet, const std::vector<u8>& data) {
                 QueueEnd(packet, kRpcBind, vm_server, buffer, cbuffer);
                 return;
             }
+            if (iop::AwaitsServer(sid)) {
+                // A module the host runs will register it, and has not yet: no
+                // server, as an IOP answers; the EE binds again.
+                Note("bind early " + Hex(sid), "SIF: IOP server " + Hex(sid) +
+                     " is not registered yet: bound to no server, for the EE to bind again");
+                QueueEnd(packet, kRpcBind, 0, 0, 0);
+                return;
+            }
             u32& server = iop.servers[sid];
             if (!server) server = kServerBase + 0x400 * u32(iop.servers.size());
             Note("bind " + Hex(sid), "SIF: bound to IOP server " + Hex(sid) +

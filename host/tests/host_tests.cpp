@@ -1730,6 +1730,42 @@ void IopCallsTheEe() {
     vm.threads.erase(id);
 }
 
+// A bind from the EE, through SIF DMA as the EE's library sends one: the
+// server its RPC end names (0: none).
+u32 BindFromTheEe(u32 sid) {
+    ps2host::Memory& m = ps2host::GuestMemory();
+    constexpr u32 kReceive = 0x00340000u, kPacket = 0x00341000u, kList = 0x00342000u, kClient = 0x00343000u;
+    auto send = [&](u32 size) {
+        m.Write(kList, kPacket, 4), m.Write(kList + 4, 0, 4), m.Write(kList + 8, size, 4), m.Write(kList + 12, 0, 4);
+        ps2host::SifDma(kList, 1);
+    };
+    for (u32 i = 0; i < 0x40; i += 4) m.Write(kPacket + i, 0, 4);
+    m.Write(kPacket, 0x20, 4), m.Write(kPacket + 8, 0x80000000u, 4), m.Write(kPacket + 16, kReceive, 4);
+    send(0x20);                                     // where the EE receives
+    m.Write(kPacket, 0x40, 4), m.Write(kPacket + 8, 0x80000009u, 4);
+    m.Write(kPacket + 16, 0, 4), m.Write(kPacket + 28, kClient, 4), m.Write(kPacket + 32, sid, 4);
+    send(0x40);                                     // the bind
+    while (ps2host::DeliverIopReply()) {}
+    return u32(m.Read(kReceive + 36, 4));
+}
+
+// A server a module the host runs will register (iop::AwaitServer): bound to
+// none until a module has registered it, as an IOP answers - the EE binds
+// again - then to the module's. A server no port names, that no module serves,
+// still binds the EE to the host's stand-in.
+void IopBindsWaitForTheirModules() {
+    using namespace ps2host::iop;
+    Vm& vm = TheVm();
+    AwaitServer(0x4E554649u);
+    Check(BindFromTheEe(0x4E554649u) == 0, "bind: before its module registers it, no server");
+    RpcServerEntry entry;
+    entry.sid = 0x4E554649u, entry.server = kIopScratch + 0x3800, entry.buffer = kIopScratch + 0x3900;
+    vm.rpc_servers[entry.server] = entry;
+    Check(BindFromTheEe(0x4E554649u) == entry.server, "bind: once registered, the module's");
+    vm.rpc_servers.erase(entry.server);
+    Check(BindFromTheEe(0x12340000u) != 0, "bind: a server no port names: the host's stand-in, as before");
+}
+
 // A module importing what the host lacks loads, and stops the run when it
 // calls that, naming it.
 void IopImportsTheHostLacksStopTheRun() {
@@ -2348,6 +2384,7 @@ int main() {
     IopModulesAreRecorded();
     IopServesRequestsOneByOne();
     IopCallsTheEe();
+    IopBindsWaitForTheirModules();
     IopImportsTheHostLacksStopTheRun();
     SpuDecodesAdpcmAndPlaysAVoice();
     SpuPlaysItsSoundDataInput();
