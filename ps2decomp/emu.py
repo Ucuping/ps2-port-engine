@@ -399,6 +399,7 @@ class Machine:
         self.vc = vu0.initial_vc()
         self.vacc = [0, 0, 0, 0]
         self.sa = 0
+        self.di = 0                       # interrupts enabled, as in a new context
         for i, value in enumerate(args):
             if i < 8:
                 self.set((4, 5, 6, 7, 8, 9, 10, 11)[i], value & MASK64)

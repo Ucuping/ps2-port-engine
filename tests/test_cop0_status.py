@@ -78,6 +78,15 @@ class TestInterpreter(Model):
         m.call(BASE, [], max_instructions=1000)
         self.assertEqual((m.get(V0), m.di), (0, 1))
 
+    def test_on_each_call_starts_enabled(self):
+        # A call that leaves interrupts disabled - the di routine, or a run cut
+        # short between di and ei - leaves nothing for the next call.
+        cpumodel.configure(cop0_status=True)
+        m = machine(DI_LOOP + READS)
+        m.call(BASE, [], max_instructions=1000)
+        m.call(BASE + 4 * len(DI_LOOP), [])
+        self.assertEqual(m.get(T0), 0x10001)
+
 
 class TestLifted(Model):
     @classmethod
@@ -87,18 +96,24 @@ class TestLifted(Model):
         except cppcheck.CompilerUnavailable as exc:
             raise unittest.SkipTest(str(exc))
 
-    def check(self, words):
+    def check(self, words, start=BASE, before=None):
+        """The function at `start` lifted and interpreted, from the state
+        verification gives each (liftverify: Machine.call, entry_context) -
+        after `before` has run on the same machine, as functions verified
+        one after another do."""
         image = struct.pack("<%dI" % len(words), *words)
         work = tempfile.mkdtemp()
         source = os.path.join(work, "lifted.cpp")
         with open(source, "w", encoding="utf-8") as handle:
-            handle.write('#include "ps2rt/lifted.h"\n\n' + lift.lift_function(image, BASE, BASE, BASE + len(image)))
+            handle.write('#include "ps2rt/lifted.h"\n\n' + lift.lift_function(image, BASE, start, BASE + len(image)))
         m = machine(words)
         lifted = liftcheck.LiftedFunctions(liftcheck.build([source], work), m)
-        m.call(BASE, [])
+        if before is not None:
+            m.call(before, [], max_instructions=1000)
+        m.call(start, [])
         expected = liftcheck.machine_state(m)
         context = liftcheck.entry_context(())
-        self.assertIsNone(lifted.run(BASE, context))
+        self.assertIsNone(lifted.run(start, context))
         self.assertEqual(liftcheck.context_state(context), expected)
         return context
 
@@ -112,6 +127,10 @@ class TestLifted(Model):
         context = self.check(READS)
         self.assertEqual((context.r[T0], context.r[T1], context.r[T2], context.di), (0x10001, 1, 0x10001, 1))
         self.check(DI_LOOP)
+
+    def test_on_verified_after_the_di_routine(self):
+        cpumodel.configure(cop0_status=True)
+        self.check(DI_LOOP + READS, start=BASE + 4 * len(DI_LOOP), before=BASE)
 
 
 class TestTheGamesChoice(Model):
