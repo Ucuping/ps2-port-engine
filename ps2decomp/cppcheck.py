@@ -113,7 +113,11 @@ EXPORT_DEFINITION = [
 # rule - no multiply-add fused into one rounding (engine/host/CMakeLists.txt) -
 # and the optimisation a Release build gives clang, -O3, as /O2 is MSVC's: the
 # optimiser gets the same chance at undefined behaviour here as in the port.
-CLANG_FLAGS = ["-std=c++17", "-O3", "-fPIC", "-ffp-contract=off", "-Wno-unknown-pragmas"]
+# Every error is reported: the callers drop each function that does not compile
+# and build again, and clang's default limit (twenty) made that one build per
+# handful of functions.
+CLANG_FLAGS = ["-std=c++17", "-O3", "-fPIC", "-ffp-contract=off", "-Wno-unknown-pragmas",
+               "-ferror-limit=0"]
 
 _CLANG_ERROR = re.compile(r"^(.*?):(\d+):\d+: (?:fatal )?error: (.*)$")
 
