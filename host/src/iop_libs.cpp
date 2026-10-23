@@ -120,9 +120,35 @@ Outcome DeleteThread(Vm& vm, Context& c) {
     return Ret(c, KE_OK);
 }
 
+/* A thread taken out of the queue of the semaphore or message box it waits
+   on (it is terminated): left there, the next SignalSema handed its release
+   to the dead thread and the waiter after it waited for ever - RenderWare
+   Audio terminates a stream's thread waiting on the stream's lock as the
+   stream stops (Burnout 3: its music stopped for good, and a screen waiting
+   on a stream with it). */
+void LeaveWaitQueue(Vm& vm, const Thread& t) {
+    if (t.ready) return;
+    if (t.wait == Wait::Sema) {
+        auto found = vm.semaphores.find(t.object);
+        if (found != vm.semaphores.end()) {
+            auto& waiting = found->second.waiting;
+            waiting.erase(std::remove(waiting.begin(), waiting.end(), t.id), waiting.end());
+        }
+    } else if (t.wait == Wait::Mbx) {
+        auto found = vm.mailboxes.find(t.object);
+        if (found != vm.mailboxes.end()) {
+            auto& waiting = found->second.waiting;
+            waiting.erase(std::remove_if(waiting.begin(), waiting.end(),
+                                         [&](const std::pair<u32, u32>& w) { return w.first == t.id; }),
+                          waiting.end());
+        }
+    }
+}
+
 Outcome TerminateThread(Vm& vm, Context& c) {
     auto found = vm.threads.find(A(vm, c, 0));
     if (found == vm.threads.end()) return Ret(c, u32(KE_UNKNOWN_THID));
+    LeaveWaitQueue(vm, found->second);
     found->second.ready = false;
     found->second.wait = Wait::Dormant;
     return Ret(c, KE_OK);
@@ -320,16 +346,19 @@ Outcome SendMbx(Vm& vm, Context& c) {
     if (found == vm.mailboxes.end()) return Ret(c, u32(KE_UNKNOWN_MBXID));
     MessageBox& box = found->second;
     const u32 message = A(vm, c, 1);
-    if (!box.waiting.empty()) {
+    // The first queued that still waits here (as SignalSema: LeaveWaitQueue).
+    bool given = false;
+    while (!given && !box.waiting.empty()) {
         const std::pair<u32, u32> waiter = box.waiting.front();
         box.waiting.pop_front();
-        Thread& t = vm.threads[waiter.first];
+        auto t = vm.threads.find(waiter.first);
+        if (t == vm.threads.end() || t->second.ready || t->second.wait != Wait::Mbx) continue;
         vm.Write(waiter.second, message, 4);
-        t.c.r[2] = KE_OK;
-        vm.MakeReady(t);
-    } else {
-        box.messages.push_back(message);
+        t->second.c.r[2] = KE_OK;
+        vm.MakeReady(t->second);
+        given = true;
     }
+    if (!given) box.messages.push_back(message);
     Return(c, KE_OK);
     return vm.reschedule && !vm.in_interrupt ? Outcome::Yield : Outcome::Return;
 }
@@ -457,14 +486,21 @@ Outcome SignalSema(Vm& vm, Context& c) {
     auto found = vm.semaphores.find(A(vm, c, 0));
     if (found == vm.semaphores.end()) return Ret(c, u32(KE_UNKNOWN_SEMID));
     Semaphore& s = found->second;
-    if (!s.waiting.empty()) {
-        Thread& t = vm.threads[s.waiting.front()];
+    // The first queued that still waits here (one no longer - terminated,
+    // deleted - is dropped, not given the count: LeaveWaitQueue).
+    bool woke = false;
+    while (!woke && !s.waiting.empty()) {
+        const u32 id = s.waiting.front();
         s.waiting.pop_front();
-        t.c.r[2] = KE_OK;
-        vm.MakeReady(t);
-    } else if (s.count < s.max || s.max <= 0) {
-        ++s.count;
+        auto waiter = vm.threads.find(id);
+        if (waiter == vm.threads.end() || waiter->second.ready || waiter->second.wait != Wait::Sema ||
+            waiter->second.object != found->first)
+            continue;
+        waiter->second.c.r[2] = KE_OK;
+        vm.MakeReady(waiter->second);
+        woke = true;
     }
+    if (!woke && (s.count < s.max || s.max <= 0)) ++s.count;
     Return(c, KE_OK);
     return vm.reschedule && !vm.in_interrupt ? Outcome::Yield : Outcome::Return;
 }
