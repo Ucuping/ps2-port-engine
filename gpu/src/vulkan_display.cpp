@@ -1946,12 +1946,32 @@ std::vector<Display::ControllerInfo> VulkanDisplay::Controllers() const {
    triggers' alone: their effects at 10 (right) and 21 (left), 11 bytes each,
    enabled by bits 2 and 3 of the first byte. An effect: its mode, then its
    parameters - 0x05 off; 0x01 resistance (start, force); 0x06 vibration
-   (frequency, amplitude, start). */
+   (frequency, amplitude, start); and by zones (the travel in ten), 0x21
+   resistance and 0x26 vibration: the zones on (a bit each, two bytes), then
+   each one's strength less 1 (3 bits each, four bytes), and for 0x26 the
+   frequency at +9. */
 void VulkanDisplay::SendTriggers(SDL_Gamepad* pad, const TriggerEffect& left, const TriggerEffect& right) {
     if (!pad || SDL_GetGamepadType(pad) != SDL_GAMEPAD_TYPE_PS5) return;
     std::uint8_t packet[47] = {};
     packet[0] = 0x04 | 0x08;
     auto put = [](std::uint8_t* at, const TriggerEffect& t) {
+        if (t.kind == TriggerEffect::kZones || t.kind == TriggerEffect::kZoneVibration) {
+            std::uint32_t on = 0, strengths = 0;
+            for (int i = 0; i < 10; ++i)
+                if (t.zones[i]) {
+                    on |= 1u << i;
+                    strengths |= std::uint32_t((std::min<int>(t.zones[i], 8) - 1) & 7) << (3 * i);
+                }
+            if (!on || (t.kind == TriggerEffect::kZoneVibration && !t.frequency)) {
+                at[0] = 0x05;
+                return;
+            }
+            at[0] = t.kind == TriggerEffect::kZones ? 0x21 : 0x26;
+            at[1] = std::uint8_t(on), at[2] = std::uint8_t(on >> 8);
+            for (int i = 0; i < 4; ++i) at[3 + i] = std::uint8_t(strengths >> (8 * i));
+            if (t.kind == TriggerEffect::kZoneVibration) at[9] = t.frequency;
+            return;
+        }
         switch (t.kind) {
             case TriggerEffect::kResistance:
                 at[0] = 0x01, at[1] = t.start, at[2] = t.force;

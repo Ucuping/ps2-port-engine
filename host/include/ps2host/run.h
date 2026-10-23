@@ -487,10 +487,15 @@ void ShowHostCursor(bool on);
 void HostRumble(u8 large, u8 small);
 /* A controller's adaptive triggers (a DualSense's), left and right: off, a
    resistance from `start` (0-255 of the travel) of `force` (0-255), or a
-   vibration from `start` of `force` at `frequency` Hz - until set again. */
+   vibration from `start` of `force` at `frequency` Hz; or by zones, the
+   travel in ten (zone 0 the first tenth of the pull): each zone's resistance
+   (kZones), or each zone's vibration at `frequency` Hz (kZoneVibration),
+   from 0 (none) to 8 - until set again. A shape: a spring that firms up, a
+   step where a stop is - what a constant resistance cannot be. */
 struct HostTriggerEffect {
-    enum Kind : u8 { kOff, kResistance, kVibration } kind = kOff;
+    enum Kind : u8 { kOff, kResistance, kVibration, kZones, kZoneVibration } kind = kOff;
     u8 start = 0, force = 0, frequency = 0;
+    u8 zones[10] = {};
 };
 void HostTriggerEffects(const HostTriggerEffect& left, const HostTriggerEffect& right);
 /* The controller left as it was found (the game ending): motors stopped,
