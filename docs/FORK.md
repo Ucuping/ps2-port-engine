@@ -105,6 +105,20 @@ stub dispatch table, every test) checks that it still builds and passes.
 - The ELF loader zeroes every segment's memory first and copies every
   segment's bytes after: a segment with no bytes in the file laid over
   another (Tekken 5's `.dmh` over its `.y4`) no longer erases it.
+- Functions the analysis guessed - found by the prologue scan or recovered
+  from the gaps, not entered, called or pointed to - are counted apart: the
+  status table gains a `confidence` column (`high`/`low`, written by derive
+  and lift), and `progress.py` leaves the `low` ones out of every figure and
+  lists them tier by tier (METHODOLOGY.md, "Counted apart").
+- A game can take its executable's FDEs as the bounds of the functions they
+  describe (game.json `"eh_frame_boundaries": true`, `ps2decomp/ehframe.py`):
+  each such function gets its FDE's extent, and a "function" starting inside
+  one - a switch's case, an entry a data word made up - is dropped unless
+  code calls it. Off by default; Tekken 5's game program turns it on.
+- The check libraries' clang build reports every compile error
+  (`-ferror-limit=0`): derive drops each function that does not compile and
+  builds again, and clang's limit of twenty made that a build per handful of
+  functions - seven builds of a 90 MB file for Tekken 5's game program.
 
 Found and not yet changed, with the evidence in the Tekken 5 repository's
 `games/tekken5/docs/FINDINGS.md` ("Engine findings worth upstreaming"): a call
