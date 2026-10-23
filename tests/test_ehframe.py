@@ -72,7 +72,8 @@ class TestApplyBounds(unittest.TestCase):
         in_code = lambda address: address < 0x800              # noqa: E731
         padding = lambda start, end: start == 0x32C             # noqa: E731
         bounds = [(0x100, 0x80), (0x200, 0x40), (0x300, 0x2C), (0x999000, 0x10)]
-        self.out, self.report = ehframe.apply_bounds(self.functions, bounds, describe, in_code, padding)
+        self.out, self.report = ehframe.apply_bounds(self.functions, bounds, describe, in_code, padding,
+                                                     lambda start, end: start)
         self.by = {f["addr"]: f for f in self.out}
 
     def test_extents_are_the_fdes(self):
@@ -94,6 +95,17 @@ class TestApplyBounds(unittest.TestCase):
         self.assertEqual(self.report["added"], [0x240])
         self.assertEqual((self.by[0x240]["end"], self.by[0x240]["confidence"]), (0x260, "recovered: past an FDE"))
         self.assertNotIn(0x32C, self.by)
+
+    def test_the_code_past_an_fde_starts_after_its_padding(self):
+        # Tekken 5's 0x002963BC: the FDE ends on a nop of alignment, and the
+        # function the analysis had run on into starts at 0x002963C0 - where a
+        # call lands.
+        functions = [function(0x500, 0x560)]
+        padding = lambda start, end: start == 0x540 and end == 0x544     # noqa: E731
+        first_code = lambda start, end: 0x544 if start == 0x540 else start  # noqa: E731
+        out, report = ehframe.apply_bounds(functions, [(0x500, 0x40)], describe, lambda a: True, padding, first_code)
+        self.assertEqual(report["added"], [0x544])
+        self.assertEqual({f["addr"] for f in out}, {0x500, 0x544})
 
     def test_bounded_functions_are_sure(self):
         self.assertEqual(game_config.confidence_label({"confidence": "prologue", "bounds": "eh_frame"}), "high")

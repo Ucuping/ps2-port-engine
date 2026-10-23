@@ -229,7 +229,11 @@ def build_database(elf_path: str, verbose: bool = True, keep=(), bounds=()) -> d
         def padding(start, end):
             return not any(data[start - section.addr:end - section.addr])
 
-        functions, bounded = ehframe.apply_bounds(functions, bounds, describe, in_code, padding)
+        def first_code(start, end):
+            return next((a for a in range(start, end, 4)
+                         if any(data[a - section.addr:a - section.addr + 4])), end)
+
+        functions, bounded = ehframe.apply_bounds(functions, bounds, describe, in_code, padding, first_code)
         log("  %d functions bounded by the executable's .eh_frame: %d given its extent, %d starts "
             "inside one dropped, %d kept (code calls them), %d added past one"
             % (sum(1 for f in functions if f.get("bounds")), len(bounded["changed"]),

@@ -87,7 +87,7 @@ def fde_ranges(data: bytes, address: int) -> list:
     return found
 
 
-def apply_bounds(functions: list, bounds, describe, in_code, padding) -> tuple:
+def apply_bounds(functions: list, bounds, describe, in_code, padding, first_code) -> tuple:
     """`functions` (the analysis's, sorted by address) with each one an FDE
     describes given the FDE's extent - its out-of-line pieces inside it - and
     marked "bounds": "eh_frame". A "function" starting strictly inside an FDE's
@@ -95,8 +95,10 @@ def apply_bounds(functions: list, bounds, describe, in_code, padding) -> tuple:
     is dropped, unless code (`in_code(address)`) outside the range calls it.
     Code past an FDE's end that the analysis had given to its function, where no
     other function starts and that is not padding (`padding(start, end)`),
-    becomes a function of its own, "recovered: past an FDE". `describe(start,
-    end, confidence)` builds a function as the analysis would.
+    becomes a function of its own, "recovered: past an FDE", starting at its
+    first word of code (`first_code(start, end)`): the alignment between two
+    functions is neither's. `describe(start, end, confidence)` builds a function
+    as the analysis would.
 
     Returns (functions, report): the report lists the functions whose extent
     changed (address, FDE length, the analysis's size), the dropped starts, the
@@ -121,8 +123,9 @@ def apply_bounds(functions: list, bounds, describe, in_code, padding) -> tuple:
             bounded["callers"] = f["callers"]
             if (f["end"] > end and not any(end <= a < f["end"] for a in by_start)
                     and not padding(end, f["end"])):
-                by_start[end] = describe(end, f["end"], "recovered: past an FDE")
-                report["added"].append(end)
+                tail = first_code(end, f["end"])
+                by_start[tail] = describe(tail, f["end"], "recovered: past an FDE")
+                report["added"].append(tail)
             f = bounded
         f["bounds"] = "eh_frame"
         by_start[start] = f
