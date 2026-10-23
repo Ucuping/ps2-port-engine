@@ -42,12 +42,16 @@ struct HighFpsRegion {
    the floats from `address`, blended one by one (only values of 1e-6 to
    1e6 either way: a pointer, a count or a flag reads as a far smaller
    float), its position at float `position` (x, y, z) and the way it looks
-   at `direction` (-1: none) - those two for its cuts. */
+   at `direction` (-1: none) - those two for its cuts. `quaternion`: the
+   way it looks is a rotation's quaternion (x, y, z, w from `direction`),
+   blended as one - q and -q are the same rotation, and blended one by one
+   across that sign the in-between passed near zero, no rotation at all. */
 struct HighFpsCamera {
     u32 address;
     int floats = 16;
     int position = 12;
     int direction = 8;
+    bool quaternion = false;
 };
 
 struct HighFpsGame {

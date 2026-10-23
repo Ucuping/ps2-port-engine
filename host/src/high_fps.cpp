@@ -221,7 +221,14 @@ void CameraTakenDown(const HighFpsCamera& camera, CameraValues& v) {
     const float d[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
     const float step = std::sqrt(Dot3(d, d));
     float turn = 0.0f;
-    if (camera.direction >= 0) {
+    if (camera.direction >= 0 && camera.quaternion) {
+        // The rotation between the two (its sign none of it: q and -q are one).
+        const float* la = v.last.data() + camera.direction;
+        const float* na = v.now.data() + camera.direction;
+        const float dot = Dot3(la, na) + la[3] * na[3];
+        const float lengths = std::sqrt((Dot3(la, la) + la[3] * la[3]) * (Dot3(na, na) + na[3] * na[3]));
+        turn = lengths > 1e-6f ? 2.0f * std::acos(std::min(1.0f, std::fabs(dot) / lengths)) * 57.29578f : 0.0f;
+    } else if (camera.direction >= 0) {
         const float* la = v.last.data() + camera.direction;
         const float* na = v.now.data() + camera.direction;
         // (only where the two are of a length: Burnout 3's +0x20 values
@@ -232,11 +239,100 @@ void CameraTakenDown(const HighFpsCamera& camera, CameraValues& v) {
     }
     const bool reversed = step > 1.0f && Dot3(d, v.way) < 0.0f;
     const bool jumped = step > 1.0f && step > 3.0f * v.step;
-    v.flipped = turn > 170.0f && !jumped && !reversed;
+    v.flipped = !camera.quaternion && turn > 170.0f && !jumped && !reversed;
     v.cut = jumped || reversed || (turn > 60.0f && turn > 2.0f * v.turn && !v.flipped);
     std::memcpy(v.way, d, sizeof v.way);
     v.step = step;
     if (!v.flipped) v.turn = turn;
+}
+
+/* PS2HOST_HIGH_FPS_BLENDS=<file>: each step, the transforms whose step
+   stands out - a blend between the two would show it (CSV): `jump` moved
+   over 4 times its step before and over a unit, `turn` turned over 30
+   degrees, `flip` changed handedness, `far` moved over 10 units (blended
+   unless over the game's cut). With the step's frame, the transform's
+   place and its step before. */
+std::FILE* BlendsFile() {
+    static std::FILE* f = [] {
+        const char* path = std::getenv("PS2HOST_HIGH_FPS_BLENDS");
+        std::FILE* out = path ? std::fopen(path, "w") : nullptr;
+        if (out) std::fprintf(out, "ms,frame,step,address,why,moved,before,turn,x,y,z,cut\n");
+        return out;
+    }();
+    return f;
+}
+
+float Determinant(const float* m) {
+    return m[0] * (m[5] * m[10] - m[6] * m[9]) - m[1] * (m[4] * m[10] - m[6] * m[8]) +
+           m[2] * (m[4] * m[9] - m[5] * m[8]);
+}
+
+/* Each transform's last step and the one before: how far it moved and how
+   far it turned (degrees). */
+struct Stepped {
+    float moved = 0.0f, turn = 0.0f;
+};
+std::unordered_map<u32, Stepped> g_stepped, g_stepped_before;
+
+void Measure() {
+    g_stepped_before.swap(g_stepped);
+    g_stepped.clear();
+    for (const auto& [address, now] : g_now) {
+        const auto last = g_last.find(address);
+        if (last == g_last.end()) continue;
+        const float* a = last->second.m;
+        const float* b = now.m;
+        const float d[3] = {b[12] - a[12], b[13] - a[13], b[14] - a[14]};
+        const float trace = Dot3(a, b) + Dot3(a + 4, b + 4) + Dot3(a + 8, b + 8);
+        g_stepped[address] = {std::sqrt(Dot3(d, d)),
+                              std::acos(std::min(1.0f, std::max(-1.0f, (trace - 1.0f) / 2.0f))) * 57.29578f};
+    }
+}
+
+/* A transform put somewhere else in a step, not moved there: over 2 units
+   and 4 times its step before, or over 60 degrees turned when it was all
+   but still - a wrecked car back on the road a few metres on (under the
+   game's cut), turned round. Blended, it slid there through the scene; it
+   is shown as the step left it. */
+bool Teleported(u32 address) {
+    const auto now = g_stepped.find(address);
+    const auto before = g_stepped_before.find(address);
+    if (now == g_stepped.end() || before == g_stepped_before.end()) return false;
+    const Stepped& n = now->second;
+    const Stepped& b = before->second;
+    return (n.moved > 2.0f && n.moved > 4.0f * b.moved) || (n.turn > 60.0f && n.turn > 4.0f * b.turn + 10.0f);
+}
+
+void LogBlends() {
+    std::FILE* f = BlendsFile();
+    if (!f) return;
+    static std::unordered_map<u32, float> before;           // each transform's step before
+    static const auto start = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    std::unordered_map<u32, float> moved_now;
+    for (const auto& [address, now] : g_now) {
+        const auto last = g_last.find(address);
+        if (last == g_last.end()) continue;
+        const float* a = last->second.m;
+        const float* b = now.m;
+        const float d[3] = {b[12] - a[12], b[13] - a[13], b[14] - a[14]};
+        const float moved = std::sqrt(Dot3(d, d));
+        const float trace = Dot3(a, b) + Dot3(a + 4, b + 4) + Dot3(a + 8, b + 8);
+        const float turn = std::acos(std::min(1.0f, std::max(-1.0f, (trace - 1.0f) / 2.0f))) * 57.29578f;
+        const bool flip = (Determinant(a) < 0.0f) != (Determinant(b) < 0.0f);
+        const auto was = before.find(address);
+        const float prior = was != before.end() ? was->second : -1.0f;
+        moved_now.emplace(address, moved);
+        const char* why = flip ? "flip"
+                          : (prior >= 0.0f && moved > 1.0f && moved > 4.0f * prior) ? "jump"
+                          : moved > 10.0f ? "far"
+                          : turn > 30.0f ? "turn"
+                                         : nullptr;
+        if (!why) continue;
+        std::fprintf(f, "%.1f,%llu,%u,%08X,%s,%.3f,%.3f,%.1f,%.2f,%.2f,%.2f,%d\n", ms, g_frames, g_steps,
+                     unsigned(address), why, moved, prior, turn, b[12], b[13], b[14], moved > g_game.cut ? 1 : 0);
+    }
+    before.swap(moved_now);
 }
 
 /* The transforms and the cameras' values as the step left them. */
@@ -329,7 +425,7 @@ void Place(u32 address, const Matrix& last, const Matrix& now, float t) {
     const float moved = std::sqrt(Dot3(d, d));
     bool turned = false;
     for (int k = 0; k < 12 && !turned; ++k) turned = now.m[k] != last.m[k];
-    if ((moved == 0.0f && !turned) || moved > g_game.cut) return;
+    if ((moved == 0.0f && !turned) || moved > g_game.cut || Teleported(address)) return;
     u8* p = generated::RamPointer(address, 64);
     if (!p) return;
     Placed placed{address, {}, {}};
@@ -357,16 +453,42 @@ void PlaceBetween(float t) {
         if (!camera || v.cut) continue;
         std::memcpy(v.was.data(), camera, count * sizeof(float));
         std::memcpy(v.placed.data(), camera, count * sizeof(float));
-        const int way = v.flipped ? g_game.cameras[k].direction : -1;
+        const HighFpsCamera& c = g_game.cameras[k];
+        const int way = v.flipped ? c.direction : -1;
+        const int q = c.quaternion ? c.direction : -1;
         for (size_t i = 0; i < count; ++i) {
             const float a = v.last[i], b = v.now[i];
+            if (q >= 0 && int(i) >= q && int(i) < q + 4) continue;           // (the quaternion: below)
             if (a == b || !AValue(a) || !AValue(b) || !(std::fabs(b - a) < g_game.cut)) continue;
             if (way >= 0 && int(i) >= way && int(i) < way + 3) continue;    // (turned round: the step's)
             v.placed[i] = a + t * (b - a);
         }
+        if (q >= 0) {
+            // The rotation between, as one: the step before's turned to the
+            // same side as the last's (q and -q are one rotation), blended,
+            // its length 1 again - at t 1 the last's as it is.
+            const float* a = v.last.data() + q;
+            const float* b = v.now.data() + q;
+            const float side = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3] < 0.0f ? -1.0f : 1.0f;
+            float r[4], length = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                r[i] = side * a[i] + t * (b[i] - side * a[i]);
+                length += r[i] * r[i];
+            }
+            const float lb = b[0] * b[0] + b[1] * b[1] + b[2] * b[2] + b[3] * b[3];
+            if (length > 1e-12f && lb > 1e-12f) {
+                const float scale = std::sqrt(lb / length);     // (the last's length, as the game had it)
+                for (int i = 0; i < 4; ++i) v.placed[size_t(q + i)] = r[i] * scale;
+            }
+        }
         std::memcpy(camera, v.placed.data(), count * sizeof(float));
         v.placing = true;
     }
+    // A camera cut in this step (shown as the step left it): the transforms
+    // too - blended, a car lagged the camera's new place by up to its step
+    // for the step's pictures, then caught up (a twitch at every cut).
+    for (const CameraValues& v : g_cameras)
+        if (v.cut) return;
     for (const auto& [address, now] : g_now) {
         const auto last = g_last.find(address);
         if (last != g_last.end()) Place(address, last->second, now, t);
@@ -516,6 +638,8 @@ void Reset() {
     g_last.clear();
     g_now.clear();
     g_known.clear();
+    g_stepped.clear();
+    g_stepped_before.clear();
     g_time = 1.0;
     g_behind = 0.0;
     g_counted = false;
@@ -559,7 +683,11 @@ bool HighFpsFrameSteps(u32 steps_so_far, unsigned blanks) {
 }
 
 void HighFpsStepped() {
-    if (g_rate > 0.0) TakeDown();
+    if (g_rate > 0.0) {
+        TakeDown();
+        Measure();
+        LogBlends();
+    }
 }
 
 /* Rising (g_target): an eighth of the way from the game's own rate at a
