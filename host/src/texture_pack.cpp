@@ -275,6 +275,170 @@ std::shared_ptr<Image> Rgba(std::vector<std::vector<u32>> levels, u32 width, u32
 
 u32 Le32(const u8* p) { return u32(p[0]) | u32(p[1]) << 8 | u32(p[2]) << 16 | u32(p[3]) << 24; }
 
+// ------------------------------------------------------------------ BC encoding
+
+/* The mipmap levels a block-compressed file lacks, made here: its smallest
+   level decoded, halved, and each half encoded again as the file's format
+   (BC1, BC2, BC3; BC7 keeps the levels it has). A simple encoder - the box
+   around the block's colours, inset, each texel the nearest of the four -
+   for levels seen small and far off. Without them a pack's texture far away
+   shimmers, and trilinear or anisotropic filtering has no levels to use. */
+u32 To565(int r, int g, int b) {
+    return u32((std::clamp(r, 0, 255) * 31 + 127) / 255) << 11 | u32((std::clamp(g, 0, 255) * 63 + 127) / 255) << 5 |
+           u32((std::clamp(b, 0, 255) * 31 + 127) / 255);
+}
+void From565(u32 c, int* rgb) {
+    rgb[0] = int((c >> 11) & 31) * 255 / 31;
+    rgb[1] = int((c >> 5) & 63) * 255 / 63;
+    rgb[2] = int(c & 31) * 255 / 31;
+}
+
+/* A 4x4 tile's colours (RGBA, R in the low byte) as a BC1 colour block.
+   `punch`: BC1 with texels of alpha under 128 - the three-colour mode, their
+   index 3 (transparent). */
+void EncodeColour(const u32* tile, u8* out, bool punch) {
+    int lo[3] = {255, 255, 255}, hi[3] = {0, 0, 0};
+    bool any = false;
+    for (int i = 0; i < 16; ++i) {
+        if (punch && (tile[i] >> 24) < 128) continue;
+        any = true;
+        for (int k = 0; k < 3; ++k) {
+            const int v = int((tile[i] >> (8 * k)) & 255);
+            lo[k] = std::min(lo[k], v);
+            hi[k] = std::max(hi[k], v);
+        }
+    }
+    if (!any) lo[0] = lo[1] = lo[2] = hi[0] = hi[1] = hi[2] = 0;
+    for (int k = 0; k < 3; ++k) {               // inset by a sixteenth of the range
+        const int inset = (hi[k] - lo[k]) / 16;
+        lo[k] += inset;
+        hi[k] -= inset;
+    }
+    u32 c0 = To565(hi[0], hi[1], hi[2]), c1 = To565(lo[0], lo[1], lo[2]);
+    // Four colours: c0 > c1; three and transparent: c0 <= c1.
+    if (punch ? c0 > c1 : c0 < c1) std::swap(c0, c1);
+    int p[4][3];
+    From565(c0, p[0]);
+    From565(c1, p[1]);
+    const bool four = c0 > c1;
+    for (int k = 0; k < 3; ++k) {
+        if (four) {
+            p[2][k] = (2 * p[0][k] + p[1][k]) / 3;
+            p[3][k] = (p[0][k] + 2 * p[1][k]) / 3;
+        } else {
+            p[2][k] = (p[0][k] + p[1][k]) / 2;
+            p[3][k] = 0;
+        }
+    }
+    u32 indices = 0;
+    if (four) {
+        // Each texel's place along the line from c1 to c0, to the nearest
+        // of its four colours (1, 3, 2, 0 in that order).
+        const int axis[3] = {p[0][0] - p[1][0], p[0][1] - p[1][1], p[0][2] - p[1][2]};
+        const int length = axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2];
+        static const u32 kOrder[4] = {1, 3, 2, 0};
+        for (int i = 0; i < 16; ++i) {
+            int along = 0;
+            for (int k = 0; k < 3; ++k) along += (int((tile[i] >> (8 * k)) & 255) - p[1][k]) * axis[k];
+            const int q = length ? std::clamp((along * 6 + length) / (2 * length), 0, 3) : 0;
+            indices |= kOrder[q] << (2 * i);
+        }
+    }
+    for (int i = 0; i < 16 && !four; ++i) {
+        u32 best = 0;
+        if (punch && (tile[i] >> 24) < 128) {
+            best = 3;
+        } else {
+            int best_d = 1 << 30;
+            for (u32 j = 0; j < (four ? 4u : 3u); ++j) {
+                int d = 0;
+                for (int k = 0; k < 3; ++k) {
+                    const int e = int((tile[i] >> (8 * k)) & 255) - p[j][k];
+                    d += e * e;
+                }
+                if (d < best_d) best_d = d, best = j;
+            }
+        }
+        indices |= best << (2 * i);
+    }
+    out[0] = u8(c0);
+    out[1] = u8(c0 >> 8);
+    out[2] = u8(c1);
+    out[3] = u8(c1 >> 8);
+    for (int k = 0; k < 4; ++k) out[4 + k] = u8(indices >> (8 * k));
+}
+
+/* A tile's alphas as BC3's alpha block: its largest and smallest, the eight
+   values between, each texel the nearest. */
+void EncodeAlpha(const u32* tile, u8* out) {
+    int a0 = 0, a1 = 255;
+    for (int i = 0; i < 16; ++i) {
+        const int a = int(tile[i] >> 24);
+        a0 = std::max(a0, a);
+        a1 = std::min(a1, a);
+    }
+    // Each texel's place between a1 (0) and a0 (7), to the nearest of the
+    // eight: 7 is index 0, 0 index 1, those between 8 - q.
+    u64 indices = 0;
+    const int range = a0 - a1;
+    for (int i = 0; i < 16 && range > 0; ++i) {
+        const int q = ((int(tile[i] >> 24) - a1) * 14 + range) / (2 * range);
+        indices |= u64(q == 7 ? 0 : q == 0 ? 1 : 8 - q) << (3 * i);
+    }
+    out[0] = u8(a0);
+    out[1] = u8(a1);
+    for (int k = 0; k < 6; ++k) out[2 + k] = u8(indices >> (8 * k));
+}
+
+/* An RGBA level as BC1, BC2 or BC3 blocks, appended to `out`. */
+void EncodeLevel(const std::vector<u32>& level, u32 w, u32 h, int bc, std::vector<u8>* out) {
+    const u32 bx = (w + 3) / 4, by = (h + 3) / 4;
+    const std::size_t block = bc == kBc1 ? 8 : 16;
+    const std::size_t at = out->size();
+    out->resize(at + std::size_t(bx) * by * block);
+    u32 tile[16];
+    bool punch = false;
+    if (bc == kBc1)
+        for (u32 c : level) punch |= (c >> 24) < 128;
+    for (u32 y = 0; y < by; ++y)
+        for (u32 x = 0; x < bx; ++x) {
+            for (u32 j = 0; j < 4; ++j)
+                for (u32 i = 0; i < 4; ++i)
+                    tile[j * 4 + i] = level[std::size_t(std::min(h - 1, y * 4 + j)) * w + std::min(w - 1, x * 4 + i)];
+            u8* b = out->data() + at + (std::size_t(y) * bx + x) * block;
+            if (bc == kBc1) {
+                EncodeColour(tile, b, punch);
+            } else {
+                if (bc == kBc2) {
+                    for (int i = 0; i < 16; i += 2)
+                        b[i / 2] = u8((tile[i] >> 28) | ((tile[i + 1] >> 28) << 4));
+                } else {
+                    EncodeAlpha(tile, b);
+                }
+                EncodeColour(tile, b + 8, false);
+            }
+        }
+}
+
+/* A level of a block-compressed file, decoded to RGBA. */
+std::vector<u32> DecodeLevel(const u8* data, u32 w, u32 h, int bc) {
+    std::vector<u32> level(std::size_t(w) * h);
+    const u32 bx = (w + 3) / 4, by = (h + 3) / 4;
+    const std::size_t block = bc == kBc1 ? 8 : 16;
+    u32 tile[16];
+    for (u32 y = 0; y < by; ++y)
+        for (u32 x = 0; x < bx; ++x) {
+            const u8* src = data + (std::size_t(y) * bx + x) * block;
+            if (bc == kBc1) bcdec_bc1(src, tile, 16);
+            else if (bc == kBc2) bcdec_bc2(src, tile, 16);
+            else if (bc == kBc3) bcdec_bc3(src, tile, 16);
+            else bcdec_bc7(src, tile, 16);
+            for (u32 j = 0; j < 4 && y * 4 + j < h; ++j)
+                for (u32 i = 0; i < 4 && x * 4 + i < w; ++i) level[std::size_t(y * 4 + j) * w + x * 4 + i] = tile[j * 4 + i];
+        }
+    return level;
+}
+
 std::shared_ptr<Image> LoadDds(const std::vector<u8>& file) {
     if (file.size() < 128 || std::memcmp(file.data(), "DDS ", 4) != 0) return nullptr;
     const u8* h = file.data() + 4;
@@ -331,6 +495,26 @@ std::shared_ptr<Image> LoadDds(const std::vector<u8>& file) {
         image->levels = u32(spans.size());
         image->data.assign(file.begin() + std::ptrdiff_t(spans.front().first),
                            file.begin() + std::ptrdiff_t(spans.back().first + spans.back().second));
+        // The levels it lacks (8 in all, as the renderer takes), made from
+        // its smallest (EncodeLevel).
+        constexpr u32 kMaxLevels = 8;
+        if (bc != kBc7 && spans.size() < kMaxLevels) {
+            u32 lw = width, lh = height;
+            for (std::size_t n = 1; n < spans.size(); ++n) lw = std::max(1u, lw / 2), lh = std::max(1u, lh / 2);
+            if (lw > 1 || lh > 1) {
+                std::vector<u32> level = DecodeLevel(file.data() + spans.back().first, lw, lh, bc);
+                while (image->levels < kMaxLevels && (lw > 1 || lh > 1)) {
+                    std::vector<u32> next;
+                    u32 nw, nh;
+                    Halve(level, lw, lh, &next, &nw, &nh);
+                    EncodeLevel(next, nw, nh, bc, &image->data);
+                    ++image->levels;
+                    level = std::move(next);
+                    lw = nw;
+                    lh = nh;
+                }
+            }
+        }
         return image;
     }
     std::vector<std::vector<u32>> levels;
@@ -422,7 +606,10 @@ struct Pack {
     std::size_t kept_bytes = 0;
     std::unordered_set<Name, NameHash> failed, queued;
     std::deque<Name> queue;
-    std::thread reader;
+    // The readers: a file's mipmap levels made as it is read (EncodeLevel,
+    // ~1-3 ms a file) - a few at a time, so that a view's new textures come
+    // in as quickly as they did read whole.
+    std::vector<std::thread> readers;
     bool stop = false;
 
     ~Pack() {
@@ -431,7 +618,8 @@ struct Pack {
             stop = true;
         }
         wake.notify_all();
-        if (reader.joinable()) reader.join();
+        for (std::thread& reader : readers)
+            if (reader.joinable()) reader.join();
     }
 
     void Read() {
@@ -512,7 +700,11 @@ std::size_t Open(const std::string& directory) {
             }
         }
         count = pack.files.size();
-        if (count && !pack.reader.joinable()) pack.reader = std::thread([&pack] { pack.Read(); });
+        if (count && pack.readers.empty()) {
+            const unsigned cores = std::thread::hardware_concurrency();
+            const unsigned n = cores >= 8 ? 3 : cores >= 4 ? 2 : 1;
+            for (unsigned i = 0; i < n; ++i) pack.readers.emplace_back([&pack] { pack.Read(); });
+        }
     }
     g_count = count;
     ++g_generation;

@@ -137,7 +137,9 @@ struct GsDrawState {
        scaled by a Fresnel term from the texel's place in the map (gs.frag);
        bit 1 mipmapped textures filtered as a modern GPU does (SampleModern,
        up to 1 << bits 8-10 taps along the footprint: 1 trilinear); bit 2 a
-       soft particle, faded near the scene's depth (kSceneDepth). */
+       soft particle, faded near the scene's depth (kSceneDepth); bits 11-12
+       the player's filter forced (1 nearest, 2 bilinear, 3 trilinear or
+       anisotropic), which a texture pack's replacement follows too. */
     std::uint32_t tag = 0;
 };
 

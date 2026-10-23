@@ -59,7 +59,8 @@ layout(push_constant) uniform Params {
                         // 16: a 16-bit target (five bits a channel stored); 17-18: its blend made
                         // by the blender (gs_renderer.cpp's Blender16): 1 S written, 2 added, 3 taken away;
                         // 19 the paint's Fresnel term; 20 modern filtering, 22-24 log2 of its most taps;
-                        // 21 a soft particle
+                        // 21 a soft particle; 25-26 the player's filter (1 nearest, 2 bilinear,
+                        // 3 trilinear or anisotropic: a replacement's too)
 } p;
 
 // What a draw may use, from its parameters (gs_renderer.cpp's Features): a
@@ -256,16 +257,44 @@ vec4 ReplacedLevel(vec2 r, int n, bool linear) {
     return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
 }
 
-// `r`: where in level 0's texels; `footprint`: its derivatives' larger length.
-vec4 ReplacedSample(vec2 r, float footprint) {
+// `r`: where in level 0's texels; `dx`, `dy`: its change a pixel. As the
+// game filters - or as the player chose (blend_ops 25-26): nearest, the
+// nearest level's nearest texel; bilinear, the nearest level; trilinear, two
+// levels mixed; anisotropic, up to 1 << blend_ops 22-24 taps along the
+// footprint's long axis, as SampleModern takes them.
+vec4 ReplacedSample(vec2 r, vec2 dx, vec2 dy) {
     const uint m = p.bilinear;
-    const bool linear = (m & 2u) == 0u ? (m & 1u) != 0u : ((m >> 8) & 1u) != 0u || ((m >> 5) & 7u) >= 4u;
     const int last = int((p.tex_format >> 9) & 7u);
-    const float lod = clamp(log2(max(footprint, 1e-6)), 0.0, float(last));
+    const uint forced = (p.blend_ops >> 25) & 3u;
+    const float lx = length(dx), ly = length(dy);
+    if (forced == 0u) {
+        const bool linear = (m & 2u) == 0u ? (m & 1u) != 0u : ((m >> 8) & 1u) != 0u || ((m >> 5) & 7u) >= 4u;
+        const float lod = clamp(log2(max(max(lx, ly), 1e-6)), 0.0, float(last));
+        const int n = int(floor(lod));
+        const vec4 c0 = ReplacedLevel(r, n, linear);
+        if (!linear || n >= last || lod == float(n)) return floor(c0 + 0.5);
+        return floor(mix(c0, ReplacedLevel(r, n + 1, linear), lod - float(n)) + 0.5);
+    }
+    const float major = max(lx, ly), minor = max(min(lx, ly), 1e-6);
+    const float most = forced == 3u ? float(1u << ((p.blend_ops >> 22) & 7u)) : 1.0;
+    const float taps = clamp(ceil(major / minor), 1.0, most);
+    const float bias = most > 1.0 ? 1.0 : 0.0;
+    const float lod = clamp(log2(max(major / taps, 1e-6)) - bias, 0.0, float(last));
+    if (forced < 3u) {
+        const int n = int(min(floor(lod + 0.5), float(last)));
+        return floor(ReplacedLevel(r, n, forced == 2u) + 0.5);
+    }
     const int n = int(floor(lod));
-    const vec4 c0 = ReplacedLevel(r, n, linear);
-    if (!linear || n >= last || lod == float(n)) return floor(c0 + 0.5);
-    return floor(mix(c0, ReplacedLevel(r, n + 1, linear), lod - float(n)) + 0.5);
+    const float f = lod - float(n);
+    const vec2 axis = lx > ly ? dx : dy;
+    vec4 sum = vec4(0.0);
+    for (int i = 0; i < int(taps); ++i) {
+        const vec2 at = r + axis * ((float(i) + 0.5) / taps - 0.5);
+        vec4 c = ReplacedLevel(at, n, true);
+        if (n < last && f > 0.0) c = mix(c, ReplacedLevel(at, n + 1, true), f);
+        sum += c;
+    }
+    return floor(sum / taps + 0.5);
 }
 
 // TEX1's mipmapping (GsDrawState::mip, in p.bilinear): the GS's LOD from the
@@ -356,7 +385,7 @@ void main() {
             const vec2 k = vec2(ReplacedSize(0)) / vec2(TextureSize());
             const vec2 r = coordinate.xy / coordinate.z * vec2(TextureSize()) * k;
             const vec2 dx = dFdx(r), dy = dFdy(r);
-            t = ReplacedSample(uv * k, sqrt(max(dot(dx, dx), dot(dy, dy))));
+            t = ReplacedSample(uv * k, dx, dy);
         } else if (Has(kMip) && ((p.blend_ops >> 20) & 1u) != 0u && (p.bilinear & 2u) != 0u) {
             const vec2 r = coordinate.xy / coordinate.z * vec2(TextureSize());
             t = SampleModern(uv, dFdx(r), dFdy(r), int((p.bilinear >> 2) & 7u),

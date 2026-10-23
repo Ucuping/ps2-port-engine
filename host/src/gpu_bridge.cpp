@@ -1971,15 +1971,19 @@ void OnDraw(const gs::Gs::DrawCall& call) {
         if (filter && type != 6 && !state.texture_target) {
             u32 m = state.mip;
             constexpr u32 kMmin = 7u << 5, kMmag = 1u << 8;
-            state.tag &= ~(2u | 7u << 8);
+            state.tag &= ~(2u | 7u << 8 | 3u << 11);
+            // (bits 11-12 the filter, 1 nearest, 2 bilinear, 3 trilinear or
+            // anisotropic - for a texture pack's replacement, which has
+            // levels of its own whether or not the game's texture has)
+            state.tag |= u32(std::min(filter, 3)) << 11;
             if (filter == 1) {                  // nearest: the nearest level's nearest texel
                 state.bilinear = false;
                 if (m) m = (m & ~(kMmin | kMmag)) | 2u << 5;
             } else {                            // bilinear in a level; trilinear and anisotropic as modern
                 state.bilinear = true;
                 if (m) m = (m & ~kMmin) | kMmag | (filter == 2 ? 4u : 5u) << 5;
-                if (m && filter >= 3)
-                    state.tag |= 2u | u32(g_texture_taps.load(std::memory_order_relaxed)) << 8;
+                if (filter >= 3) state.tag |= u32(g_texture_taps.load(std::memory_order_relaxed)) << 8;
+                if (m && filter >= 3) state.tag |= 2u;
             }
             state.mip = m;
         }

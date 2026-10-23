@@ -3163,8 +3163,9 @@ void VulkanGsRenderer::Flush() {
     if (state_.textured && t->scale > 1) params.blend_ops |= (t->scale & 0xFFu) << 8;
     if (Is16Bit(state_.psm)) params.blend_ops |= 1u << 16;    // gs.frag: colour cut to five bits a channel
     if (state_.tag & 1u) params.blend_ops |= 1u << 19;          // gs.frag: the paint's Fresnel term
-    if (state_.tag & 2u)                                        // gs.frag: modern texture filtering, its taps
-        params.blend_ops |= 1u << 20 | ((state_.tag >> 8) & 7u) << 22;
+    if (state_.tag & 2u) params.blend_ops |= 1u << 20;          // gs.frag: modern texture filtering
+    params.blend_ops |= ((state_.tag >> 8) & 7u) << 22 |       // ...its taps, and the player's filter
+                        ((state_.tag >> 11) & 3u) << 25;
     if ((state_.tag & 4u) && !ShaderBlend(state_) && SceneDepthSet())
         params.blend_ops |= 1u << 21;                           // gs.frag: a soft particle
     params.blend_ops |= std::uint32_t(Blender16(state_)) << 17;     // gs.frag: S for the blender
