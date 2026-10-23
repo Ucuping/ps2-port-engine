@@ -4,9 +4,13 @@
 #define PS2GPU_GPU_INTERNAL_H
 
 #include <volk.h>
+// The portability subset's types, which vulkan.h brings only with all the
+// provisional extensions (VK_ENABLE_BETA_EXTENSIONS); this header alone.
+#include <vulkan/vulkan_beta.h>
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <mutex>
 #include <unordered_map>
@@ -17,6 +21,63 @@
 #include "ps2gpu/gs_renderer.h"
 
 namespace ps2gpu {
+
+/* Portability drivers - MoltenVK on macOS - are listed only to an instance
+   that asks for them (VK_KHR_portability_enumeration and its flag), and a
+   device that offers VK_KHR_portability_subset must have it enabled, with
+   the subset's features the device has. All of it only where it is
+   offered, so nothing changes where it is not. */
+inline constexpr const char* kPortabilitySubset = VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME;
+/* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR, whose
+   name vulkan_core.h has only among the provisional values. */
+inline constexpr VkStructureType kPortabilitySubsetFeatures = VkStructureType(1000163000);
+
+inline bool InstanceOffers(const char* name) {
+    std::uint32_t count = 0;
+    if (vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr) != VK_SUCCESS) return false;
+    std::vector<VkExtensionProperties> list(count);
+    if (vkEnumerateInstanceExtensionProperties(nullptr, &count, list.data()) != VK_SUCCESS) return false;
+    for (const VkExtensionProperties& e : list)
+        if (std::strcmp(e.extensionName, name) == 0) return true;
+    return false;
+}
+
+inline bool DeviceOffers(VkPhysicalDevice gpu, const char* name) {
+    std::uint32_t count = 0;
+    if (vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, nullptr) != VK_SUCCESS) return false;
+    std::vector<VkExtensionProperties> list(count);
+    if (vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, list.data()) != VK_SUCCESS) return false;
+    for (const VkExtensionProperties& e : list)
+        if (std::strcmp(e.extensionName, name) == 0) return true;
+    return false;
+}
+
+/* The subset's features the device has, to enable all of them: the RGBA8
+   targets read as 32-bit words need imageViewFormatReinterpretation
+   (gs_renderer.cpp, MakeImage). */
+inline VkPhysicalDevicePortabilitySubsetFeaturesKHR PortabilityFeatures(VkPhysicalDevice gpu) {
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR subset{kPortabilitySubsetFeatures};
+    VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    query.pNext = &subset;
+    vkGetPhysicalDeviceFeatures2(gpu, &query);
+    subset.pNext = nullptr;
+    return subset;
+}
+
+/* Vulkan 1.3's features the renderer needs: dynamic rendering,
+   synchronization2, and the shaders' `discard`, which glslang makes a demote
+   to a helper invocation for Vulkan 1.3. */
+inline VkPhysicalDeviceVulkan13Features Vulkan13Features(VkPhysicalDevice gpu) {
+    VkPhysicalDeviceVulkan13Features supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    query.pNext = &supported;
+    vkGetPhysicalDeviceFeatures2(gpu, &query);
+    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    v13.dynamicRendering = VK_TRUE;
+    v13.synchronization2 = VK_TRUE;
+    v13.shaderDemoteToHelperInvocation = supported.shaderDemoteToHelperInvocation;
+    return v13;
+}
 
 /* SubmitStats: submissions, the time spent waiting for the GPU, and what
    waited (a read-back of which kind, a resize, a full ring). */

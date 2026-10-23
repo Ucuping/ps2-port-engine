@@ -441,16 +441,25 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
         return false;
     }
 
-    // The instance, with the extensions SDL needs for its surface.
+    // The instance, with the extensions SDL needs for its surface, and the
+    // portability drivers where the loader offers them (gpu_internal.h).
     Uint32 count = 0;
-    const char* const* extensions = SDL_Vulkan_GetInstanceExtensions(&count);
+    const char* const* sdl_extensions = SDL_Vulkan_GetInstanceExtensions(&count);
+    std::vector<const char*> extensions(sdl_extensions, sdl_extensions + count);
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = title;
     app.apiVersion = VK_API_VERSION_1_3;      // the GS renderer draws on this device too
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = count;
-    ici.ppEnabledExtensionNames = extensions;
+    if (InstanceOffers(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+        ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        if (std::find_if(extensions.begin(), extensions.end(), [](const char* e) {
+                return std::strcmp(e, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0;
+            }) == extensions.end())
+            extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+    }
+    ici.enabledExtensionCount = std::uint32_t(extensions.size());
+    ici.ppEnabledExtensionNames = extensions.data();
     if (!Check(vkCreateInstance(&ici, nullptr, &instance_), "vkCreateInstance")) return false;
     volkLoadInstance(instance_);
     if (!SDL_Vulkan_CreateSurface(window_, instance_, nullptr, &surface_)) {
@@ -501,26 +510,31 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     qci.queueFamilyIndex = family_;
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
-    const char* device_extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    std::vector<const char*> device_extensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    const bool subset = DeviceOffers(gpu_, kPortabilitySubset);
+    if (subset) device_extensions.push_back(kPortabilitySubset);
     // What the GS renderer needs, for when it draws on this device
     // (SharedGpu): dynamic rendering, and dual-source blending if there is any.
     VkPhysicalDeviceFeatures supported;
     vkGetPhysicalDeviceFeatures(gpu_, &supported);
     dual_source_ = supported.dualSrcBlend == VK_TRUE;
-    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    v13.dynamicRendering = VK_TRUE;
-    v13.synchronization2 = VK_TRUE;
+    VkPhysicalDeviceVulkan13Features v13 = Vulkan13Features(gpu_);
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.features.dualSrcBlend = supported.dualSrcBlend;
     features.features.logicOp = supported.logicOp;
     features.features.textureCompressionBC = supported.textureCompressionBC;     // texture packs' DDS
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR subset_features{kPortabilitySubsetFeatures};
+    if (subset) {
+        subset_features = PortabilityFeatures(gpu_);
+        v13.pNext = &subset_features;
+    }
     features.pNext = &v13;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &features;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1;
-    dci.ppEnabledExtensionNames = device_extensions;
+    dci.enabledExtensionCount = std::uint32_t(device_extensions.size());
+    dci.ppEnabledExtensionNames = device_extensions.data();
     if (!Check(vkCreateDevice(gpu_, &dci, nullptr, &device_), "vkCreateDevice")) return false;
     // Device functions stay the loader's: see gpu.cpp.
     vkGetDeviceQueue(device_, family_, 0, &queue_);

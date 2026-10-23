@@ -45,6 +45,12 @@ bool VulkanGpu::Init(std::string* error) {
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    const char* portability = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+    if (InstanceOffers(portability)) {
+        ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        ici.enabledExtensionCount = 1;
+        ici.ppEnabledExtensionNames = &portability;
+    }
     if ((r = vkCreateInstance(&ici, nullptr, &instance)) != VK_SUCCESS) return fail("vkCreateInstance", r);
     volkLoadInstance(instance);
 
@@ -85,9 +91,7 @@ bool VulkanGpu::Init(std::string* error) {
     qci.queueFamilyIndex = family;
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
-    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    v13.dynamicRendering = VK_TRUE;
-    v13.synchronization2 = VK_TRUE;
+    VkPhysicalDeviceVulkan13Features v13 = Vulkan13Features(gpu);
     // Dual-source blending: the GS's blend factor (source alpha or FIX, where
     // 0x80 is 1.0) is a second fragment output, not the alpha written.
     VkPhysicalDeviceFeatures supported;
@@ -104,6 +108,14 @@ bool VulkanGpu::Init(std::string* error) {
     dci.pNext = &features;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    const char* subset = kPortabilitySubset;
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR subset_features{kPortabilitySubsetFeatures};
+    if (DeviceOffers(gpu, subset)) {
+        subset_features = PortabilityFeatures(gpu);
+        v13.pNext = &subset_features;
+        dci.enabledExtensionCount = 1;
+        dci.ppEnabledExtensionNames = &subset;
+    }
     if ((r = vkCreateDevice(gpu, &dci, nullptr, &device)) != VK_SUCCESS) return fail("vkCreateDevice", r);
     // Device functions stay the loader's (volkLoadInstance): they dispatch by
     // handle, so the window's device and this one can live side by side. volk
