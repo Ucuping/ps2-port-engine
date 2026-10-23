@@ -13,6 +13,7 @@
 #include "ps2host/gs.h"
 #include "ps2host/profile.h"
 #include "ps2host/dma.h"
+#include "gs_decode.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -37,14 +38,14 @@ u32 Bits(u64 value, int low, int count) { return u32((value >> low) & ((1ull << 
 std::string Gs::Summary() const {
     char text[160];
     std::snprintf(text, sizeof text, "GIF tags: PATH1 %llu, PATH2 %llu, PATH3 %llu; image %llu quadwords;",
-                  static_cast<unsigned long long>(tags_[1]), static_cast<unsigned long long>(tags_[2]),
-                  static_cast<unsigned long long>(tags_[3]), static_cast<unsigned long long>(image_qwords_));
+                  static_cast<unsigned long long>(gif.tags[1]), static_cast<unsigned long long>(gif.tags[2]),
+                  static_cast<unsigned long long>(gif.tags[3]), static_cast<unsigned long long>(gif.image_qwords));
     std::string out = text;
     out += " register writes:";
     for (u32 r = 0; r < 256; ++r)
-        if (register_writes_[r]) {
+        if (gif.register_writes[r]) {
             std::snprintf(text, sizeof text, " %02X:%llu", unsigned(r),
-                          static_cast<unsigned long long>(register_writes_[r]));
+                          static_cast<unsigned long long>(gif.register_writes[r]));
             out += text;
         }
     return out;
@@ -61,13 +62,7 @@ Gs& MakeGs() {
 
 // ---------------------------------------------------------------- GIF
 
-void Gs::Word(int path, u32 word) {
-    Path& p = paths_[path];
-    p.pending[p.pending_count++] = word;
-    if (p.pending_count < 4) return;
-    p.pending_count = 0;
-    Qword(path, u64(p.pending[0]) | u64(p.pending[1]) << 32, u64(p.pending[2]) | u64(p.pending[3]) << 32);
-}
+void Gs::Word(int path, u32 word) { GifDecode<Gs>::Word(gif, *this, path, word); }
 
 void Gs::BeginRecord(std::FILE* out) {
     record_ = nullptr;
@@ -106,11 +101,11 @@ void Gs::BeginRecord(std::FILE* out) {
     reg(0x50, bitbltbuf_);
     reg(0x51, trxpos_);
     reg(0x52, trxreg_);
-    reg(0x0A, u64(fog_) << 56);
+    reg(0x0A, u64(gif.fog) << 56);
     reg(0x00, prim_);                                   // PRIM last: it starts no primitive
-    reg(0x01, rgbaq_);
-    reg(0x02, st_);
-    reg(0x03, uv_);
+    reg(0x01, gif.rgbaq);
+    reg(0x02, gif.st);
+    reg(0x03, gif.uv);
     auto privileged = [&](u32 offset, u64 value) {
         std::fputc('P', out);
         const u32 address = 0x12000000u + offset;
@@ -138,153 +133,31 @@ void Gs::EndRecord() {
 }
 
 void Gs::Words(int path, const u32* words, u32 count, u32 from) {
-    if (record_ && count) {
-        std::fputc('W', record_);
-        std::fputc(path, record_);
-        const u32 bytes = count * 4;
-        std::fwrite(&bytes, 4, 1, record_);
-        std::fwrite(words, 4, count, record_);
-    }
-    Path& p = paths_[path];
-    for (u32 i = 0; i < count;) {
-        if (p.pending_count == 0 && p.loops && p.format >= 2 && count - i >= 4) {     // IMAGE
-            const u32 qwords = std::min(p.loops, (count - i) / 4);
-            image_qwords_ += qwords;
-            TransferBlock(reinterpret_cast<const u8*>(words + i), qwords);
-            p.loops -= qwords;
-            i += 4 * qwords;
-            continue;
-        }
-        // DMA already supplies complete quadwords. Avoid assembling those
-        // through four Word calls; retain that path for fragmented packets.
-        // Word's fourth write supplies the diagnostic source address.
-        if (p.pending_count == 0 && count - i >= 4) {
-            if (from != kNoSource) dma_source_ = from + 4 * (i + 3);
-            Qword(path, u64(words[i]) | u64(words[i + 1]) << 32,
-                  u64(words[i + 2]) | u64(words[i + 3]) << 32);
-            i += 4;
-            continue;
-        }
-        if (from != kNoSource) dma_source_ = from + 4 * i;
-        Word(path, words[i++]);
-    }
+    GifDecode<Gs>::Words(gif, *this, path, words, count, from);
 }
 
-void Gs::Qword(int path, u64 low, u64 high) {
-    Path& p = paths_[path];
-    if (!p.loops) {
-        // A tag.
-        p.tag_low = low;
-        p.tag_high = high;
-        p.loops = Bits(low, 0, 15);
-        p.format = Bits(low, 58, 2);
-        p.nregs = Bits(low, 60, 4);
-        if (!p.nregs) p.nregs = 16;
-        p.reg = 0;
-        q_ = 1.0f;
-        ++tags_[path];
-        if (trace)
-            std::fprintf(trace_out, "[gs] tag path %d nloop %u eop %u pre %u prim %X flg %u nreg %u regs %016llX\n",
-                         path, p.loops, Bits(low, 15, 1), Bits(low, 46, 1), Bits(low, 47, 11), p.format,
-                         p.nregs, (unsigned long long)high);
-        if (Bits(low, 46, 1) && p.format == 0) WriteRegister(0x00, Bits(low, 47, 11));
-        return;
-    }
-    switch (p.format) {
-        case 0:                                         // PACKED
-            Packed(u32(p.tag_high >> (4 * p.reg)) & 15, low, high);
-            if (++p.reg == p.nregs) { p.reg = 0; --p.loops; }
-            break;
-        case 1:                                         // REGLIST
-            for (u64 value : {low, high}) {
-                if (!p.loops) break;
-                const u32 descriptor = u32(p.tag_high >> (4 * p.reg)) & 15;
-                if (descriptor != 0xE && descriptor != 0xF) WriteRegister(descriptor, value);
-                if (++p.reg == p.nregs) { p.reg = 0; --p.loops; }
-            }
-            break;
-        default:                                        // IMAGE
-            ++image_qwords_;
-            Transfer(low, high);
-            --p.loops;
-            break;
-    }
-}
-
-void Gs::Packed(u32 descriptor, u64 low, u64 high) {
-    switch (descriptor) {
-        case 0x0: WriteRegister(0x00, low & 0x7FF); break;
-        case 0x1: {                                     // RGBA, Q from ST
-            rgba_source_ = dma_source_;
-            u32 qbits;
-            std::memcpy(&qbits, &q_, 4);
-            rgbaq_ = Bits(low, 0, 8) | Bits(low, 32, 8) << 8 | u64(Bits(high, 0, 8)) << 16 |
-                     u64(Bits(high, 32, 8)) << 24 | u64(qbits) << 32;
-            break;
-        }
-        case 0x2: st_ = low; q_ = AsFloat(u32(high)); break;   // Q waits for the next RGBA
-        case 0x3: uv_ = Bits(low, 0, 14) | u64(Bits(low, 32, 14)) << 16; break;
-        case 0x4: case 0xC: {                           // XYZF2 / XYZF3
-            const u64 value = Bits(low, 0, 16) | u64(Bits(low, 32, 16)) << 16 |
-                              u64(Bits(high, 4, 24)) << 32 | u64(Bits(high, 36, 8)) << 56;
-            const bool adc = descriptor == 0xC || Bits(high, 47, 1);
-            WriteRegister(adc ? 0x0C : 0x04, value);
-            break;
-        }
-        case 0x5: case 0xD: {                           // XYZ2 / XYZ3
-            const u64 value = Bits(low, 0, 16) | u64(Bits(low, 32, 16)) << 16 | u64(u32(high)) << 32;
-            const bool adc = descriptor == 0xD || Bits(high, 47, 1);
-            WriteRegister(adc ? 0x0D : 0x05, value);
-            break;
-        }
-        case 0xA: WriteRegister(0x0A, u64(Bits(high, 36, 8)) << 56); break;  // FOG
-        case 0xE: WriteRegister(u32(high & 0xFF), low); break;               // A+D
-        case 0xF: break;                                                    // NOP
-        default: WriteRegister(descriptor, low); break; // TEX0, CLAMP
-    }
-}
+void Gs::Qword(int path, u64 low, u64 high) { GifDecode<Gs>::Qword(gif, *this, path, low, high); }
 
 // ---------------------------------------------------------------- registers
 
-void Gs::WriteRegister(u32 address, u64 value) {
-    ++register_writes_[address & 0xFF];
+void Gs::WriteRegister(u32 address, u64 value) { GifDecode<Gs>::Register(gif, *this, address, value); }
+
+/* A vertex the decoding made (GifDecode::Register): queued, and the
+   primitive drawn once there are enough (Kick). */
+void Gs::PushVertex(const Vertex& v, bool draw) {
+    if (queued_ == 3) {                         // keep the newest two
+        queue_[0] = queue_[1];
+        queue_[1] = queue_[2];
+        queued_ = 2;
+    }
+    queue_[queued_++] = v;
+    Kick(draw);
+}
+
+/* The registers the GS keeps (every one but those only the decoding reads). */
+void Gs::Apply(u32 address, u64 value) {
     switch (address) {
         case 0x00: prim_ = value; queued_ = 0; strip_ = 0; break;
-        case 0x01: rgbaq_ = value; rgba_source_ = g_dma_source; break;
-        case 0x02: st_ = value; break;
-        case 0x03: uv_ = value; break;
-        case 0x04: case 0x05: case 0x0C: case 0x0D: {
-            // A vertex: position from the register, the rest latched.
-            if (trace) xyz_source_ = dma_source_ ? dma_source_ : g_dma_source;
-            const Context& c = Ctx();
-            Vertex v;
-            const bool f = address == 0x04 || address == 0x0C;
-            v.x = (float(Bits(value, 0, 16)) - float(Bits(c.xyoffset, 0, 16))) / 16.0f;
-            // Field mode: a game draws one field half a pixel lower than the
-            // other (sceGsSetHalfOffset), for a television to scan between
-            // the lines. Shown a field at a time on a progressive screen that
-            // shook the picture up and down; drawn on the whole pixel, both
-            // fields stand still (PS2HOST_HALF_OFFSET=1 keeps the console's).
-            static const bool half_offset = std::getenv("PS2HOST_HALF_OFFSET") != nullptr;
-            const u32 ofy = FieldMode() && !half_offset ? Bits(c.xyoffset, 32, 16) & ~15u : Bits(c.xyoffset, 32, 16);
-            v.y = (float(Bits(value, 16, 16)) - float(ofy)) / 16.0f;
-            v.z = f ? Bits(value, 32, 24) : u32(value >> 32);
-            v.fog = f ? u8(value >> 56) : fog_;
-            v.r = u8(rgbaq_); v.g = u8(rgbaq_ >> 8); v.b = u8(rgbaq_ >> 16); v.a = u8(rgbaq_ >> 24);
-            v.q = AsFloat(u32(rgbaq_ >> 32));
-            v.s = AsFloat(u32(st_));
-            v.t = AsFloat(u32(st_ >> 32));
-            v.u = Bits(uv_, 0, 14);
-            v.v = Bits(uv_, 16, 14);
-            if (queued_ == 3) {                         // keep the newest two
-                queue_[0] = queue_[1];
-                queue_[1] = queue_[2];
-                queued_ = 2;
-            }
-            queue_[queued_++] = v;
-            Kick(address == 0x04 || address == 0x05);
-            break;
-        }
         case 0x06: case 0x07:
             ctx_[address - 0x06].tex0 = value;
             LoadClut(value);
@@ -301,18 +174,12 @@ void Gs::WriteRegister(u32 address, u64 value) {
             LoadClut(tex0);
             break;
         }
-        case 0x18: case 0x19:
-            if (trace && value != ctx_[address - 0x18].xyoffset)
-                std::fprintf(trace_out, "[gs] xyoffset_%u (%u, %u)\n", unsigned(address - 0x17),
-                             unsigned(value & 0xFFFF) / 16, unsigned((value >> 32) & 0xFFFF) / 16);
-            ctx_[address - 0x18].xyoffset = value;
-            break;
+        case 0x18: case 0x19: ctx_[address - 0x18].xyoffset = value; break;
         case 0x1A: prmodecont_ = value; break;
         case 0x1B: prmode_ = value; break;
         case 0x1C: texclut_ = value; break;
         case 0x3B: texa_ = value; break;
         case 0x3D: fogcol_ = value; break;
-        case 0x0A: fog_ = u8(value >> 56); break;
         case 0x40: case 0x41: ctx_[address - 0x40].scissor = value; break;
         case 0x42: case 0x43: ctx_[address - 0x42].alpha = value; break;
         case 0x45: dthe_ = value; break;
@@ -518,12 +385,9 @@ void Gs::LoadClut(u64 tex0) {
 
 // ---------------------------------------------------------------- display
 
-void Gs::SetPrivileged(u32 address, u64 value) {
-    if (record_) {
-        std::fputc('P', record_);
-        std::fwrite(&address, 4, 1, record_);
-        std::fwrite(&value, 8, 1, record_);
-    }
+void Gs::SetPrivileged(u32 address, u64 value) { GifDecode<Gs>::Privileged(gif, *this, address, value); }
+
+void Gs::ApplyPrivileged(u32 address, u64 value) {
     switch (address & 0xFFFF) {
         case 0x0000: pmode_ = value; break;
         case 0x0020: smode2_ = value; break;

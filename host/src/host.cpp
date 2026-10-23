@@ -85,6 +85,13 @@ int GsReplay(const std::string& file, const std::string& out) {
         g.trace_out = trace;
         g.trace = true;
     }
+    // PS2HOST_GS_SPLIT=1: through the GS's threads as a game's run feeds them
+    // (the decoding on its own), synced at each vertical blank.
+    const bool threaded = GsSplit();
+    if (threaded) {
+        if (std::getenv("PS2HOST_REPLAY_SAMPLE")) SetSampleGsThread(true);
+        StartGsThread();
+    }
     std::size_t at = 5 + kMemory;
     auto u32_at = [&](std::size_t o) { u32 v; std::memcpy(&v, data.data() + o, 4); return v; };
     auto u64_at = [&](std::size_t o) { u64 v; std::memcpy(&v, data.data() + o, 8); return v; };
@@ -99,10 +106,12 @@ int GsReplay(const std::string& file, const std::string& out) {
     while (at < data.size()) {
         const char kind = char(data[at++]);
         if (kind == 'R') {
-            g.WriteRegister(u32_at(at), u64_at(at + 4));
+            if (threaded) GsRegister(u32_at(at), u64_at(at + 4));
+            else g.WriteRegister(u32_at(at), u64_at(at + 4));
             at += 12;
         } else if (kind == 'P') {
-            g.SetPrivileged(u32_at(at), u64_at(at + 4));
+            if (threaded) GsPrivileged(u32_at(at), u64_at(at + 4));
+            else g.SetPrivileged(u32_at(at), u64_at(at + 4));
             at += 12;
         } else if (kind == 'W') {
             const int path = data[at];
@@ -115,7 +124,9 @@ int GsReplay(const std::string& file, const std::string& out) {
             // (memory then, to compare two renderers mid-frame).
             static const long long stop = std::getenv("PS2HOST_REPLAY_STOP_PRIM")
                                               ? std::atoll(std::getenv("PS2HOST_REPLAY_STOP_PRIM")) : -1;
-            if (stop < 0) {
+            if (threaded) {
+                GsWords(path, words.data(), u32(words.size()));
+            } else if (stop < 0) {
                 g.Words(path, words.data(), u32(words.size()));
             } else {
                 bool stopped = false;
@@ -129,6 +140,7 @@ int GsReplay(const std::string& file, const std::string& out) {
                 }
             }
         } else if (kind == 'V') {
+            if (threaded) SyncGs();
             g.Finish();
             if (timing) {
                 if (gpu) GpuShadowFrame(u64(pictures), std::string());
@@ -149,6 +161,7 @@ int GsReplay(const std::string& file, const std::string& out) {
         }
     }
     if (pass == 0 && trace) {           // the trace of the first pass alone
+        if (threaded) SyncGs();
         g.trace = false;
         g.trace_out = stderr;
         std::fclose(trace);
@@ -156,7 +169,7 @@ int GsReplay(const std::string& file, const std::string& out) {
     }
     if (pass == 0) {
         if (repeat > 0 && std::getenv("PS2HOST_REPLAY_SAMPLE")) {
-            StartSampler();
+            if (!threaded) StartSampler();      // (split: the GS thread's, started with it)
             SetSampleFrom(0);
             SampleFrame(0);
         }
@@ -166,6 +179,7 @@ int GsReplay(const std::string& file, const std::string& out) {
     timing = true;
     at = stream;
     }
+    if (threaded) StopGsThread();
     g.Finish();
     if (repeat > 0) {
         // To the last drawn: a block read back waits for the GPU (and for a

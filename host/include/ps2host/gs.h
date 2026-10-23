@@ -106,6 +106,31 @@ struct MipChoice {
 };
 MipChoice ChooseLevel(u32 mode, float q);
 
+/* What the GIF's decoding keeps (gs_decode.h): each path's place in its
+   packet, the registers only it reads (RGBAQ, ST, UV, FOG, Q), its own copies
+   of those that place a vertex (PRIM, PRMODE, PRMODECONT, XYOFFSET, SMODE2),
+   and the counts for the report. One thread at a time: the GS's own, or the
+   decoding's (PS2HOST_GS_SPLIT) - read by the others only with the GS
+   synced (SyncGs). */
+struct GifState {
+    struct Path {
+        u64 tag_low = 0, tag_high = 0;
+        u32 loops = 0, reg = 0, nregs = 0, format = 0;
+        u32 pending[4] = {};
+        u32 pending_count = 0;
+    };
+    Path paths[4];
+    float q = 1;
+    u64 rgbaq = 0, st = 0, uv = 0;
+    u8 fog = 0;                                 // FOG: F for XYZ2/XYZ3 vertices
+    u64 prim = 0, prmode = 0, prmodecont = 1, xyoffset[2] = {}, smode2 = 0;
+    u32 dma_source = 0;                         // where the word being taken came from (--gs-trace)
+    u32 rgba_source = 0;                        // where the last RGBAQ came from (trace)
+    u32 xyz_source = 0;                         // ...and the last vertex (trace)
+    u64 tags[4] = {}, image_qwords = 0;
+    std::array<u64, 256> register_writes{};
+};
+
 class Gs {
 public:
     Memory memory;
@@ -135,6 +160,33 @@ public:
 
     /* Privileged registers (the 0x12000000 window): what is displayed. */
     void SetPrivileged(u32 address, u64 value);
+
+    /* The decoding's state (gs_decode.h) and what it hands on - the GS as
+       its own sink, or the GS thread's for a decoding on a thread of its own
+       (gs_thread.cpp): a register the GS keeps, a vertex (`draw`: XYZ2, it
+       may draw), IMAGE data, a privileged register; the stream recorded. */
+    GifState gif;
+    void Apply(u32 address, u64 value);
+    void PushVertex(const Vertex& v, bool draw);
+    void Image(const u8* data, u32 qwords) { TransferBlock(data, qwords); }
+    void ApplyPrivileged(u32 address, u64 value);
+    void Record(int path, const u32* words, u32 count) {
+        if (!record_) return;
+        std::fputc('W', record_);
+        std::fputc(path, record_);
+        const u32 bytes = count * 4;
+        std::fwrite(&bytes, 4, 1, record_);
+        std::fwrite(words, 4, count, record_);
+    }
+    void RecordPrivileged(u32 address, u64 value) {
+        if (!record_) return;
+        std::fputc('P', record_);
+        std::fwrite(&address, 4, 1, record_);
+        std::fwrite(&value, 8, 1, record_);
+    }
+    bool Tracing() const { return trace; }
+    void TraceLine(const char* text) const { std::fputs(text, trace_out); }
+    bool Recording() const { return record_ != nullptr; }
 
     /* The displayed picture, 32-bit BGRA, and its size. False if nothing is.
        In field mode (SMODE2 INT and FFMD) each field shows every line of the
@@ -214,14 +266,6 @@ public:
     std::string Summary() const;
 
 private:
-    struct Path {
-        u64 tag_low = 0, tag_high = 0;
-        u32 loops = 0, reg = 0, nregs = 0, format = 0;
-        bool in_packet = false;
-        u32 pending[4] = {};
-        u32 pending_count = 0;
-    };
-    Path paths_[4];
     /* The drawing state a primitive's pixels all use, decoded from the
        registers once per primitive (Prepare) rather than once per pixel, and
        kept with the primitive while it waits to be drawn. */
@@ -244,8 +288,7 @@ private:
         u32 a, b, c, d, fix;                        // ALPHA
     };
     Setup setup_{};
-    bool setup_stale_ = false;
-    u32 dma_source_ = 0;                // where the word being taken came from (--gs-trace)          // !rasterize: Prepare left to DecodeTexture, which alone reads it
+    bool setup_stale_ = false;          // !rasterize: Prepare left to DecodeTexture, which alone reads it
     void Prepare();
     /* A primitive waiting to be drawn. */
     struct Job {
@@ -259,7 +302,6 @@ private:
     /* One primitive, the rows of band `band` of `bands` (rows in groups of 8
        dealt round). */
     void DrawJob(const Job& job, int band, int bands);
-    void Packed(u32 descriptor, u64 low, u64 high);
     void Kick(bool draw);
     void Draw();
     void DrawSprite(const Job& job, int band, int bands);
@@ -284,13 +326,9 @@ private:
 
     std::FILE* record_ = nullptr;               // BeginRecord's stream
     Context ctx_[2];
-    u64 prim_ = 0, prmode_ = 0, prmodecont_ = 1, rgbaq_ = 0, st_ = 0, uv_ = 0;
-    u8 fog_ = 0;                                // FOG: F for XYZ2/XYZ3 vertices
+    u64 prim_ = 0, prmode_ = 0, prmodecont_ = 1;
     u64 texclut_ = 0, texa_ = 0, fogcol_ = 0, dthe_ = 0, colclamp_ = 1, pabe_ = 0;
     u64 bitbltbuf_ = 0, trxpos_ = 0, trxreg_ = 0, trxdir_ = 3;
-    float q_ = 1;
-    u32 rgba_source_ = 0;                       // where the last RGBAQ came from (trace)
-    u32 xyz_source_ = 0;                        // ...and the last vertex (trace)
     Vertex queue_[3];
     u32 queued_ = 0;
     u32 strip_ = 0;                             // vertices since the primitive started
@@ -303,8 +341,6 @@ private:
     u64 pmode_ = 0, smode2_ = 0, dispfb_[2] = {}, display_[2] = {}, bgcolor_ = 0;
     u64 primitives_ = 0, uploads_ = 0;
     std::atomic<u64> pixels_{0};               // written by the row workers too
-    u64 tags_[4] = {}, image_qwords_ = 0;
-    std::array<u64, 256> register_writes_{};
     u64 effect_params_[14] = {};                // 0x70-0x7D (on_effect)
     // CLUT, loaded per TEX0's CLD; copied when it changes, so that queued
     // primitives keep the one they were drawn with.

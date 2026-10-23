@@ -212,6 +212,11 @@ void GsQword(int path, u64 low, u64 high);
 void GsWord(int path, u32 word);
 void GsWords(int path, const u32* words, u32 count, u32 from = ~0u);
 void GsPrivileged(u32 address, u64 value);
+/* A GS register write, as A+D would (the replay's recorded registers). */
+void GsRegister(u32 address, u64 value);
+/* PS2HOST_GS_SPLIT=1: the GIF's decoding on a thread of its own in front of
+   the GS thread (gs_thread.cpp). */
+bool GsSplit();
 /* The end of frame N, in the GS's stream: the handler (the GPU bridge's, when
    the GPU draws: hand the frame to the GPU, show its picture) runs on the GS
    thread once the frame's packets are taken, so the EE need not wait for
