@@ -971,7 +971,7 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
     bool ran = false;
     // From program to program (a jump to a register's address may go to
     // another), as long as one starts here and its code is in memory.
-    while (!state.done && state.count < limit && state.delayed == kNone && !state.stopping) {
+    while (!state.done && !state.interpret && state.count < limit && state.delayed == kNone && !state.stopping) {
         Entered* entered = state.pc < micro.size() ? &entered_[state.pc / 8] : nullptr;
         const VuCompiled* program = nullptr;
         const std::vector<VuBlock>* blocks = nullptr;
@@ -1005,7 +1005,22 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
         const std::vector<VuBlock>& table = *blocks;
         const u64 before = state.count;
         const u32 started = state.pc;
-        while (!state.done && state.count < limit) {
+        while (!state.done && !state.interpret && state.count < limit) {
+            // A jump to a register's address: into a block that knows fields
+            // clean from the ways into it the generator knew, the interpreter
+            // goes on (that block's clamps were left out for them).
+            if (state.jumped) {
+                state.jumped = false;
+                if (program->knows) {
+                    const u32 pc = state.pc & u32(micro.size() - 1);
+                    const u32* end = program->starts + program->block_count;
+                    const u32* at = std::lower_bound(program->starts, end, pc);     // (in order of address)
+                    if (at != end && *at == pc && program->knows[at - program->starts]) {
+                        state.interpret = true;
+                        break;
+                    }
+                }
+            }
             const VuBlock block = table[(state.pc & u32(micro.size() - 1)) / 8];
             if (!block) break;
             const u64 at = state.count;

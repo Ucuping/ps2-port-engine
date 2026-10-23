@@ -685,7 +685,8 @@ class Chain:
 def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int = 0,
               written: dict = None, clean: dict = None, dead_flags: bool = False,
               after: tuple = None, no_flags: bool = False, chain: dict = None, fl: Flags = None,
-              quiet: set = frozenset(), no_status: bool = False, entry: dict = None) -> list:
+              quiet: set = frozenset(), no_status: bool = False, entry: dict = None,
+              unsafe: frozenset = frozenset()) -> list:
     """One pair, as Run runs it, then where the run goes: on to the next pair
     of the block, or (`last`, a branch taken, the program's end) back to the
     driver with s.pc. `index` is its place in the block and `written` where
@@ -697,7 +698,11 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
     checked only after one that may set them. `no_flags`: the fast blocks
     of a program that never reads MAC or STATUS (fast_eligible) - an FMAC
     leaves both alone (CLIP is as ever). `no_status`: the fast blocks of a
-    program that never reads STATUS - an FMAC sets MAC alone (mac_only)."""
+    program that never reads STATUS - an FMAC sets MAC alone (mac_only).
+    `unsafe`: whether any of the program's blocks starts knowing fields
+    clean (entry_clean) - a jump whose target is not known says so
+    (s.jumped), and where it lands on such a block the driver hands the run
+    to the interpreter (VuCompiled::knows)."""
     if written is None:
         written = {}
     immediate = bool(upper & 0x80000000)
@@ -838,7 +843,9 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
             body.append("if (delayed != kNone) { s.pc = 0x%Xu; delayed = %s; %s%s }" %
                         (target, new_delayed, landing_into(target), leave_to(target, chain, recent)))
         else:
-            body.append("if (delayed != kNone) { s.pc = delayed; delayed = %s; %s%s }" % (new_delayed, leaving, LEAVE))
+            guard = "s.jumped = true; " if unsafe else ""
+            body.append("if (delayed != kNone) { s.pc = delayed; %sdelayed = %s; %s%s }" %
+                        (guard, new_delayed, leaving, LEAVE))
     if branch:
         body.append("delayed = branch;")
     if last:
@@ -898,6 +905,91 @@ def blocks_of(pairs: dict, entries: list, mask: int) -> list:
                                       before[1] & 0x40000000))
         previous = pc
     return blocks
+
+
+# PS2_VU_NO_ENTRY_CLEAN=1: blocks start knowing nothing clean (to compare).
+ENTRY_CLEAN = os.environ.get("PS2_VU_NO_ENTRY_CLEAN", "") != "1"
+
+
+def clean_after(state: set, pc: int, lower: int, upper: int, mask: int) -> set:
+    """The fields clean after a pair, from those before it - as emit_pair
+    keeps `clean`: the lower's held writes not known clean, then the upper's."""
+    s = set(state)
+    if not upper & 0x80000000:
+        for r, dest in lower_writes(emit_lower(lower, pc, mask)[0]):
+            for lane in range(4):
+                if dest & (8 >> lane):
+                    s.discard((r, lane))
+    for r, dest, is_clean in clean_writes(upper):
+        for lane in range(4):
+            if dest & (8 >> lane) and r != 0:
+                (s.add if is_clean else s.discard)((r, lane))
+    return s
+
+
+def entry_clean(blocks: list, pairs: dict, entries: list, mask: int) -> dict:
+    """The fields each block can start knowing clean - in every lane, from
+    every way into it: {start: frozenset of (register or 'acc', lane)}.
+    A clean field is one an operand's clamp would leave as it is (an FMAC's
+    result, ITOF's, ABS's...: known_clean); a block knew only those written
+    in it, so 79% of the clamps the explosion's VU1 ran were of fields from
+    before the block. Its predecessors are the blocks that go on into it
+    (straight on, a branch, a conditional branch's side exit); a block a run
+    may start at (an entry, the pair after an E bit, which a later run goes
+    on from), a return's place (after an unconditional branch's delay slot:
+    JR's target), or one with no known way in starts knowing nothing. A jump
+    to a register's address may land anywhere: where it lands on a block that
+    knows something (`unsafe`), the run goes on in the interpreter (emit_pair).
+    No versions: the same code, its clamps fewer."""
+    by_start = {b[0]: b for b in blocks}
+    if not ENTRY_CLEAN:
+        return {start: frozenset() for start in by_start}
+    unknown = set(e for e in entries if e in by_start)
+    for pc, (lower, upper) in pairs.items():
+        branch, static, conditional = is_branch(lower, upper)
+        after = (pc + 16) & mask
+        if after in by_start and ((branch and not conditional) or upper & 0x40000000):
+            unknown.add(after)
+
+    def exits(block, state):
+        out, s, taken = [], set(state), None
+        for pc in block:
+            lower, upper = pairs[pc]
+            s = clean_after(s, pc, lower, upper, mask)
+            if taken is not None:
+                out.append((taken, frozenset(s)))
+                taken = None
+            branch, static, _conditional = is_branch(lower, upper)
+            if branch and static:
+                target = (pc + 8 + imm11(lower) * 8) & mask
+                if target in by_start:
+                    taken = target                  # after its delay slot
+            if upper & 0x40000000:
+                return out
+        if taken is not None:
+            out.append((taken, frozenset(s)))
+        last = block[-1]
+        before = pairs.get((last - 8) & mask)
+        jumped = before is not None and is_branch(*before)[0] and not is_branch(*before)[2]
+        if not jumped and not pairs[last][1] & 0x40000000 and ((last + 8) & mask) in by_start:
+            out.append(((last + 8) & mask, frozenset(s)))
+        return out
+
+    every = frozenset([(r, lane) for r in range(1, 32) for lane in range(4)] + [("acc", lane) for lane in range(4)])
+    state = {start: frozenset() if start in unknown else every for start in by_start}
+    changed = True
+    while changed:
+        changed = False
+        met = {start: None for start in by_start}
+        for block in blocks:
+            for target, s in exits(block, state[block[0]]):
+                met[target] = s if met[target] is None else met[target] & s
+        for start in by_start:
+            now = frozenset() if start in unknown or met[start] is None else met[start]
+            if now != state[start]:
+                state[start] = now
+                changed = True
+    return state
 
 
 def reads_mac(lower: int, upper: int) -> bool:
@@ -1214,7 +1306,8 @@ TIMES_PASS = os.environ.get("PS2_VU_ALL_TIMES", "") != "1"
 
 def emit_block(name: str, block: list, pairs: dict, mask: int, drops: set = frozenset(),
                chain: dict = None, quiet: set = frozenset(), no_status: bool = False,
-               entry: dict = None) -> list:
+               entry: dict = None, entry_clean: frozenset = frozenset(),
+               unsafe: frozenset = frozenset()) -> list:
     # The run's state and the cycle as locals, written back where the block
     # leaves (LEAVE): nothing the block does can reach them through memory.
     # A block starts only with as many pairs left to the limit as it has
@@ -1230,13 +1323,13 @@ def emit_block(name: str, block: list, pairs: dict, mask: int, drops: set = froz
            "    u64 count = s.count, cyc = C::Cycle(v);",
            "    bool stopping = s.stopping;",
            "    u32 delayed = s.delayed;"]
-    written, clean = {}, {}
+    written, clean = {}, {f: True for f in entry_clean}
     dead = dead_flags(block, pairs) - {0}
     fl = Flags()
     head = len(out)
     bodies = [emit_pair(pc, pairs[pc][0], pairs[pc][1], mask, i == len(block) - 1, i, written, clean,
                         i in dead, pairs[block[i - 1]] if i else None, pc in drops, chain, fl, quiet,
-                        no_status, entry)
+                        no_status, entry, unsafe)
               for i, pc in enumerate(block)]
     if TIMES_PASS:
         untimed_writes(bodies)
@@ -1318,6 +1411,8 @@ def generate_files(programs: list, what: str, single: str = None) -> dict:
         fast = drops is not None
         quiet = quiet_blocks(blocks, pairs)
         by_start = {b[0]: b for b in blocks}
+        known_clean_at = entry_clean(blocks, pairs, entries, mask)
+        unsafe = frozenset(start for start, known in known_clean_at.items() if known)
         for block in blocks:
             names.append((block[0], "%sBlock%04X" % (name, block[0])))
         for variant, dropped in [("", frozenset())] + ([("Fast", drops)] if fast else []):
@@ -1326,7 +1421,8 @@ def generate_files(programs: list, what: str, single: str = None) -> dict:
             while work:
                 start, entry, block_name = work.pop(0)
                 code = emit_block(block_name, by_start[start], pairs, mask, dropped, chain, quiet,
-                                  no_status=variant == "Fast", entry=entry)
+                                  no_status=variant == "Fast", entry=entry, entry_clean=known_clean_at[start],
+                                  unsafe=unsafe)
                 work += chain.wanted
                 chain.wanted = []
                 if single is None and len(chunks[-1]) + len(code) > LINES_PER_FILE and chunks[-1]:
@@ -1338,14 +1434,18 @@ def generate_files(programs: list, what: str, single: str = None) -> dict:
         tables.append("};")
         tables.append("const u32 k%sStarts[] = {%s};" % (name, ", ".join("0x%Xu" % pc for pc, _ in names)))
         tables.append("const ps2host::VuBlock k%sBlocks[] = {%s};" % (name, ", ".join(n for _, n in names)))
+        if unsafe:
+            tables.append("const std::uint8_t k%sKnows[] = {%s};" %
+                          (name, ", ".join("1" if pc in unsafe else "0" for pc, _ in names)))
         if fast:
             tables.append("const ps2host::VuBlock k%sFastBlocks[] = {%s};" %
                           (name, ", ".join(n + "Fast" for _, n in names)))
         tables.append("")
         for entry in entries:
-            registrations.append("    {%d, 0x%Xu, k%sCode, k%sStarts, k%sBlocks, %du, %s}," %
+            registrations.append("    {%d, 0x%Xu, k%sCode, k%sStarts, k%sBlocks, %du, %s, %s}," %
                                  (unit, entry, name, name, name, len(names),
-                                  "k%sFastBlocks" % name if fast else "nullptr"))
+                                  "k%sFastBlocks" % name if fast else "nullptr",
+                                  "k%sKnows" % name if unsafe else "nullptr"))
     main = [HEADER % what]
     if single is not None:
         main += declarations + [""] + chunks[0]

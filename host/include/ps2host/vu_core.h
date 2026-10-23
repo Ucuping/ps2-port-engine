@@ -88,6 +88,9 @@ struct VuRunState {
     bool stopping = false;          // the pair before had E: this one is the last
     std::uint64_t count = 0;        // pairs run
     bool done = false;              // the program has ended
+    bool jumped = false;            // pc is a jump's to a register's address (or one not known)
+    bool interpret = false;         // the interpreter goes on from pc (such a jump into a block that
+                                    // knows fields clean from its known ways in: VuCompiled::knows)
 };
 
 /* A block of a compiled program: pairs run in a line from its first, the
@@ -127,6 +130,8 @@ struct VuCompiled {
     const VuBlock* blocks;
     std::uint32_t block_count;
     const VuBlock* fast_blocks = nullptr;   // the same without MAC and STATUS (--vu-fast), or none
+    const std::uint8_t* knows = nullptr;    // each block: 1 if it starts knowing fields clean from the
+                                            // ways into it the generator knows (vurecomp's entry_clean), or none
 };
 /* Adds one to those Vu::Run looks for (the generated file does, as it starts). */
 void RegisterVuProgram(const VuCompiled* program);

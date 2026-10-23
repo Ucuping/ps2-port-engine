@@ -20,7 +20,7 @@ pair. Of the compiled code's samples, by VuCore step:
 
 | | share |
 | --- | --- |
-| operand clamps (ClampLanes) | ~9% |
+| operand clamps (ClampLanes) | ~9% (before step 8) |
 | stall checks (Wait and its max) | ~11% |
 | MAC flags worked out (MacFlagsOf) | ~8% |
 | flags landed and queued (LandFlags, QueueFlags, FinishUpper's queue) | ~8% |
@@ -97,6 +97,23 @@ comparison with a profiled build).
    Tried, no gain: entry versions carried through blocks of fewer than three
    pairs (the generic blocks left are entered from the driver - a run's
    start, MSCNT - 7% of the samples against 28% in versions).
+8. **Clean on entry, from every way in** (done). Where the clamps left
+   come from (each pair weighted by how often the explosion ran it, the
+   interpreter counting): 79% are of fields from before the block, 14%
+   loaded in it (LQ), 4% Q. vurecomp's entry_clean works out what a block
+   can start knowing clean from all its known ways in (going on, a branch,
+   a conditional branch's side exit) - met over them, no versions, the same
+   code. A run's start, the pair after an E bit and a return's place start
+   knowing nothing. A jump to a register's address says so (s.jumped); the
+   driver hands the run to the interpreter where it lands on a block that
+   knows something (VuCompiled::knows; under 1,024 of the bench's 20,000
+   runs did). The first try had
+   the guard in every block (5,536 switches, +9% code) and was 1% slower.
+   Proven clean: 22% of the clamps run; the ceiling even with every loaded
+   value clean would be 47% - the rest are registers a run starts with,
+   left by the runs before. Fast bench 43.5 -> 42.4 ms (-2.6%), exact
+   71.4 -> 70.8, both hashes the same; the corpus at 600 programs, seeds 7
+   and 3. `PS2_VU_NO_ENTRY_CLEAN=1` for blocks knowing nothing on entry.
 5. **Superblocks for loops.** A loop body chained into itself (most of the
    hot code) compiled as one function with the loop kept, so the steps above
    hold from one iteration to the next.
