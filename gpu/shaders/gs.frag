@@ -267,8 +267,15 @@ vec4 ReplacedSample(vec2 r, vec2 dx, vec2 dy) {
     const int last = int((p.tex_format >> 9) & 7u);
     const uint forced = (p.blend_ops >> 25) & 3u;
     const float lx = length(dx), ly = length(dy);
+    // REPEAT or CLAMP: the GPU's sampler filters it (gs_renderer.cpp's
+    // ReplacementSampler: linear in and between levels, the player's
+    // anisotropy) - one sample, where the levels by hand were 4 to 8 texels
+    // (and anisotropy's taps each); the region modes by hand still.
+    const bool by_sampler = p.wms <= 1u && p.wmt <= 1u;
+    const vec2 size0 = vec2(ReplacedSize(0));
     if (forced == 0u) {
         const bool linear = (m & 2u) == 0u ? (m & 1u) != 0u : ((m >> 8) & 1u) != 0u || ((m >> 5) & 7u) >= 4u;
+        if (linear && by_sampler) return floor(textureGrad(texture_image, r / size0, dx / size0, dy / size0) * 255.0 + 0.5);
         const float lod = clamp(log2(max(max(lx, ly), 1e-6)), 0.0, float(last));
         const int n = int(floor(lod));
         const vec4 c0 = ReplacedLevel(r, n, linear);
@@ -282,8 +289,10 @@ vec4 ReplacedSample(vec2 r, vec2 dx, vec2 dy) {
     const float lod = clamp(log2(max(major / taps, 1e-6)) - bias, 0.0, float(last));
     if (forced < 3u) {
         const int n = int(min(floor(lod + 0.5), float(last)));
+        if (forced == 2u && by_sampler) return floor(textureLod(texture_image, r / size0, float(n)) * 255.0 + 0.5);
         return floor(ReplacedLevel(r, n, forced == 2u) + 0.5);
     }
+    if (by_sampler) return floor(textureGrad(texture_image, r / size0, dx / size0, dy / size0) * 255.0 + 0.5);
     const int n = int(floor(lod));
     const float f = lod - float(n);
     const vec2 axis = lx > ly ? dx : dy;

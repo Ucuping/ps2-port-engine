@@ -163,7 +163,7 @@ constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
 
 struct Texture {
     Image image;
-    VkDescriptorSet sets[8] = {};       /* by sampler */
+    VkDescriptorSet sets[28] = {};      /* by sampler (samplers_, then replacement_samplers_) */
     /* A texture drawn as a texture pack's replacement (UseReplacement): its
        id, 0 for none. A replacement itself (replacements_): gs.frag's
        tex_format for it - bit 8, levels - 1 in bits 9-11 - when it was last
@@ -640,7 +640,18 @@ private:
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     bool keep_colour_ = false;      /* ReloadKeepsColour */
-    VkSampler samplers_[8] = {};    /* bilinear << 2 | clamp_s << 1 | clamp_t */
+    VkSampler samplers_[28] = {};   /* bilinear << 2 | clamp_s << 1 | clamp_t; from 8 a texture pack's
+                                       (ReplacementSampler) */
+    /* A texture pack's replacement, filtered by the GPU (gs.frag's
+       ReplacedSample): linear in and between its levels, CLAMP's REPEAT or
+       CLAMP each way (clamp_s << 1 | clamp_t) and 1, 2, 4, 8 or 16 taps of
+       anisotropy (the player's ANISOTROPIC: GsDrawState::tag bits 8-12) -
+       one of samplers_' from 8. */
+    static int ReplacementSampler(const GsDrawState& s) {
+        const int clamps = int((s.wms & 1u) << 1 | (s.wmt & 1u));
+        const int taps = ((s.tag >> 11) & 3u) == 3u ? int(std::min((s.tag >> 8) & 7u, 4u)) : 0;
+        return 8 + clamps * 5 + taps;
+    }
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     std::map<std::uint32_t, VkPipeline> pipelines_;
     std::uint32_t last_pipeline_key_ = ~0u;
@@ -1121,6 +1132,21 @@ bool VulkanGsRenderer::Init(std::string* error) {
         sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sci.maxLod = 0.0f;
         vkCreateSampler(g_.device, &sci, nullptr, &samplers_[i]);
+    }
+    for (int i = 0; i < 20; ++i) {              // ReplacementSampler's
+        const int clamps = i / 5, taps = 1 << (i % 5);
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        sci.addressModeU = (clamps & 2) ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sci.addressModeV = (clamps & 1) ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxLod = 16.0f;
+        if (taps > 1 && g_.anisotropy > 1.0f) {
+            sci.anisotropyEnable = VK_TRUE;
+            sci.maxAnisotropy = std::min(float(taps), g_.anisotropy);
+        }
+        vkCreateSampler(g_.device, &sci, nullptr, &samplers_[8 + i]);
     }
     VkPushConstantRange push[2] = {{VK_SHADER_STAGE_VERTEX_BIT, 0, 8},
                                    {VK_SHADER_STAGE_FRAGMENT_BIT, kFragmentOffset, sizeof(FragmentParams)}};
@@ -3057,8 +3083,11 @@ void VulkanGsRenderer::Flush() {
             }
         }
     }
-    // The shader addresses and filters texels itself (texelFetch), as the GS does.
-    const int sampler = 3;
+    // The shader addresses and filters texels itself (texelFetch), as the GS
+    // does - but a texture pack's replacement in REPEAT or CLAMP, which the
+    // GPU filters (ReplacementSampler).
+    const int sampler = (texture->replaced & 0x100u) && state_.wms < 2 && state_.wmt < 2
+                            ? ReplacementSampler(state_) : 3;
     VkDescriptorSet set = SetFor(*texture, sampler);
     // Render to texture: the target itself, or a copy when it is also drawn into.
     Image* source = nullptr;

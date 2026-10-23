@@ -99,6 +99,12 @@ bool VulkanGpu::Init(std::string* error) {
     logic_op = supported.logicOp == VK_TRUE;
     features.features.textureCompressionBC = supported.textureCompressionBC;     // texture packs' DDS
     bc = supported.textureCompressionBC == VK_TRUE;
+    features.features.samplerAnisotropy = supported.samplerAnisotropy;           // texture packs' samplers
+    if (supported.samplerAnisotropy) {
+        VkPhysicalDeviceProperties properties;
+        vkGetPhysicalDeviceProperties(gpu, &properties);
+        anisotropy = properties.limits.maxSamplerAnisotropy;
+    }
     features.pNext = &v13;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &features;
