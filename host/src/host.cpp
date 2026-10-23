@@ -206,6 +206,7 @@ struct CachedCall {
     u32 address = 0;
     const FunctionEntry* entry = nullptr;
     u64* count = nullptr;
+    bool called = false;            // in RunStats().called already
 };
 constexpr std::size_t kCallCache = 1u << 14;
 CachedCall g_call_cache[kCallCache];
@@ -218,7 +219,7 @@ std::size_t g_overlay_count = 0;
 // OverrideInOverlay's: (overlay name, address) -> the host's function.
 std::map<std::pair<std::string, u32>, FunctionEntry> g_overlay_overrides;
 
-const FunctionEntry* FindInOverlay(u32 address, bool* in_overlay) {
+const FunctionEntry* FindInOverlay(u32 address, bool* in_overlay, const char** overlay) {
     for (std::size_t i = 0; i < g_overlay_count; ++i) {
         const OverlayEntry& o = g_overlays[i];
         if (address < o.start || address >= o.end) continue;
@@ -231,6 +232,7 @@ const FunctionEntry* FindInOverlay(u32 address, bool* in_overlay) {
         const u32 length = at->size && at->size < 16 ? at->size : 16;
         const u8* here = GuestMemory().Translate(address, length);
         if (here && std::memcmp(here, check, length) == 0) {
+            if (overlay) *overlay = o.name;
             if (!g_overlay_overrides.empty()) {
                 const auto mine = g_overlay_overrides.find({o.name, address});
                 if (mine != g_overlay_overrides.end()) return &mine->second;
@@ -241,12 +243,14 @@ const FunctionEntry* FindInOverlay(u32 address, bool* in_overlay) {
     return nullptr;
 }
 
-const FunctionEntry* Find(u32 address) {
+// `overlay`, if given, is set to the name of the overlay whose function it is;
+// it is left alone for the executable's.
+const FunctionEntry* Find(u32 address, const char** overlay = nullptr) {
     auto found = g_overrides.find(address);
     if (found != g_overrides.end()) return &found->second;
     if (g_overlay_count) {
         bool in_overlay = false;
-        const FunctionEntry* entry = FindInOverlay(address, &in_overlay);
+        const FunctionEntry* entry = FindInOverlay(address, &in_overlay, overlay);
         if (entry || in_overlay) return entry;
     }
     const FunctionEntry* end = g_table + g_count;
@@ -411,9 +415,13 @@ void Note(const std::string& key, const std::string& text) {
     }
 }
 
-void Dispatch(lifted::Context& c, u32 address) {
+namespace {
+
+// A call to `address` - a jal, a jalr, the kernel entering a thread or a
+// handler - or, `jump`, a jump out of a function to it (lifted::TailCall).
+void Enter(lifted::Context& c, u32 address, bool jump) {
     CachedCall& line = g_call_cache[(address >> 2) & (kCallCache - 1)];
-    if (line.address == address && line.entry && g_watch.empty()) {
+    if (line.address == address && line.entry && g_watch.empty() && (jump || line.called)) {
         ++*line.count;
         if (g_trace) std::fprintf(stderr, "[call] %s\n", Describe(address).c_str());
         Frame frame(address);
@@ -428,7 +436,8 @@ void Dispatch(lifted::Context& c, u32 address) {
         }
         return;
     }
-    const FunctionEntry* entry = Find(address);
+    const char* overlay = "";
+    const FunctionEntry* entry = Find(address, &overlay);
     const bool cacheable = entry && entry->function;     // the program's own, or an override
     if (!entry || !entry->function) {
         if (const FunctionEntry* copy = FindCopy(address)) entry = copy;
@@ -446,7 +455,11 @@ void Dispatch(lifted::Context& c, u32 address) {
     u64& count = RunStats().calls[address];
     if (++count == 1 || g_trace)
         std::fprintf(stderr, "[call] %s\n", Describe(address).c_str());
-    if (cacheable) line = CachedCall{address, entry, &count};
+    // A jump lands on a function's start as often as on code inside one - a
+    // switch's case, the code after a function cut short; a call starts one.
+    const std::pair<u32, std::string> key{address, overlay};
+    if (!jump) RunStats().called.insert(key);
+    if (cacheable) line = CachedCall{address, entry, &count, !jump || RunStats().called.count(key) != 0};
     if (std::find(g_watch.begin(), g_watch.end(), address) != g_watch.end()) {
         std::fprintf(stderr, "[watch] %s a0=%016llX a1=%016llX a2=%016llX a3=%016llX "
                      "f12=%08X f13=%08X ra=%08X s0=%08X s1=%08X sp=%08X gp=%08X t0=%08X\n",
@@ -473,6 +486,10 @@ void Dispatch(lifted::Context& c, u32 address) {
                      Describe(address).c_str(), (unsigned long long)c.r[2], c.f[0],
                      unsigned(c.r[16]), unsigned(c.r[17]), unsigned(c.r[29]));
 }
+
+}  // namespace
+
+void Dispatch(lifted::Context& c, u32 address) { Enter(c, address, false); }
 
 namespace {
 
@@ -612,6 +629,15 @@ void Report(const Options& options, const std::string& outcome) {
         if (out) {
             for (const auto& [run, source] : stats.discovered)
                 std::fprintf(out, "0x%08X 0x%08X\n", run, source);
+            std::fclose(out);
+        }
+    }
+    if (!options.called_path.empty()) {
+        // Merged with what earlier runs called, as the discoveries are.
+        std::FILE* out = std::fopen(options.called_path.c_str(), "a");
+        if (out) {
+            for (const auto& [address, overlay] : stats.called)
+                std::fprintf(out, "0x%08X%s%s\n", address, overlay.empty() ? "" : " ", overlay.c_str());
             std::fclose(out);
         }
     }
@@ -927,6 +953,7 @@ int Main(int argc, char** argv) {
         else if (arg == "--limit" && i + 1 < argc) options.report_limit = std::stoi(argv[++i]);
         else if (arg == "--timeout" && i + 1 < argc) options.timeout_seconds = std::stoi(argv[++i]);
         else if (arg == "--discover" && i + 1 < argc) options.discover_path = argv[++i];
+        else if (arg == "--called" && i + 1 < argc) options.called_path = argv[++i];
         else if (arg == "--disc" && i + 1 < argc) options.disc_path = argv[++i];
         else if (arg == "--watch" && i + 1 < argc)
             options.watch.push_back(u32(std::stoul(argv[++i], nullptr, 16)));
@@ -970,7 +997,7 @@ void Call(Context& c, u32 target) { ps2host::Dispatch(c, target); }
 void TailCall(Context& c, u32 target, u32 /*return_address*/, u32 /*entry_sp*/) {
     // The guest jumps and never comes back here; natively, the callee runs and
     // the translated function returns straight after (it emits `return;`).
-    ps2host::Dispatch(c, target);
+    ps2host::Enter(c, target, true);
 }
 
 void Syscall(Context& c) { ps2host::KernelSyscall(c); }

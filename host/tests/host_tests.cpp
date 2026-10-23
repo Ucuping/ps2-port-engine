@@ -1776,6 +1776,7 @@ void OverlaysRunWhatIsLoaded() {
     ps2host::CodeChanged();
     ps2host::Dispatch(c, 0x00500000u);
     Check(g_overlay_ran == 2, "overlays: the loaded one's function runs");
+    Check(ps2host::RunStats().called.count({0x00500000u, "b"}) == 1, "overlays: the call is recorded as the loaded one's");
     for (int i = 0; i < 4; ++i) m.Write(0x00500000u + 4 * i, a_checks[i], 4);
     ps2host::CodeChanged();
     ps2host::Dispatch(c, 0x00500000u);
@@ -1790,6 +1791,34 @@ void OverlaysRunWhatIsLoaded() {
     }
     Check(refused, "overlays: code neither overlay's is not run as either");
     ps2host::RegisterOverlays(nullptr, 0);
+}
+
+// The run records where a call enters - a function's start, which confirms one
+// the analysis only guessed (tools/confirm.py) - and not where a jump lands: a
+// jump lands inside functions too. A function a jump entered first is recorded
+// at its first call all the same, though the jump cached it.
+int g_entered = 0;
+void Entered(lifted::Context&) { ++g_entered; }
+
+void CallsAreRecordedNotJumps() {
+    static const ps2host::FunctionEntry table[] = {
+        {0x00600000u, Entered, "called", 8u},
+        {0x00600010u, Entered, "jumped to", 8u},
+        {0x00600020u, Entered, "jumped to, then called", 8u},
+    };
+    ps2host::RegisterFunctions(table, 3);
+    auto recorded = [](u32 address) { return ps2host::RunStats().called.count({address, std::string()}) == 1; };
+    lifted::Context c{};
+    lifted::Call(c, 0x00600000u);
+    lifted::TailCall(c, 0x00600010u, 0, 0);
+    lifted::TailCall(c, 0x00600020u, 0, 0);
+    Check(recorded(0x00600000u), "calls: a call's target is recorded");
+    Check(!recorded(0x00600010u) && !recorded(0x00600020u), "calls: a jump's is not");
+    lifted::Call(c, 0x00600020u);
+    lifted::Call(c, 0x00600020u);
+    Check(recorded(0x00600020u), "calls: a function a jump entered first, at its first call");
+    Check(g_entered == 5 && ps2host::RunStats().calls[0x00600020u] == 3, "calls: every entry runs and is counted");
+    ps2host::RegisterFunctions(nullptr, 0);
 }
 
 // Code met at run time is looked for in every segment the executable loaded,
@@ -1888,6 +1917,7 @@ void SegmentsKeepTheirBytes() {
 
 int main() {
     OverlaysRunWhatIsLoaded();
+    CallsAreRecordedNotJumps();
     CopiedCodeIsFoundInEverySegment();
     SegmentsKeepTheirBytes();
     MirrorsReachTheSameRam();

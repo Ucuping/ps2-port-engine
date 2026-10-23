@@ -111,6 +111,7 @@ struct Options {
     int report_limit = 40;         /* how many entries each report section lists */
     int timeout_seconds = 30;      /* stop and report a run that goes on longer */
     std::string discover_path;     /* where to record code found copied at run time */
+    std::string called_path;       /* where to record the functions entered by a call (--called) */
     std::vector<u32> watch;        /* functions whose every call logs its argument registers */
     std::vector<u32> peek;         /* guest addresses whose 64 bytes the report shows */
     std::string dump_ram;          /* --dump-ram FILE: the EE's 32 MB of RAM, written as the run ends */

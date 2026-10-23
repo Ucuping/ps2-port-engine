@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <map>
+#include <set>
 #include <string>
 #include <functional>
 #include <vector>
@@ -51,7 +52,7 @@ u32 LoadExecutable(const std::string& name, std::vector<u8> data);
 
 /* What the run touched, for the report at the end. */
 struct Stats {
-    std::map<u32, u64> calls;                  /* function -> times called */
+    std::map<u32, u64> calls;                  /* function -> times entered, by a call or a jump */
     std::map<s32, u64> syscalls;               /* service -> times called, beyond the array's */
     u64 syscall_counts[0x200] = {};            /* service + 0x100 -> times called */
     std::vector<u32> stopped_in;               /* the stack when the run stopped */
@@ -59,6 +60,11 @@ struct Stats {
     std::vector<std::string> notes;            /* one line per first-time event */
     /* Code run where it was copied to: (run address, the executable's copy). */
     std::vector<std::pair<u32, u32>> discovered;
+    /* The functions entered by a call - a jal, a jalr, the kernel entering a
+       thread or a handler - rather than by a jump: (address, the overlay whose
+       function it is, "" for the executable's). Where a call enters, a function
+       starts: the record tools/confirm.py takes the run's confirmations from. */
+    std::set<std::pair<u32, std::string>> called;
 };
 Stats& RunStats();
 

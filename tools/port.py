@@ -21,7 +21,9 @@ extension, an overlay - and run where it was copied to. The host records each
 such call it meets with the code's source in the executable (--discover); this
 translates those at their run addresses and builds again, until a run finds
 nothing new. They are translated, not verified: nothing tests them against the
-interpreter, which never sees them run.
+interpreter, which never sees them run. Each run also records the functions a
+call entered (--called, build/port/called.txt): where a call enters, a function
+starts, which confirms one the analysis only guessed (tools/confirm.py).
 
 Nothing from the disc is built into the port: the executable is loaded at run
 time, from the game's extracted/ directory.
@@ -418,6 +420,11 @@ def discoveries_path(game) -> str:
     return game.path(os.path.join(game.build, "port", "discovered.txt"))
 
 
+def called_path(game) -> str:
+    """Where the runs record the functions a call entered (tools/confirm.py)."""
+    return game.path(os.path.join(game.build, "port", "called.txt"))
+
+
 def run(game, executable: str, extra) -> int:
     elf = game.path(os.path.join(game.extracted, game.executable))
     if not os.path.exists(elf):
@@ -431,7 +438,8 @@ def run(game, executable: str, extra) -> int:
         if "--timeout" in extra and extra.index("--timeout") + 1 < len(extra):
             timeout = int(extra[extra.index("--timeout") + 1])
         try:
-            result = subprocess.run([executable, elf, "--discover", discoveries_path(game)]
+            result = subprocess.run([executable, elf, "--discover", discoveries_path(game),
+                                     "--called", called_path(game)]
                                     + options + list(extra), stdout=out, stderr=subprocess.STDOUT,
                                     timeout=timeout + HOST_GRACE_SECONDS, env=_game_env())
             code = result.returncode
