@@ -135,8 +135,9 @@ struct GsDrawState {
     /* A game's tag on the draw (the bridge's SetGpuDrawTag, by the texture
        it samples): bit 0 a car's paint sampling a sphere map, its colour
        scaled by a Fresnel term from the texel's place in the map (gs.frag);
-       bit 1 mipmapped textures filtered as a modern GPU does (SampleModern);
-       bit 2 a soft particle, faded near the scene's depth (kSceneDepth). */
+       bit 1 mipmapped textures filtered as a modern GPU does (SampleModern,
+       up to 1 << bits 8-10 taps along the footprint: 1 trilinear); bit 2 a
+       soft particle, faded near the scene's depth (kSceneDepth). */
     std::uint32_t tag = 0;
 };
 

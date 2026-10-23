@@ -93,6 +93,15 @@ std::atomic<u32> g_rule_begin{0}, g_rule_end{0}, g_rule_fbw{0};
 // (PS2HOST_MODERN_TEXTURES=1: on from the start - a capture's replay)
 std::atomic<bool> g_modern_textures{std::getenv("PS2HOST_MODERN_TEXTURES") != nullptr};
 void SetGpuModernTextures(bool on) { g_modern_textures = on; }
+// SetGpuTextureFilter's: the filter (0 the game's) and the anisotropic taps'
+// log2 (GsDrawState::tag bits 8-10).
+std::atomic<int> g_texture_filter{0}, g_texture_taps{3};
+void SetGpuTextureFilter(int filter, int taps) {
+    int log2 = 0;
+    while (log2 < 4 && (2 << log2) <= taps) ++log2;
+    g_texture_filter = filter;
+    g_texture_taps = filter == 4 ? log2 : 0;
+}
 
 std::string g_gpu_name;         // GpuName
 std::string GpuName() { return g_gpu_name; }
@@ -1798,7 +1807,7 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     state.gouraud = gouraud;
     state.textured = (call.prim >> 4) & 1;
     if (state.textured && Bits(c.tex0, 0, 14) == g_tag_tbp.load(std::memory_order_relaxed)) state.tag = g_tag_bits;
-    if (state.textured && g_modern_textures.load(std::memory_order_relaxed)) state.tag |= 2u;
+    if (state.textured && g_modern_textures.load(std::memory_order_relaxed)) state.tag |= 2u | 3u << 8;  // (8 taps)
     // A soft particle: a game's particle texture, blended and depth tested,
     // drawn after its view's effects (the scene's depth saved then).
     if (g_after_effects && state.textured && ((call.prim >> 6) & 1) && Bits(c.test, 16, 1)) {
@@ -1957,6 +1966,23 @@ void OnDraw(const gs::Gs::DrawCall& call) {
         // Mipmapped, per pixel (gs.frag's Sample): the levels decoded with it
         // (CachedTexture). A texture of K alone that never minifies, as before.
         state.mip = s.primary && !state.texture_target ? gs::MipMode(c) : 0;
+        // The player's filtering (SetGpuTextureFilter), on the 3D draws.
+        const int filter = g_texture_filter.load(std::memory_order_relaxed);
+        if (filter && type != 6 && !state.texture_target) {
+            u32 m = state.mip;
+            constexpr u32 kMmin = 7u << 5, kMmag = 1u << 8;
+            state.tag &= ~(2u | 7u << 8);
+            if (filter == 1) {                  // nearest: the nearest level's nearest texel
+                state.bilinear = false;
+                if (m) m = (m & ~(kMmin | kMmag)) | 2u << 5;
+            } else {                            // bilinear in a level; trilinear and anisotropic as modern
+                state.bilinear = true;
+                if (m) m = (m & ~kMmin) | kMmag | (filter == 2 ? 4u : 5u) << 5;
+                if (m && filter >= 3)
+                    state.tag |= 2u | u32(g_texture_taps.load(std::memory_order_relaxed)) << 8;
+            }
+            state.mip = m;
+        }
         state.wms = Bits(c.clamp, 0, 2);
         state.wmt = Bits(c.clamp, 2, 2);
         state.minu = Bits(c.clamp, 4, 10);

@@ -57,7 +57,9 @@ layout(push_constant) uniform Params {
     uint scale;         // a target drawn larger (the internal resolution): its pixels to a GS texel
     uint blend_ops;     // bits 0-7, SHADER_BLEND: ALPHA's A, B, C, D, two bits each; 8-15: Snap's scale;
                         // 16: a 16-bit target (five bits a channel stored); 17-18: its blend made
-                        // by the blender (gs_renderer.cpp's Blender16): 1 S written, 2 added, 3 taken away
+                        // by the blender (gs_renderer.cpp's Blender16): 1 S written, 2 added, 3 taken away;
+                        // 19 the paint's Fresnel term; 20 modern filtering, 22-24 log2 of its most taps;
+                        // 21 a soft particle
 } p;
 
 // What a draw may use, from its parameters (gs_renderer.cpp's Features): a
@@ -279,12 +281,15 @@ vec4 ReplacedSample(vec2 r, float footprint) {
    between levels (no bands where the level changes), and up to eight taps
    along the footprint's long axis (anisotropic: the road ahead sharp, not
    smeared). `dx`, `dy` the coordinate's change a pixel, in level 0's
-   texels. */
-vec4 SampleModern(vec2 uv, vec2 dx, vec2 dy, int mxl) {
+   texels; `most` the taps at most (the player's anisotropy; 1: trilinear,
+   the level the footprint's as it is - finer would shimmer, nothing to
+   calm it). */
+vec4 SampleModern(vec2 uv, vec2 dx, vec2 dy, int mxl, float most) {
     const float lx = length(dx), ly = length(dy);
     const float major = max(lx, ly), minor = max(min(lx, ly), 1e-4);
-    const float taps = clamp(ceil(major / minor), 1.0, 8.0);
-    const float lod = clamp(log2(max(major / taps, 1e-4)) - 1.0, 0.0, float(mxl));     // (a level finer: sharp, the taps keep it calm)
+    const float taps = clamp(ceil(major / minor), 1.0, most);
+    const float bias = most > 1.0 ? 1.0 : 0.0;     // (a level finer: sharp, the taps keep it calm)
+    const float lod = clamp(log2(max(major / taps, 1e-4)) - bias, 0.0, float(mxl));
     const int n = int(floor(lod));
     const float f = lod - float(n);
     const vec2 axis = lx > ly ? dx : dy;
@@ -354,7 +359,8 @@ void main() {
             t = ReplacedSample(uv * k, sqrt(max(dot(dx, dx), dot(dy, dy))));
         } else if (Has(kMip) && ((p.blend_ops >> 20) & 1u) != 0u && (p.bilinear & 2u) != 0u) {
             const vec2 r = coordinate.xy / coordinate.z * vec2(TextureSize());
-            t = SampleModern(uv, dFdx(r), dFdy(r), int((p.bilinear >> 2) & 7u));
+            t = SampleModern(uv, dFdx(r), dFdy(r), int((p.bilinear >> 2) & 7u),
+                             float(1u << ((p.blend_ops >> 22) & 7u)));
         } else {
             t = Sample(uv);
         }

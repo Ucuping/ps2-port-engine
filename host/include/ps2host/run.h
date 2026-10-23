@@ -614,6 +614,15 @@ void SetGpuDrawTag(u32 tbp, u32 tag);
    the footprint on screen (finer at an internal resolution), trilinear,
    anisotropic - not by the GS's depth-based level (GsDrawState::tag bit 1). */
 void SetGpuModernTextures(bool on);
+/* The texture filtering a player chose, over the game's own (TEX1) on its
+   3D draws - not on sprites (the HUD, text, a picture's copies and effects,
+   drawn texel for texel) or a draw that samples a target (render to
+   texture), which the game's filtering keeps exact. 0 the game's (with
+   SetGpuModernTextures as it says); 1 nearest; 2 bilinear (the nearest
+   mipmap level); 3 trilinear (the level from the footprint on screen, two
+   mixed); 4 anisotropic, `taps` (2-16) along the footprint's long axis -
+   both of those as SetGpuModernTextures filters, on mipmapped textures. */
+void SetGpuTextureFilter(int filter, int taps = 8);
 /* In real time, the EE asleep until something it waits on may have come - a
    blank, a timer, an interrupt to deliver, an IOP reply - for a game's wait
    loop whose turns call a function (Burnout 3's packet wait): its turns
