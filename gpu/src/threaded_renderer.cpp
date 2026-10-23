@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -310,19 +311,45 @@ public:
         }
         scale_ = inner_->Scale();
     }
+    /* Queued with its data, in its place among the draws - not the queue
+       drained first and the GS thread waiting for the renderer at every new
+       replacement (a view's new textures, one after another). Refused here
+       as the renderer would: a format it cannot take. */
     bool UploadReplacement(std::uint64_t id, std::uint32_t format, std::uint32_t width, std::uint32_t height,
                            std::uint32_t levels, const std::uint8_t* data, std::size_t bytes) override {
-        Drain(1);
-        return inner_->UploadReplacement(id, format, width, height, levels, data, bytes);
+        if (format > 4 || width == 0 || height == 0 || (format != 0 && !BlockCompression())) return false;
+        const std::uint32_t a[4] = {format, width, height, levels};
+        Op(kUploadReplacement, 8 + sizeof a + bytes);
+        Put(&id, 8);
+        Put(a, sizeof a);
+        Put(data, bytes);
+        End();
+        queued_replacements_[id] = std::chrono::steady_clock::now();
+        return true;
     }
     // Asked each draw of a replaced texture: the renderer's own answer, safe
     // from here, not after the queue drains (that was half the GS thread
-    // with a texture pack). One evicted meanwhile is drawn once as the game
-    // has it - as the renderer does for any it no longer holds.
-    bool HasReplacement(std::uint64_t id) const override { return inner_->HasReplacement(id); }
+    // with a texture pack) - or one queued and not yet made (for a few
+    // seconds at most: one the renderer could not make, or made and evicted
+    // unseen, is then asked again). One evicted meanwhile is drawn once as
+    // the game has it - as the renderer does for any it no longer holds.
+    bool HasReplacement(std::uint64_t id) const override {
+        if (inner_->HasReplacement(id)) {
+            if (!queued_replacements_.empty()) queued_replacements_.erase(id);
+            return true;
+        }
+        const auto queued = queued_replacements_.find(id);
+        if (queued == queued_replacements_.end()) return false;
+        if (std::chrono::steady_clock::now() - queued->second < std::chrono::seconds(3)) return true;
+        queued_replacements_.erase(queued);
+        return false;
+    }
     bool BlockCompression() const override {
-        Drain(3);
-        return inner_->BlockCompression();
+        if (block_compression_ < 0) {
+            Drain(3);
+            block_compression_ = inner_->BlockCompression() ? 1 : 0;
+        }
+        return block_compression_ != 0;
     }
     bool HasTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm) const override {
         Drain(4);
@@ -363,8 +390,12 @@ private:
         kDraw, kDrawSame, kFlush, kKick, kUploadTexture, kUseReplacement, kUploadDepth, kUploadTarget,
         kReleaseTexture, kMemoryWrite, kMemoryPatch, kTargetFromMemory, kDepthFromMemory, kTextureFromMemory,
         kClutFromMemory, kClutRows, kReloadKeepsColour, kTargetRowsFromMemory, kDepthRowsFromMemory,
-        kTargetToMemory, kDepthToMemory, kChannelShuffle, kRunEffect,
+        kTargetToMemory, kDepthToMemory, kChannelShuffle, kRunEffect, kUploadReplacement,
     };
+    // UploadReplacement's queued and not yet seen made, by id (the GS
+    // thread's alone); the device's block compression, asked once.
+    mutable std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> queued_replacements_;
+    mutable int block_compression_ = -1;
     // The images the queue has made by its end, as VulkanGsRenderer makes
     // them: a target by (FBP, FBW, PSM) at the size first asked for, a depth
     // buffer by (ZBP, width, height); all dropped by a new scale.
@@ -540,6 +571,14 @@ private:
                 case kClutFromMemory: r.ClutFromMemory(Take<GsClutLoad>(at)); break;
                 case kChannelShuffle: r.ChannelShuffle(Take<GsShuffle>(at)); break;
                 case kRunEffect: r.RunEffect(Take<GsEffect>(at)); break;
+                case kUploadReplacement: {
+                    const auto id = Take<std::uint64_t>(at);
+                    std::uint32_t a[4];
+                    std::memcpy(a, at, sizeof a);
+                    at += sizeof a;
+                    r.UploadReplacement(id, a[0], a[1], a[2], a[3], at, std::size_t(next - at));
+                    break;
+                }
                 case kClutRows: {
                     const auto rows = Take<std::uint32_t>(at);
                     std::memcpy(clut_, at, sizeof clut_);

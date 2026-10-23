@@ -3,6 +3,12 @@
 
 #include "ps2host/texture_pack.h"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -703,7 +709,15 @@ std::size_t Open(const std::string& directory) {
         if (count && pack.readers.empty()) {
             const unsigned cores = std::thread::hardware_concurrency();
             const unsigned n = cores >= 8 ? 3 : cores >= 4 ? 2 : 1;
-            for (unsigned i = 0; i < n; ++i) pack.readers.emplace_back([&pack] { pack.Read(); });
+            for (unsigned i = 0; i < n; ++i)
+                pack.readers.emplace_back([&pack] {
+#ifdef _WIN32
+                    // Below the game's threads: a view's new files a moment
+                    // later, never the game's work.
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+                    pack.Read();
+                });
         }
     }
     g_count = count;
