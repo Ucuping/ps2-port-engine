@@ -149,7 +149,25 @@ stub dispatch table, every test) checks that it still builds and passes.
   servers (the EE's RPC end now reaches the module's client) and its
   request-by-request serving. `Disc::List` gives a directory's entries.
   modload's SearchModuleByName answers 1 for a name no module recorded has,
-  as the DirtySock stub answered every name before.
+  as the DirtySock stub answered every name before, and logs each name it
+  answers so.
+- VU0's flags in macro mode: the clip flag (`vclipw`'s last four
+  judgements) and the status flag's Z and S with their sticky copies, in
+  the interpreter and the lifted code alike; verification compares them as
+  the rest of the state. The MAC flag and the O, U, I and D bits are not
+  kept, and `cfc2` of vi17 stays refused. The host's VU interpreter keeps
+  its own flags, unchanged.
+- A CPU-model choice, `cop0_status` in game.json (`ps2decomp/cpumodel.py`),
+  off by default: Status reads IE, and EIE until `di` and again after `ei`,
+  per thread; every other COP0 register still reads 0. The interpreter and
+  the lifted code follow it alike, and the verdict cache's inputs include
+  it. Tekken 5 turns it on: its thread start refuses while Status says
+  interrupts are disabled. (Each interpreted call starts enabled since
+  8e1fad4: before it, a run left between `di` and `ei` carried into the
+  next call on the same machine.)
+- `ps2host::iop::AwaitServer`: an EE bind to a server that a module in the
+  IOP interpreter will register gets server 0 until the module registers
+  it, so the EE binds again; the port names the servers.
 
 Found and not yet changed, with the evidence in the Tekken 5 repository's
 `games/tekken5/docs/FINDINGS.md` ("Engine findings worth upstreaming"): a call
