@@ -194,6 +194,9 @@ stub dispatch table, every test) checks that it still builds and passes.
   interpreter runs: stopped if they said at their start they can be, and
   unloaded once nothing points into them any more. A module whose services
   are the host's stays resident.
+- The IOP notes a module loaded while one of its name still is, and an RPC
+  server registered while one of its id still is, with both: which of the
+  two a game reaches is the host's choice.
 
 Found and not yet changed, with the evidence in the Tekken 5 repository's
 `games/tekken5/docs/FINDINGS.md` ("Engine findings worth upstreaming"): a call
@@ -204,4 +207,6 @@ compiled check catches and drops; `callers_known` holds for an executable
 whose own modules, loaded at run time, call it, until they are listed as
 overlays; a store made in kernel mode and ended by `eret` has no
 translation (Tekken 5 overrides its one; if another game has the same form,
-the lifter should learn it).
+the lifter should learn it); a VIFcode's interrupt bit is ignored - VIF1
+raises no interrupt and VIF1_STAT never shows INT - so a game that waits for
+it to let PATH3 go on waits for ever (Tekken 5's texture uploads).
