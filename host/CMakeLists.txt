@@ -214,6 +214,7 @@ add_executable(ps2host_tests ${CMAKE_CURRENT_LIST_DIR}/tests/host_tests.cpp
 target_link_libraries(ps2host_tests PRIVATE ps2host)
 if(PS2HOST_VULKAN)
     target_compile_definitions(ps2host_tests PRIVATE PS2HOST_VULKAN=1)
+    ps2gpu_build_rpath(ps2host_tests)       # engine/gpu/CMakeLists.txt
 endif()
 # The IOP interpreter's internals, for its instruction tests; the runtime's
 # float-mode tests, which run here too.
@@ -238,6 +239,7 @@ if(PS2HOST_VULKAN AND NOT WIN32)
     add_executable(ps2host_sdl_tests ${CMAKE_CURRENT_LIST_DIR}/tests/sdl_display_tests.cpp)
     target_link_libraries(ps2host_sdl_tests PRIVATE ps2host)
     target_include_directories(ps2host_sdl_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
+    ps2gpu_build_rpath(ps2host_sdl_tests)
 endif()
 
 # ps2_add_port(<target>
@@ -266,6 +268,9 @@ function(ps2_add_port target)
         target_link_libraries(${target} PRIVATE ps2_cpu_check)
     endif()
     target_link_libraries(${target} PRIVATE ps2host)
+    if(COMMAND ps2gpu_build_rpath)
+        ps2gpu_build_rpath(${target})       # engine/gpu/CMakeLists.txt
+    endif()
     if(PORT_GAME)
         get_filename_component(game_dir ${PORT_GAME} ABSOLUTE)
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${game_dir}/game.json)

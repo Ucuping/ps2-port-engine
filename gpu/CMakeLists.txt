@@ -133,7 +133,29 @@ else()
     target_compile_options(ps2gpu PRIVATE -ffp-contract=off)
 endif()
 
+# macOS: the Vulkan loader is opened at run time by its bare name (volk, SDL),
+# which dyld looks for in the executable's rpaths - and a Homebrew prefix is
+# in none of its own places. For development, the folder of the loader found
+# on this machine goes into the rpath of the executables built here: the
+# build rpath only, which nothing installed keeps, and no folder written in.
+# A release carries the loader and MoltenVK in its app bundle instead, with
+# PS2GPU_VULKAN_BUILD_RPATH off.
+if(APPLE)
+    option(PS2GPU_VULKAN_BUILD_RPATH "macOS: executables built here find this machine's Vulkan loader" ON)
+    if(PS2GPU_VULKAN_BUILD_RPATH)
+        find_library(PS2GPU_VULKAN_LOADER NAMES vulkan vulkan.1 DOC "The Vulkan loader, for the build rpath")
+    endif()
+endif()
+function(ps2gpu_build_rpath target)
+    if(APPLE AND PS2GPU_VULKAN_BUILD_RPATH AND PS2GPU_VULKAN_LOADER)
+        get_filename_component(folder ${PS2GPU_VULKAN_LOADER} DIRECTORY)
+        set_property(TARGET ${target} APPEND PROPERTY BUILD_RPATH ${folder})
+    endif()
+endfunction()
+
 add_executable(ps2gpu_smoke ${CMAKE_CURRENT_LIST_DIR}/tests/display_smoke.cpp)
 target_link_libraries(ps2gpu_smoke PRIVATE ps2gpu)
+ps2gpu_build_rpath(ps2gpu_smoke)
 add_executable(ps2gpu_tests ${CMAKE_CURRENT_LIST_DIR}/tests/renderer_tests.cpp)
 target_link_libraries(ps2gpu_tests PRIVATE ps2gpu)
+ps2gpu_build_rpath(ps2gpu_tests)
