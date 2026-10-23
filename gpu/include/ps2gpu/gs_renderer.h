@@ -215,6 +215,9 @@ public:
     virtual void UseReplacement(std::uint64_t key, std::uint64_t id) { (void)key, (void)id; }
     /* Whether block-compressed replacements can be uploaded as they are. */
     virtual bool BlockCompression() const { return false; }
+    /* Whether a channel FBMSK masks only in part is drawn exactly: with the
+       device's logic ops. A device without them (MoltenVK) writes it whole. */
+    virtual bool ExactPartialMasks() const { return true; }
     /* A depth buffer's contents, one Z per pixel, rows top-down: what local
        memory holds there (the GS's Z, unsigned). */
     virtual void UploadDepth(std::uint32_t zbp, std::uint32_t width, std::uint32_t height,

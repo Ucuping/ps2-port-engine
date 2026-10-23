@@ -11,10 +11,32 @@
 namespace {
 
 int g_failures = 0;
+/* Inside KnownFailure: why the device fails what it checks, and how often. */
+const char* g_known = nullptr;
+int g_known_failures = 0;
 
 void Check(bool ok, const char* what) {
-    if (!ok) {
-        std::printf("FAIL: %s\n", what);
+    if (ok) return;
+    if (g_known) {
+        std::printf("KNOWN FAILURE: %s (%s)\n", what, g_known);
+        ++g_known_failures;
+        return;
+    }
+    std::printf("FAIL: %s\n", what);
+    ++g_failures;
+}
+
+/* A test this device is known to fail, for `why`: run all the same, each
+   failure reported as known. Passing would mean the mark is out of date,
+   which fails. */
+template <typename Test>
+void KnownFailure(const char* why, Test&& test) {
+    const int before = g_known_failures;
+    g_known = why;
+    test();
+    g_known = nullptr;
+    if (g_known_failures == before) {
+        std::printf("FAIL: passes, though marked as known to fail (%s): the mark is out of date\n", why);
         ++g_failures;
     }
 }
@@ -416,6 +438,12 @@ int main() {
     std::string error;
     auto gpu = ps2gpu::CreateGpu(&error);
     if (!gpu) {
+        // PS2GPU_REQUIRE: where a GPU is meant to be found (the Mac's
+        // MoltenVK, say), not finding one fails rather than skips.
+        if (std::getenv("PS2GPU_REQUIRE")) {
+            std::printf("FAIL: no GPU, though PS2GPU_REQUIRE is set: %s\n", error.c_str());
+            return EXIT_FAILURE;
+        }
         std::printf("no GPU: %s (skipped)\n", error.c_str());
         return 0;
     }
@@ -437,8 +465,18 @@ int main() {
     Addressed(*renderer);
     RenderToTexture(*renderer);
     TargetFromMemory(*renderer);
-    PartlyMaskedChannels(*renderer);
+    // A device without logic ops - MoltenVK, built without Apple's private
+    // Metal API - writes a channel FBMSK masks in part whole (gs_renderer.cpp),
+    // so this fails there: known, reported, not skipped. Reading the target
+    // in the shader (VK_KHR_dynamic_rendering_local_read) is the way round
+    // it, for when a game shows the difference.
+    if (renderer->ExactPartialMasks()) PartlyMaskedChannels(*renderer);
+    else KnownFailure("no logic ops on this device: a channel FBMSK masks in part is written whole",
+                      [&] { PartlyMaskedChannels(*renderer); });
     if (g_failures) std::printf("gpu renderer tests: %d failed\n", g_failures);
+    else if (g_known_failures)
+        std::printf("gpu renderer tests: all passed but %d known failure(s) (%s)\n", g_known_failures,
+                    gpu->Describe().c_str());
     else std::printf("gpu renderer tests: all passed (%s)\n", gpu->Describe().c_str());
     return g_failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

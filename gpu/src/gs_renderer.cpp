@@ -433,6 +433,7 @@ public:
     }
     void UseReplacement(std::uint64_t key, std::uint64_t id) override { textures_[key].replacement = id; }
     bool BlockCompression() const override { return g_.bc; }
+    bool ExactPartialMasks() const override { return g_.logic_op; }
     void UploadDepth(std::uint32_t zbp, std::uint32_t width, std::uint32_t height, const std::uint32_t* z) override;
     void UploadTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, const std::uint32_t* pixels,
                       std::uint32_t width, std::uint32_t height) override;

@@ -279,6 +279,8 @@ public:
         Drain(3);
         return inner_->BlockCompression();
     }
+    // The device's, fixed as it was made: nothing queued changes it.
+    bool ExactPartialMasks() const override { return inner_->ExactPartialMasks(); }
     bool HasTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm) const override {
         Drain(4);
         return inner_->HasTarget(fbp, fbw, psm);
