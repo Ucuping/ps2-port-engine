@@ -183,6 +183,17 @@ stub dispatch table, every test) checks that it still builds and passes.
   drawn exactly (logic ops). The renderer's tests mark
   `PartlyMaskedChannels` a known failure where it is not - run and
   reported, not skipped - and `PS2GPU_REQUIRE` makes a missing GPU fail.
+- The EE kernel answers ReferSemaStatus and iReferSemaStatus (ps2sdk's
+  `ee_sema_t`: count, max_count, init_count, wait_threads, attr, option),
+  CreateSema keeping the attributes and option it was given. A game that
+  takes a result's address from a semaphore's option got nothing.
+- The IOP heap refuses a size that would wrap when rounded up (0xFFFFFFFF),
+  as sysmem refuses what no free block holds.
+- loadfile's module requests (procedures 9, 7, 8: search by name, stop,
+  unload) are answered as modload does, for the modules the IOP
+  interpreter runs: stopped if they said at their start they can be, and
+  unloaded once nothing points into them any more. A module whose services
+  are the host's stays resident.
 
 Found and not yet changed, with the evidence in the Tekken 5 repository's
 `games/tekken5/docs/FINDINGS.md` ("Engine findings worth upstreaming"): a call
