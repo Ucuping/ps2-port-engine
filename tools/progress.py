@@ -24,7 +24,10 @@ Nor is a function the analysis guessed - found by the prologue scan or
 recovered from the gaps rather than called, pointed to or entered
 (game.confidence_label) - counted with the others: it may not be a function at
 all. Such functions are counted apart, tier by tier, and the figures above leave
-them out.
+them out - unless another source confirms one (game.json's "confirmed",
+tools/confirm.py): a call a run saw enter it, Ghidra's analysis of the same
+image. Passing its tests confirms nothing: a piece of a function passes them as
+well as a function does.
 
     python engine/tools/progress.py
     python engine/tools/progress.py --markdown > games/burnout3/docs/PROGRESS.md
@@ -77,10 +80,18 @@ def _by_tier(functions, status: dict) -> dict:
     return by_tier
 
 
-def summarise(database: dict, status: dict) -> dict:
+def summarise(database: dict, status: dict, confirmed=None) -> dict:
     # What the analysis is sure is a function, and what it guessed: counted apart.
-    functions = [f for f in database["functions"] if game_config.confidence_label(f) == "high"]
-    guessed = [f for f in database["functions"] if game_config.confidence_label(f) != "high"]
+    # A guessed function another source confirms (`confirmed`) counts as sure.
+    functions = [f for f in database["functions"]
+                 if game_config.confidence_label(f, confirmed) == "high"]
+    guessed = [f for f in database["functions"]
+               if game_config.confidence_label(f, confirmed) != "high"]
+    by_confirmation = {}
+    for f in functions:
+        if game_config.confidence_label(f) != "high":
+            for source in confirmed[f["addr"]].split("+"):
+                by_confirmation[source] = by_confirmation.get(source, 0) + 1
     total_functions = len(functions)
     total_code = sum(f["size"] for f in functions)
     by_tier = _by_tier(functions, status)
@@ -97,6 +108,8 @@ def summarise(database: dict, status: dict) -> dict:
         "total_functions": total_functions,
         "total_code": total_code,
         "by_tier": by_tier,
+        "confirmed_functions": sum(1 for f in functions if game_config.confidence_label(f) != "high"),
+        "confirmed_by": by_confirmation,
         "guessed_functions": len(guessed),
         "guessed_code": sum(f["size"] for f in guessed),
         "guessed_by_tier": _by_tier(guessed, status),
@@ -107,6 +120,11 @@ def summarise(database: dict, status: dict) -> dict:
         "conf_called": stats.get("conf_called", 0),
         "conf_prologue": stats.get("conf_prologue", 0),
     }
+
+
+def _sources(counts: dict) -> str:
+    """"run 12, ghidra 30": how many confirmations each source gave."""
+    return ", ".join("%s %s" % (source, format(counts[source], ",")) for source in sorted(counts))
 
 
 def _pct(part: int, whole: int) -> float:
@@ -124,6 +142,9 @@ def render_text(summary: dict, title: str) -> str:
     lines.append("non-code         : %s bytes" % format(summary["data_bytes"], ","))
     lines.append("functions found  : %s, and %s guessed (counted apart, below)"
                  % (format(summary["total_functions"], ","), format(summary["guessed_functions"], ",")))
+    if summary["confirmed_functions"]:
+        lines.append("                   %s of them guessed by the analysis, and confirmed (%s)"
+                     % (format(summary["confirmed_functions"], ","), _sources(summary["confirmed_by"])))
     lines.append("")
     lines.append("%-14s %9s %7s %14s %8s" % ("tier", "functions", "share", "bytes", "share"))
     lines.append("-" * 62)
@@ -196,6 +217,9 @@ def render_markdown(summary: dict) -> str:
     lines.append("| functions discovered | %s |"
                  % format(summary["total_functions"] + summary["guessed_functions"], ","))
     lines.append("| - the analysis is sure of (counted below) | %s |" % format(summary["total_functions"], ","))
+    if summary["confirmed_functions"]:
+        lines.append("| - of which guessed, and confirmed by another source | %s (%s) |"
+                     % (format(summary["confirmed_functions"], ","), _sources(summary["confirmed_by"])))
     lines.append("| - guessed (counted apart) | %s |" % format(summary["guessed_functions"], ","))
     lines.append("| - found via direct calls | %s |" % format(summary["conf_called"], ","))
     lines.append("| - found via prologue scan | %s |" % format(summary["conf_prologue"], ","))
@@ -250,7 +274,7 @@ def main(argv=None) -> int:
 
     game = game_config.from_args(args)
     database = game.load_database()
-    summary = summarise(database, load_status(args.status or game.path(game.status)))
+    summary = summarise(database, load_status(args.status or game.path(game.status)), game.confirmed)
     sys.stdout.write(
         render_markdown(summary) if args.markdown else render_text(summary, game.name) + "\n"
     )

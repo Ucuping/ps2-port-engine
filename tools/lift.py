@@ -590,7 +590,8 @@ def main(argv=None) -> int:
               % (len(paths), out, len(chosen), len(unverified)))
     if args.csv:
         update_status(game.path(game.status), verified, outcomes, names, unverified,
-                      {f["addr"]: game_config.confidence_label(f) for f in database["functions"]})
+                      {f["addr"]: game_config.confidence_label(f, game.confirmed)
+                       for f in database["functions"]})
     print("  elapsed %.0fs" % (time.time() - started))
     return 0
 

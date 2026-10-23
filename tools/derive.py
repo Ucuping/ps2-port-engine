@@ -1944,7 +1944,7 @@ def main(argv=None) -> int:
                 "notes": notes,
             }
         rows = [existing[key] for key in sorted(existing)]
-        sure = {f["addr"]: game_config.confidence_label(f) for f in database["functions"]}
+        sure = {f["addr"]: game_config.confidence_label(f, game.confirmed) for f in database["functions"]}
         for row in rows:
             row["confidence"] = sure.get(int(row["address"], 16), row.get("confidence", ""))
         os.makedirs(os.path.dirname(os.path.abspath(args.csv)), exist_ok=True)

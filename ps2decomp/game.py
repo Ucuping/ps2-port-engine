@@ -20,6 +20,7 @@ always establishes it.
 
 from __future__ import annotations
 
+import csv
 import dataclasses
 import json
 import os
@@ -42,11 +43,34 @@ STATUS_FIELDS = ["address", "name", "status", "source", "notes", "confidence"]
 CONFIDENT = ("entry", "called", "pointer")
 
 
-def confidence_label(function: dict) -> str:
-    """"high" for a function the analysis is sure of - or that an FDE in the
-    executable's .eh_frame describes (ehframe.py) - "low" for one it guessed."""
-    sure = function.get("confidence") in CONFIDENT or function.get("bounds") == "eh_frame"
+def confidence_label(function: dict, confirmed=None) -> str:
+    """"high" for a function the analysis is sure of - that an FDE in the
+    executable's .eh_frame describes (ehframe.py), or that another source
+    confirms (`confirmed`, the game's: tools/confirm.py) - "low" for one it
+    guessed."""
+    sure = (function.get("confidence") in CONFIDENT or function.get("bounds") == "eh_frame"
+            or function.get("addr") in (confirmed or ()))
     return "high" if sure else "low"
+
+
+# The confirmations' columns (game.json's "confirmed"): a guessed function's
+# start, and what confirms a function starts there - "run", a call a run saw
+# enter it; "ghidra", Ghidra's analysis of the same image - joined by "+".
+CONFIRMED_FIELDS = ["address", "source"]
+
+
+def read_confirmed(path: str) -> dict:
+    """{address: source} from a confirmations table; empty if there is none."""
+    if not os.path.exists(path):
+        return {}
+    confirmed = {}
+    with open(path, newline="", encoding="utf-8") as handle:
+        for line, row in enumerate(csv.DictReader(handle), 2):
+            address, source = (row.get("address") or "").strip(), (row.get("source") or "").strip()
+            if not address or not source:
+                raise SystemExit("%s:%d: a confirmation needs an address and its source" % (path, line))
+            confirmed[int(address, 16)] = source
+    return confirmed
 
 
 DEFAULTS = {
@@ -70,6 +94,10 @@ DEFAULTS = {
     # A function ends after a `jr $ra` that padding or the next function's
     # prologue follows, when nothing in it branches past (analysis.py).
     "end_at_returns": False,
+    # The guessed functions another source confirms, counted as sure
+    # (confidence_label): a table of their addresses and sources, written by
+    # tools/confirm.py - e.g. "config/confirmed.csv".
+    "confirmed": None,
 }
 
 
@@ -97,6 +125,10 @@ class Game:
     # Whether only the code's jals name functions, and functions end at returns.
     calls_from_code_only: bool = False
     end_at_returns: bool = False
+    # The guessed functions another source confirms: {address: source}; and the
+    # table they are read from, None for a game without one.
+    confirmed: dict = dataclasses.field(default_factory=dict)
+    confirmed_path: "str | None" = None
 
     def path(self, relative: str) -> str:
         return os.path.normpath(os.path.join(self.directory, relative))
@@ -153,6 +185,9 @@ def load(directory: str) -> Game:
                 eh_frame_boundaries=bool(values["eh_frame_boundaries"]),
                 calls_from_code_only=bool(values["calls_from_code_only"]),
                 end_at_returns=bool(values["end_at_returns"]))
+    if values["confirmed"]:
+        game.confirmed_path = game.path(values["confirmed"])
+        game.confirmed = read_confirmed(game.confirmed_path)
     configure_layout(game)
     return game
 

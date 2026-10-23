@@ -88,6 +88,14 @@ marks each row `high` or `low` (its `confidence` column, from the analysis).
 apart, tier by tier, whatever their tests say: a translation of something that
 is not a function can still agree with the interpreter.
 
+Another source can confirm a guess, and a game can say which it takes (its
+`game.json`'s `"confirmed"`, a table `tools/confirm.py` writes, each row with
+its sources): a run that entered the function by a call - a `jal`, a `jalr`,
+the kernel starting a thread or a handler, never a jump, which lands inside
+functions too - or Ghidra's analysis of the same image, which finds functions
+its own way. A confirmed function counts as sure, and `progress.py` says how
+many of the sure are confirmed guesses, by source.
+
 ## Why functional reconstruction, and what it does and does not prove
 
 The original compiler is known - Metrowerks CodeWarrior MIPS 2.4.1.01, named in
