@@ -427,14 +427,43 @@ class ImageAnalyzer:
     # much keeps a function whole without letting a real gap merge two of them.
     MAX_PADDING_WORDS = 4
 
+    # GCC schedules register set-up ahead of a function's stack adjustment: of
+    # the 2,759 functions Tekken 5's FDEs describe in its game program, 2,513
+    # open with `addiu $sp`, and 2,743 within three instructions.
+    SCHEDULED_PROLOGUE_WORDS = 3
+
+    def _opens_frame(self, addr: int) -> bool:
+        """True when a function's prologue starts at `addr`: its stack adjustment
+        there (_is_prologue), or after at most SCHEDULED_PROLOGUE_WORDS
+        instructions that set up registers - no transfer of control, no nop,
+        nothing that reads or writes $sp (Tekken 5's 0x0048EE70: `lui $v0, 0x73;
+        addiu $sp, $sp, -0x20`). The prologue scan takes the first kind only."""
+        for k in range(self.SCHEDULED_PROLOGUE_WORDS + 1):
+            at = addr + 4 * k
+            if not self.contains(at):
+                return False
+            if self._is_prologue(at):
+                return True
+            word = self.word_at(at)
+            ins = DISASM.decode(word, at)
+            registers = (ins.rs, ins.rt, ins.rd) if word >> 26 in (0x00, 0x1C) else (ins.rs, ins.rt)
+            if not word or ins.has_delay_slot or ins.ends_block or 29 in registers:
+                return False
+        return False
+
     def _cut_after_return(self, start: int, end: int) -> int:
         """Where a function `start`-`end` stops when it ends at returns: just after
         the first `jr $ra` and its delay slot that padding or the next function's
-        prologue follows, and that nothing before it in the function branches past.
-        An early return's later code is reached by a branch - a conditional one, a
-        `b`, a switch's case - and stays the function's; a `j` to the next
-        function's prologue is a tail call into that one, not a branch into this.
-        Without such a point, `end`."""
+        prologue (_opens_frame) follows, and that nothing before it in the
+        function branches past. An early return's later code is reached by a
+        branch - a conditional one, a `b`, a switch's case - and stays the
+        function's. A `j` to a function's start - one a `jal` calls, or code that
+        opens a frame - is a tail call into that one, not a branch into this: of
+        the 393 `j`s in Tekken 5's game program's FDE-bounded functions, none lands
+        inside its own function, and 364 land on such a start. The traversal
+        follows tail calls, and through them reaches the next function (Tekken 5's
+        0x0048EDE0 tail-calls three functions that each tail-call 0x0048EE70,
+        right after it). Without such a point, `end`."""
         for addr in range(start, end - 8, 4):
             ins = DISASM.decode(self.word_at(addr), addr)
             if ins.mnemonic != "jr" or ins.rs != 31:
@@ -443,7 +472,7 @@ class ImageAnalyzer:
             following = cut
             while following < end and self.word_at(following) == 0:
                 following += 4
-            if following >= end or (following == cut and not self._is_prologue(cut)):
+            if following >= end or (following == cut and not self._opens_frame(cut)):
                 continue
             into = False
             for at in range(start, cut, 4):
@@ -457,7 +486,7 @@ class ImageAnalyzer:
                 for target in targets:
                     if not cut <= target < end:
                         continue
-                    if transfer.mnemonic == "j" and target == following and self._is_prologue(following):
+                    if transfer.mnemonic == "j" and (target in self.call_sites or self._opens_frame(target)):
                         continue
                     into = True
             if not into:
