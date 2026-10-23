@@ -168,6 +168,21 @@ stub dispatch table, every test) checks that it still builds and passes.
 - `ps2host::iop::AwaitServer`: an EE bind to a server that a module in the
   IOP interpreter will register gets server 0 until the module registers
   it, so the EE binds again; the port names the servers.
+- Vulkan on macOS through MoltenVK and the Vulkan loader: the executables
+  built here have the loader's folder in their build rpath (only for
+  development, `PS2GPU_VULKAN_BUILD_RPATH`; a release bundles the loader);
+  the instance asks for portability drivers, and the device enables
+  `VK_KHR_portability_subset` with its features, where they are offered.
+- Found by the validation layers, on every device: the shaders' `discard`
+  (a demote for Vulkan 1.3) needs `shaderDemoteToHelperInvocation`, now
+  enabled; the renderer's destructor destroys the image swizzle's, the
+  decode's, the patch's and the depth paths' objects too. And the
+  swapchain takes `B8G8R8A8_UNORM` in sRGB's colour space, not the last
+  space offered (Display P3 linear on MoltenVK).
+- `GsRenderer::ExactPartialMasks`: whether a channel FBMSK masks in part is
+  drawn exactly (logic ops). The renderer's tests mark
+  `PartlyMaskedChannels` a known failure where it is not - run and
+  reported, not skipped - and `PS2GPU_REQUIRE` makes a missing GPU fail.
 
 Found and not yet changed, with the evidence in the Tekken 5 repository's
 `games/tekken5/docs/FINDINGS.md` ("Engine findings worth upstreaming"): a call
