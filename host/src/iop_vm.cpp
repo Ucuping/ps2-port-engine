@@ -95,6 +95,9 @@ std::string Vm::String(u32 address, u32 limit) {
 }
 
 u32 Vm::Allocate(u32 size) {
+    // A size that would wrap when rounded up - 0xFFFFFFFF, which Tekken 5
+    // asks for - fits no block, as on an IOP; not a block of none.
+    if (size > ~15u) return 0;
     size = (size + 15) & ~15u;
     for (auto it = free_blocks.begin(); it != free_blocks.end(); ++it) {
         if (it->second < size) continue;

@@ -1450,6 +1450,23 @@ void IopPoolsLendAndTakeBack() {
     Check(CallIop("thfpool", 5, {fpl}).result == 0, "fpl: deleted");
 }
 
+// The heap refuses what no free block holds, as sysmem does: 0xFFFFFFFF too
+// (Tekken 5 asks the EE's IOP heap for it), which rounded up to 16 bytes once
+// wrapped to a block of none, and was given.
+void IopHeapRefusesWhatItCannotHold() {
+    using namespace ps2host::iop;
+    Vm& vm = TheVm();
+    const u32 largest = vm.LargestFree();
+    Check(vm.Allocate(0xFFFFFFFFu) == 0, "iop heap: 0xFFFFFFFF bytes refused");
+    Check(vm.Allocate(0xFFFFFFF1u) == 0, "iop heap: nor any size that would wrap when rounded");
+    Check(vm.Allocate(largest + 16) == 0, "iop heap: nor more than the largest free block");
+    Check(vm.LargestFree() == largest, "iop heap: nothing taken by the refusals");
+    const u32 block = vm.Allocate(64);
+    Check(block != 0, "iop heap: a block that fits is given");
+    vm.Free(block);
+    Check(vm.LargestFree() == largest, "iop heap: and taken back");
+}
+
 void IopThreadsAreReportedAsThbaseDoes() {
     using namespace ps2host::iop;
     Vm& vm = TheVm();
@@ -2378,6 +2395,7 @@ int main() {
     IpuDecodesAndRetriesCleanly();
     IopInstructionsMatchTheR5900();
     IopPoolsLendAndTakeBack();
+    IopHeapRefusesWhatItCannotHold();
     IopThreadsAreReportedAsThbaseDoes();
     IopSetjmpReturnsTwice();
     IopReadsTheDiscAsCdvdmanAndIomanDo();
