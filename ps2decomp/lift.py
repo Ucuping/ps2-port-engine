@@ -256,6 +256,18 @@ def statement(ins) -> str:
         if rd == 0:
             return ""
         return "{ u64 lo = c.rh[%d], hi = c.rh[%d]; c.r[%d] = lo; c.rh[%d] = hi; }" % (rs, rt, rd, rd)
+    if m == "plzcw":
+        # rd's high doubleword stays as it was.
+        if rd == 0:
+            return ""
+        return ("{ u64 v = %s; c.r[%d] = (u64)lifted::PlzcwCount((u32)v) | "
+                "(u64)lifted::PlzcwCount((u32)(v >> 32)) << 32; }" % (a, rd))
+    if m == "prot3w":
+        # Words 1, 2, 0 of rt into words 0, 1, 2 of rd; word 3 kept.
+        if rd == 0:
+            return ""
+        return ("{ u64 lo = %s, hi = c.rh[%d]; c.r[%d] = (lo >> 32) | (hi << 32); "
+                "c.rh[%d] = (lo & 0xFFFFFFFFull) | (hi & 0xFFFFFFFF00000000ull); }" % (b, rt, rd, rd))
     if m == "pcpyh":
         if rd == 0:
             return ""

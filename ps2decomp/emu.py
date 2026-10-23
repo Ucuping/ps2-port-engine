@@ -1023,6 +1023,33 @@ def _op_pcpyud(m: Machine, ins) -> None:
         m.regs_hi[ins.rd] = m.regs_hi[ins.rt]
 
 
+def _plzcw_count(word: int) -> int:
+    """How many of a word's bits after its sign bit equal it: its leading sign
+    bits, less one (0 to 31)."""
+    differs = word ^ (0xFFFFFFFF if word & 0x80000000 else 0)
+    count, bit = 0, 0x40000000
+    while bit and not differs & bit:
+        count += 1
+        bit >>= 1
+    return count
+
+
+def _op_plzcw(m: Machine, ins) -> None:
+    """Each word of rs's low doubleword counted as _plzcw_count does, into the
+    same word of rd's low doubleword; rd's high doubleword stays as it was."""
+    if ins.rd:
+        value = m.get(ins.rs)
+        m.regs[ins.rd] = _plzcw_count(value & 0xFFFFFFFF) | _plzcw_count(value >> 32 & 0xFFFFFFFF) << 32
+
+
+def _op_prot3w(m: Machine, ins) -> None:
+    """rt's low three words rotated a word down - word 1 into word 0, word 2 into
+    word 1, word 0 into word 2 - and its word 3 kept."""
+    value = _q_get(m, ins.rt)
+    words = [value >> 32 * k & 0xFFFFFFFF for k in range(4)]
+    _q_set(m, ins.rd, words[1] | words[2] << 32 | words[0] << 64 | words[3] << 96)
+
+
 def _op_pcpyh(m: Machine, ins) -> None:
     """Broadcast the low halfword of each doubleword across it."""
     value = _q_get(m, ins.rt)
@@ -1260,6 +1287,8 @@ _HANDLERS = {
     "psubb": _q_perbyte(lambda a, b: a - b),
     "pcpyld": _op_pcpyld,
     "pcpyud": _op_pcpyud,
+    "plzcw": _op_plzcw,
+    "prot3w": _op_prot3w,
     "pcpyh": _op_pcpyh,
     "pmaxw": _q_lanes(32, lambda a, b: a if _s32(a) >= _s32(b) else b),
     "pminw": _q_lanes(32, lambda a, b: a if _s32(a) <= _s32(b) else b),

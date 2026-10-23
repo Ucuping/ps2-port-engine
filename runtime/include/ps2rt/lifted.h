@@ -103,6 +103,15 @@ u32 FloatMulAdd(u32 acc, u32 a, u32 b, bool subtract);
 /* Per-byte 128-bit add and subtract (paddb, psubb). */
 void AddBytes(u64& lo, u64& hi, u64 alo, u64 ahi, u64 blo, u64 bhi, bool subtract);
 
+/* PLZCW's count for one word: how many of the bits after its sign bit equal
+   it - its leading sign bits, less one (0 to 31). */
+inline u32 PlzcwCount(u32 word) {
+    const u32 differs = word ^ (0u - (word >> 31));     // the bits unlike the sign, set
+    u32 count = 0;
+    for (u32 bit = 0x40000000u; bit && !(differs & bit); bit >>= 1) ++count;
+    return count;
+}
+
 /* Lane-wise 128-bit MMI operations: each lane of rs (a) and rt (b). */
 enum LaneOp { kPmaxw = 1, kPminw, kPsubw, kPadduw, kPaddub, kPabsw, kPaddw, kPaddh,
               /* all ones where rs > rt (signed) or rs == rt; signed halfword max/min */

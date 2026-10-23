@@ -53,7 +53,7 @@ def mmi_word(name, rd, rs, rt, sa=None):
     """The MMI encoding of `name`, found by asking the decoder, so the test does not
     depend on a hand-copied table."""
     from ps2decomp.r5900 import DISASM
-    for funct in (0x08, 0x28, 0x09, 0x29) + tuple(range(0x30, 0x40)):
+    for funct in (0x04, 0x08, 0x28, 0x09, 0x29) + tuple(range(0x30, 0x40)):
         for sub in range(32):
             word = r_type(funct, rs, rt, rd, sub if sa is None or funct < 0x30 else sa, op=0x1C)
             if DISASM.decode(word, 0).mnemonic == name:
@@ -167,6 +167,16 @@ def programs():
         r_type(0x29, T0, T1, T3, 0x0E, op=0x1C),                    # pcpyud $t3, $t0, $t1
         r_type(0x08, A0, A1, T4, 0x09, op=0x1C),                    # psubb $t4, $a0, $a1
         JR_RA, r_type(0x29, 0, T0, T5, 0x1B, op=0x1C),              # pcpyh $t5, $t0
+    ])
+    add("mmi_counts", [
+        r_type(0x09, A0, A1, T0, 0x0E, op=0x1C),                    # pcpyld $t0, $a0, $a1
+        mmi_word("plzcw", T1, A0, 0),                               # plzcw $t1, $a0
+        mmi_word("plzcw", T0, A1, 0),                               # plzcw $t0, $a1 (high half kept)
+        r_type(0x09, A2, A3, T2, 0x0E, op=0x1C),                    # pcpyld $t2, $a2, $a3
+        mmi_word("prot3w", T3, 0, T2),                              # prot3w $t3, $t2
+        mmi_word("prot3w", T2, 0, T2),                              # prot3w $t2, $t2 (in place)
+        mmi_word("plzcw", 0, A0, 0),                                # plzcw $zero, $a0
+        JR_RA, mmi_word("prot3w", T4, 0, T0),                       # prot3w in the delay slot
     ])
     add("unaligned", [
         i_type(0x22, A0, T0, 3), i_type(0x26, A0, T0, 0),           # lwl/lwr pair
@@ -359,6 +369,10 @@ class TestLift(unittest.TestCase):
 
     def test_more_mmi_and_rsqrt(self):
         self.check("mmi_more")
+
+    def test_mmi_counts_and_rotations(self):
+        # plzcw and prot3w lifted, against the interpreter on the whole state.
+        self.check("mmi_counts")
 
     def test_mmi_comparisons_and_upper_interleaves(self):
         self.check("mmi_compare")
