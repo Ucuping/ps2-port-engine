@@ -29,7 +29,8 @@ from ps2decomp.r5900 import DISASM
 from ps2decomp.symbols import SymbolRecovery
 
 
-def build_database(elf_path: str, verbose: bool = True, keep=(), bounds=()) -> dict:
+def build_database(elf_path: str, verbose: bool = True, keep=(), bounds=(), call_ranges=None,
+                   end_at_returns: bool = False) -> dict:
     started = time.time()
     elf = ElfFile.load(elf_path)
     exec_sections = elf.exec_sections
@@ -47,7 +48,7 @@ def build_database(elf_path: str, verbose: bool = True, keep=(), bounds=()) -> d
     log("entry      : 0x%08x" % elf.e_entry)
 
     log("discovering functions...")
-    analyzer = ImageAnalyzer(data, section.addr, elf.e_entry)
+    analyzer = ImageAnalyzer(data, section.addr, elf.e_entry, call_ranges, end_at_returns)
     analyzer.run()
     log("  %s functions, %.1f%% of the image proven to be code"
         % (format(len(analyzer.functions), ","), analyzer.coverage()))
@@ -308,8 +309,14 @@ def main(argv=None) -> int:
         eh_frame = source.section(".eh_frame")
         if eh_frame is not None:
             bounds = ehframe.fde_ranges(source.section_data(eh_frame), eh_frame.addr)
+    call_ranges = None
+    if game.calls_from_code_only:
+        # The overlay's code and its executable's: the executable calls into it.
+        executable = ElfFile.load((game.base or game).elf_path).exec_sections[0]
+        call_ranges = list(game.code_ranges) + [(executable.addr, executable.addr + executable.size)]
     database = build_database(game.elf_path, verbose=not args.quiet,
-                              keep=game.code_ranges, bounds=bounds)
+                              keep=game.code_ranges, bounds=bounds, call_ranges=call_ranges,
+                              end_at_returns=game.end_at_returns)
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     with open(output, "w", encoding="utf-8") as handle:
         json.dump(database, handle, indent=1)

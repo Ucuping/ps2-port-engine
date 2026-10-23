@@ -80,11 +80,19 @@ class Region:
 class ImageAnalyzer:
     """Recovers functions and code/data boundaries from a flat loaded image."""
 
-    def __init__(self, data: bytes, base_addr: int, entry_point: int = 0) -> None:
+    def __init__(self, data: bytes, base_addr: int, entry_point: int = 0, call_ranges=None,
+                 end_at_returns: bool = False) -> None:
         self.data = data
         self.base = base_addr
         self.end = base_addr + len(data)
         self.entry_point = entry_point
+        # Where a jal counts (game.json "calls_from_code_only"): an overlay's image
+        # holds data that decodes as jal too, and its "calls" split real functions
+        # (Tekken 5's game program: 101 of them). None: anywhere in the image.
+        self.call_ranges = list(call_ranges) if call_ranges else None
+        # Whether a function ends after a `jr $ra` that padding or the next
+        # function's prologue follows (game.json "end_at_returns", _cut_after_return).
+        self.end_at_returns = end_at_returns
         self.words = struct.unpack("<%dI" % (len(data) // 4), data[: (len(data) // 4) * 4])
         self.functions: dict = {}
         self.code_bytes = bytearray(len(data))  # 1 where traversal proved code
@@ -119,6 +127,8 @@ class ImageAnalyzer:
             if (word >> 26) != 0x03:  # jal
                 continue
             addr = self.base + i * 4
+            if self.call_ranges is not None and not any(low <= addr < high for low, high in self.call_ranges):
+                continue
             target = ((addr + 4) & 0xF0000000) | ((word & 0x03FFFFFF) << 2)
             if not self.contains(target):
                 continue
@@ -417,6 +427,43 @@ class ImageAnalyzer:
     # much keeps a function whole without letting a real gap merge two of them.
     MAX_PADDING_WORDS = 4
 
+    def _cut_after_return(self, start: int, end: int) -> int:
+        """Where a function `start`-`end` stops when it ends at returns: just after
+        the first `jr $ra` and its delay slot that padding or the next function's
+        prologue follows, and that nothing before it in the function branches past.
+        An early return's later code is reached by a branch - a conditional one, a
+        `b`, a switch's case - and stays the function's; a `j` to the next
+        function's prologue is a tail call into that one, not a branch into this.
+        Without such a point, `end`."""
+        for addr in range(start, end - 8, 4):
+            ins = DISASM.decode(self.word_at(addr), addr)
+            if ins.mnemonic != "jr" or ins.rs != 31:
+                continue
+            cut = addr + 8
+            following = cut
+            while following < end and self.word_at(following) == 0:
+                following += 4
+            if following >= end or (following == cut and not self._is_prologue(cut)):
+                continue
+            into = False
+            for at in range(start, cut, 4):
+                transfer = DISASM.decode(self.word_at(at), at)
+                if transfer.is_call:
+                    continue
+                if transfer.mnemonic == "jr":
+                    targets = (self.jump_table(at, transfer.rs) or []) if transfer.rs != 31 else []
+                else:
+                    targets = [transfer.target] if transfer.target >= 0 else []
+                for target in targets:
+                    if not cut <= target < end:
+                        continue
+                    if transfer.mnemonic == "j" and target == following and self._is_prologue(following):
+                        continue
+                    into = True
+            if not into:
+                return cut
+        return end
+
     def extent_from(self, start: int, visited: set) -> int:
         """Turn a traversal's visited set into a contiguous end address.
 
@@ -543,6 +590,8 @@ class ImageAnalyzer:
             self.functions[addr] = func
             visited = self.traverse(addr, func)
             func.end = self.extent_from(addr, visited)
+            if self.end_at_returns:
+                func.end = self._cut_after_return(addr, func.end)
             func.instruction_count = sum(
                 1 for a in visited if func.start <= a < func.end
             )
@@ -567,6 +616,8 @@ class ImageAnalyzer:
                 continue
             self.functions[addr] = func
             func.end = self.extent_from(addr, visited)
+            if self.end_at_returns:
+                func.end = self._cut_after_return(addr, func.end)
             func.instruction_count = sum(
                 1 for a in visited if func.start <= a < func.end
             )
@@ -580,6 +631,8 @@ class ImageAnalyzer:
             self.functions[addr] = func
             visited = self.traverse(addr, func)
             func.end = self.extent_from(addr, visited)
+            if self.end_at_returns:
+                func.end = self._cut_after_return(addr, func.end)
             func.instruction_count = sum(
                 1 for a in visited if func.start <= a < func.end
             )

@@ -63,6 +63,13 @@ DEFAULTS = {
     # The executable's .eh_frame as the truth about the functions it describes
     # (ps2decomp/ehframe.py): their extent, and no function inside one.
     "eh_frame_boundaries": False,
+    # Call targets from the code only: a jal in the image's data names no
+    # function (an overlay's image holds its data too). The code is an
+    # overlay's code ranges and its executable's code section.
+    "calls_from_code_only": False,
+    # A function ends after a `jr $ra` that padding or the next function's
+    # prologue follows, when nothing in it branches past (analysis.py).
+    "end_at_returns": False,
 }
 
 
@@ -87,6 +94,9 @@ class Game:
     overlays: list = dataclasses.field(default_factory=list)
     # Whether the analysis takes the executable's FDEs as the functions' bounds.
     eh_frame_boundaries: bool = False
+    # Whether only the code's jals name functions, and functions end at returns.
+    calls_from_code_only: bool = False
+    end_at_returns: bool = False
 
     def path(self, relative: str) -> str:
         return os.path.normpath(os.path.join(self.directory, relative))
@@ -140,7 +150,9 @@ def load(directory: str) -> Game:
                 code_ranges=[tuple(_number(v) for v in pair)
                              for pair in (values["overlay"] or {}).get("code", [])],
                 base=base, overlays=list(values["overlays"]),
-                eh_frame_boundaries=bool(values["eh_frame_boundaries"]))
+                eh_frame_boundaries=bool(values["eh_frame_boundaries"]),
+                calls_from_code_only=bool(values["calls_from_code_only"]),
+                end_at_returns=bool(values["end_at_returns"]))
     configure_layout(game)
     return game
 
