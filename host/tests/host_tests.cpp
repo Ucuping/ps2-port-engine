@@ -131,6 +131,12 @@ void DiscFindsFilesByPath() {
     Check(disc.Find("/dir/inner.dat", &file) && file.lsn == 23 && file.size == 3,
           "a file in a directory, any case, no version");
     Check(!disc.Find("\\MISSING.BIN", &file), "a missing file");
+    std::vector<ps2host::Disc::Entry> entries;
+    Check(disc.List("\\", &entries) && entries.size() == 2 && entries[0].name == "FILE.BIN;1" &&
+          entries[0].file.lsn == 21 && entries[1].name == "DIR" && (entries[1].file.flags & 2),
+          "a directory's entries, without . and ..");
+    Check(disc.List("/dir", &entries) && entries.size() == 1 && entries[0].name == "INNER.DAT;1" &&
+          !disc.List("\\FILE.BIN;1", &entries), "a directory in a directory; a file is none");
     u8 sector[ps2host::kSectorSize];
     Check(disc.Read(21, 1, sector) && std::memcmp(sector, "hello", 5) == 0, "reading a sector");
     Check(!disc.Read(30, 1, sector), "reading past the end");

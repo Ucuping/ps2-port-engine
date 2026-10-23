@@ -1,5 +1,6 @@
 #include "ps2host/disc.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <string>
@@ -157,46 +158,66 @@ bool Disc::ReadPattern(u32 lsn, u32 count, u32 pattern, u8* out) {
     return true;
 }
 
+namespace {
+
+// A directory record's file: its extent, size, flags and date.
+Disc::File RecordFile(const u8* record) {
+    Disc::File file{Le32(record + 2), Le32(record + 10), record[25], {}};
+    std::memcpy(file.date, record + 18, 7);
+    return file;
+}
+
+}  // namespace
+
+bool Disc::Entries(const File& directory, std::vector<Entry>* out) {
+    // Records never cross a sector boundary; a zero length pads to the next.
+    const u32 sectors = (directory.size + kSectorSize - 1) / kSectorSize;
+    std::vector<u8> data(size_t(sectors) * kSectorSize);
+    if (!Read(directory.lsn, sectors, data.data())) return false;
+    out->clear();
+    for (u32 at = 0; at < directory.size;) {
+        const u8 length = data[at];
+        if (length == 0) {
+            at = (at / kSectorSize + 1) * kSectorSize;
+            continue;
+        }
+        const u8 name_length = data[at + 32];
+        const std::string name(reinterpret_cast<const char*>(&data[at + 33]), name_length);
+        if (name_length > 1 || (name_length == 1 && name[0] > 1))     // not "." (0) or ".." (1)
+            out->push_back(Entry{name, RecordFile(&data[at])});
+        at += length;
+    }
+    return true;
+}
+
 bool Disc::Find(const std::string& path, File* out) {
     // The primary volume descriptor, sector 16, holds the root directory's record.
     std::vector<u8> sector(kSectorSize);
     if (!Read(16, 1, sector.data()) || sector[0] != 1 || std::memcmp(&sector[1], "CD001", 5) != 0)
         return false;
-    File directory{Le32(&sector[156 + 2]), Le32(&sector[156 + 10])};
+    File directory = RecordFile(&sector[156]);
     std::string rest = path;
     for (char& ch : rest) if (ch == '/') ch = '\\';
+    std::vector<Entry> entries;
     while (!rest.empty()) {
         while (!rest.empty() && rest[0] == '\\') rest.erase(0, 1);
         if (rest.empty()) break;
         const auto end = rest.find('\\');
         const std::string part = Bare(rest.substr(0, end));
         rest = end == std::string::npos ? "" : rest.substr(end);
-        // Scan the directory's records for this part.
-        const u32 sectors = (directory.size + kSectorSize - 1) / kSectorSize;
-        std::vector<u8> data(size_t(sectors) * kSectorSize);
-        if (!Read(directory.lsn, sectors, data.data())) return false;
-        bool found = false;
-        for (u32 at = 0; at < directory.size;) {
-            const u8 length = data[at];
-            if (length == 0) {                  // records never cross a sector boundary
-                at = (at / kSectorSize + 1) * kSectorSize;
-                continue;
-            }
-            const u8 name_length = data[at + 32];
-            const std::string name(reinterpret_cast<const char*>(&data[at + 33]), name_length);
-            if (name_length > 1 || (name_length == 1 && name[0] > 1)) {
-                if (Bare(name) == part) {
-                    directory = File{Le32(&data[at + 2]), Le32(&data[at + 10])};
-                    found = true;
-                    break;
-                }
-            }
-            at += length;
-        }
-        if (!found) return false;
+        if (!Entries(directory, &entries)) return false;
+        const auto found = std::find_if(entries.begin(), entries.end(),
+                                        [&](const Entry& e) { return Bare(e.name) == part; });
+        if (found == entries.end()) return false;
+        directory = found->file;
     }
     *out = directory;
     return true;
+}
+
+bool Disc::List(const std::string& path, std::vector<Entry>* out) {
+    File directory;
+    return Find(path, &directory) && (directory.flags & 0x02) && Entries(directory, out);
 }
 
 bool Disc::ReadFile(const std::string& path, std::vector<u8>* out) {

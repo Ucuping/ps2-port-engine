@@ -27,6 +27,13 @@ public:
     struct File {
         u32 lsn = 0;        // first sector
         u32 size = 0;       // bytes
+        u8 flags = 0;       // its directory record's: 0x02 a directory
+        u8 date[7] = {};    // the record's: years since 1900, month, day, hour, minute, second, GMT offset
+    };
+    /* A directory's entry (List). */
+    struct Entry {
+        std::string name;   // as the disc has it: "CARS.BIN;1"
+        File file;
     };
 
     ~Disc();
@@ -51,6 +58,9 @@ public:
     /* Look a path up - "\\DATA\\CARS.BIN;1" as the SDK writes it; separators may
        be either slash, the version suffix is optional, case does not matter. */
     bool Find(const std::string& path, File* out);
+    /* A directory's entries, "." and ".." left out (a path as Find takes it;
+       "" or "\\" the root); false if it is not a directory there. */
+    bool List(const std::string& path, std::vector<Entry>* out);
     /* A whole file's bytes (a path as Find takes it); false if it is not there. */
     bool ReadFile(const std::string& path, std::vector<u8>* out);
     /* The executable the console boots: SYSTEM.CNF's BOOT2 line, as a path on
@@ -58,6 +68,7 @@ public:
     std::string BootPath();
 
 private:
+    bool Entries(const File& directory, std::vector<Entry>* out);
     void DetectFormat();
     bool ReadBytes(u64 offset, u64 length, u8* out);
 
