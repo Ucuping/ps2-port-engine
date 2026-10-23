@@ -1384,7 +1384,7 @@ Outcome FreeVpl(Vm& vm, Context& c) {
 
 // ---------------------------------------------------------------- modload, loadcore
 
-constexpr s32 KE_UNKNOWN_MODULE = -202, KE_ILLEGAL_FLAG = -220, KE_LIBRARY_NOTFOUND = -213;
+constexpr s32 KE_ILLEGAL_FLAG = -220, KE_LIBRARY_NOTFOUND = -213;     // KE_UNKNOWN_MODULE: iop_vm_internal.h
 
 // SearchModuleByName(name): the latest module of that name loaded, by its id.
 // A name no module recorded has - a BIOS module's (rom0:), whose image the
@@ -1906,6 +1906,16 @@ void SetPcmInputVolume(u32 core, u32 percent) { S().spu.SetInputVolume(core, per
 
 void EnableSound() {
     S().spu.SetOutput([](const Spu2::s16* frames, u32 count) { AudioFrames(frames, count); });
+}
+
+std::string SoundHandlerIn(u32 begin, u32 end) {
+    const Sound& s = S();
+    auto in = [&](u32 address) { return address >= begin && address < end; };
+    for (int channel = 0; channel < 2; ++channel)
+        if (in(s.transfer[channel].function) || in(s.transfer_callback[channel]))
+            return "libsd's transfer handler for channel " + std::to_string(channel);
+    if (in(s.spu2.function) || in(s.irq_callback)) return "libsd's SPU2 interrupt handler";
+    return "";
 }
 
 // Due sound interrupts: a voice transfer's completion, a block transfer's

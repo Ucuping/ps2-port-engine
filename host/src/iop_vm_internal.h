@@ -96,7 +96,17 @@ struct ModuleRecord {
     std::string name;
     u16 version = 0, flags = 0;
     u32 entry = 0, gp = 0, text = 0, text_size = 0, data_size = 0, bss_size = 0;
+    // A module the interpreter runs: the memory it was loaded into, its start
+    // routine's answer - MODULE_REMOVABLE_END (2) lets it be stopped and
+    // unloaded - and whether it has been stopped.
+    bool runs = false, stopped = false;
+    u32 base = 0, size = 0;
+    s32 start_result = 0;
 };
+
+// modload's errors, as ps2sdk's kerr.h numbers them.
+constexpr s32 KE_UNKNOWN_MODULE = -202, KE_ALREADY_STOPPED = -208, KE_CAN_NOT_STOP = -209,
+              KE_NOT_STOPPED = -210, KE_NOT_REMOVABLE = -211;
 
 // A file a module opened through ioman: on the disc, read-only; or a
 // directory there (dopen), its entries given one by one (dread).
@@ -268,6 +278,10 @@ std::string ExportName(const std::string& library, u32 index);
 
 /* Starts the next waiting request of a server thread in sceSifRpcLoop. */
 void ServeNext(Vm& vm, Thread& t);
+
+/* A handler or callback a module gave libsd (iop_libs.cpp) that lies in
+   [begin, end), described; "" if none does. */
+std::string SoundHandlerIn(u32 begin, u32 end);
 
 /* Due sound-hardware interrupts (iop_libs.cpp), run by the scheduler. */
 // Due sound interrupts, the SPU2 run on; `idle`: the IOP has nothing to run,

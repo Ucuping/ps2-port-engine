@@ -529,6 +529,104 @@ bool RunsModule(const std::string& path) {
     return RunList().count(name) != 0;
 }
 
+namespace {
+
+// A module's argument block - strings, each ending in a zero - as words after
+// those already in `words`.
+void Words(const std::vector<u8>& args, std::vector<std::string>* words) {
+    std::string current;
+    for (u8 ch : args) {
+        if (ch) current += char(ch);
+        else if (!current.empty()) { words->push_back(current); current.clear(); }
+    }
+    if (!current.empty()) words->push_back(current);
+}
+
+// A module's entry run as the IOP's module loader runs it: in a thread of its
+// own - it may wait, and it may ask for its own thread id - given `argc` (the
+// words' count to start it, negated to stop it, as modload asks) and argv in
+// IOP memory. Its return value.
+s32 RunEntry(Vm& vm, const std::string& what, u32 entry, u32 gp, const std::vector<std::string>& words, s32 argc) {
+    u32 total = 4 * u32(words.size() + 1);
+    for (const auto& w : words) total += u32(w.size()) + 1;
+    const u32 argv = vm.Allocate(total);
+    u32 text = argv + 4 * u32(words.size() + 1);
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        vm.Write(argv + 4 * u32(i), text, 4);
+        std::memcpy(vm.ram + text, words[i].c_str(), words[i].size() + 1);
+        text += u32(words[i].size()) + 1;
+    }
+    Thread loader;
+    loader.id = vm.next_id++;
+    loader.entry = entry;
+    loader.priority = 8;
+    loader.stack_size = 0x1000;
+    loader.stack = vm.Allocate(loader.stack_size);
+    loader.c.r[4] = u32(argc);
+    loader.c.r[5] = argv;
+    loader.c.r[28] = gp;
+    loader.c.r[29] = loader.stack + loader.stack_size - 16;
+    loader.c.r[31] = kThreadExit;
+    loader.c.pc = loader.entry;
+    loader.c.npc = loader.entry + 4;
+    Thread& started = vm.threads[loader.id] = loader;
+    vm.MakeReady(started);
+    const u64 deadline = vm.NowUs() + 5000000;      // it may wait on timers: real time
+    while (vm.threads[loader.id].wait != Wait::Dormant && vm.NowUs() < deadline) {
+        Run();
+        if (vm.threads[loader.id].wait != Wait::Dormant)
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    Thread& done = vm.threads[loader.id];
+    if (done.wait != Wait::Dormant) Stop(what + " did not finish");
+    const s32 result = s32(done.c.r[2]);
+    vm.Free(done.stack);
+    vm.threads.erase(loader.id);
+    Run();
+    return result;
+}
+
+// What still points into [begin, end) - a thread, a handler, a server, another
+// module's import of a library exported from there - the first found,
+// described; "" if nothing does.
+std::string StillIn(Vm& vm, u32 begin, u32 end) {
+    auto in = [&](u32 address) { return address >= begin && address < end; };
+    char text[160];
+    for (const auto& [id, t] : vm.threads)
+        if (in(t.entry) || in(t.c.pc)) {
+            std::snprintf(text, sizeof text, "thread %u (entry 0x%08X, at 0x%08X)", unsigned(id),
+                          unsigned(t.entry), unsigned(t.c.pc));
+            return text;
+        }
+    auto handler = [&](const char* kind, u32 function) {
+        std::snprintf(text, sizeof text, "%s at 0x%08X", kind, unsigned(function));
+        return std::string(text);
+    };
+    for (const auto& [key, alarm] : vm.alarms)
+        if (in(alarm.handler)) return handler("an alarm handler", alarm.handler);
+    for (const auto& [id, timer] : vm.hard_timers)
+        if (in(timer.handler)) return handler("a timer handler", timer.handler);
+    for (const auto& [function, data] : vm.completions)
+        if (in(function)) return handler("a DMA callback", function);
+    for (const auto& [command, entry] : vm.command_handlers)
+        if (in(entry.first)) return handler("a SIF command handler", entry.first);
+    for (const auto& [address, server] : vm.rpc_servers)
+        if (in(server.server) || in(server.function) || in(server.cfunction)) {
+            std::snprintf(text, sizeof text, "RPC server 0x%08X", unsigned(server.sid));
+            return text;
+        }
+    for (const auto& [stub, import] : vm.stubs) {
+        const auto exported = vm.exports.find(import.first);
+        if (exported != vm.exports.end() && in(exported->second) && !in(stub)) {
+            std::snprintf(text, sizeof text, "an import of %s at 0x%08X", import.first.c_str(), unsigned(stub));
+            return text;
+        }
+    }
+    return SoundHandlerIn(begin, end);
+}
+
+}  // namespace
+
 bool LoadModule(const std::string& path, const std::vector<u8>& image,
                 const std::vector<u8>& args, s32* result, s32 id) {
     Vm& vm = TheVm();
@@ -622,60 +720,25 @@ bool LoadModule(const std::string& path, const std::vector<u8>& image,
     if (id > 0) vm.modules[id] = Describe(image, base);
     // Start it: _start(argc, argv), argv[0] the path, then the argument strings.
     std::vector<std::string> words{path};
-    std::string current;
-    for (u8 ch : args) {
-        if (ch) current += char(ch);
-        else if (!current.empty()) { words.push_back(current); current.clear(); }
-    }
-    if (!current.empty()) words.push_back(current);
-    u32 total = 4 * u32(words.size() + 1);
-    for (const auto& w : words) total += u32(w.size()) + 1;
-    const u32 argv = vm.Allocate(total);
-    u32 text = argv + 4 * u32(words.size() + 1);
-    for (std::size_t i = 0; i < words.size(); ++i) {
-        vm.Write(argv + 4 * u32(i), text, 4);
-        std::memcpy(vm.ram + text, words[i].c_str(), words[i].size() + 1);
-        text += u32(words[i].size()) + 1;
-    }
+    Words(args, &words);
     char line[160];
     std::snprintf(line, sizeof line, "IOP: running %s at 0x%08X (%u bytes), entry 0x%08X",
                   path.c_str(), unsigned(base), unsigned(memsz), unsigned(base + entry));
     Note("iop run " + path, line);
-    // _start runs as a thread, as the IOP's module loader runs it: it may wait,
-    // and it may ask for its own thread id. Its return value is the result.
-    Thread loader;
-    loader.id = vm.next_id++;
-    loader.entry = base + entry;
-    loader.priority = 8;
-    loader.stack_size = 0x1000;
-    loader.stack = vm.Allocate(loader.stack_size);
-    loader.c.r[4] = u32(words.size());
-    loader.c.r[5] = argv;
-    loader.c.r[29] = loader.stack + loader.stack_size - 16;
-    loader.c.r[31] = kThreadExit;
     // $gp as the IOP's module loader sets it: the base plus .iopmod's gp value
     // (its third word). Its threads take it from there (StartThread).
+    u32 gp = 0;
     for (u16 i = 0; i < shnum; ++i) {
         const std::size_t sh = shoff + std::size_t(i) * shentsize;
-        if (u32at(sh + 4) == 0x70000080u && u32at(sh + 20) >= 12)
-            loader.c.r[28] = base + u32at(u32at(sh + 16) + 8);
+        if (u32at(sh + 4) == 0x70000080u && u32at(sh + 20) >= 12) gp = base + u32at(u32at(sh + 16) + 8);
     }
-    loader.c.pc = loader.entry;
-    loader.c.npc = loader.entry + 4;
-    Thread& started = vm.threads[loader.id] = loader;
-    vm.MakeReady(started);
-    const u64 deadline = vm.NowUs() + 5000000;      // it may wait on timers: real time
-    while (vm.threads[loader.id].wait != Wait::Dormant && vm.NowUs() < deadline) {
-        Run();
-        if (vm.threads[loader.id].wait != Wait::Dormant)
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
+    *result = RunEntry(vm, path + "'s start routine", base + entry, gp, words, s32(words.size()));
+    if (id > 0) {
+        ModuleRecord& record = vm.modules[id];
+        record.runs = true;
+        record.base = base, record.size = memsz;
+        record.start_result = *result;
     }
-    Thread& done = vm.threads[loader.id];
-    if (done.wait != Wait::Dormant) Stop(path + "'s start routine did not finish");
-    *result = s32(done.c.r[2]);
-    vm.Free(done.stack);
-    vm.threads.erase(loader.id);
-    Run();
     return true;
 }
 
@@ -784,6 +847,54 @@ bool RpcEnd(const std::vector<u8>& packet) {
     }
     Run();
     return true;
+}
+
+s32 SearchModule(const std::string& name) {
+    s32 found = 0;
+    for (const auto& [id, module] : TheVm().modules)
+        if (module.name == name && id > found) found = id;
+    return found ? found : KE_UNKNOWN_MODULE;
+}
+
+s32 StopModule(s32 id, const std::vector<u8>& args, s32* module_result) {
+    Vm& vm = TheVm();
+    const auto found = vm.modules.find(id);
+    if (found == vm.modules.end()) return KE_UNKNOWN_MODULE;
+    ModuleRecord& module = found->second;
+    if (!module.runs || (module.start_result & 3) != 2) return KE_NOT_REMOVABLE;
+    if (module.stopped) return KE_ALREADY_STOPPED;
+    // argv[0] "other": another module asks it to stop (loadfile, for the EE).
+    std::vector<std::string> words{"other"};
+    Words(args, &words);
+    const s32 answer = RunEntry(vm, module.name + "'s stop routine", module.entry, module.gp, words,
+                                -s32(words.size()));
+    if (module_result) *module_result = answer;
+    if ((answer & 3) != 1) return KE_CAN_NOT_STOP;     // MODULE_NO_RESIDENT_END: it has stopped
+    module.stopped = true;
+    return id;
+}
+
+s32 UnloadModule(s32 id) {
+    Vm& vm = TheVm();
+    const auto found = vm.modules.find(id);
+    if (found == vm.modules.end()) return KE_UNKNOWN_MODULE;
+    ModuleRecord& module = found->second;
+    if (!module.runs || (module.start_result & 3) != 2) return KE_NOT_REMOVABLE;
+    if (!module.stopped) return KE_NOT_STOPPED;
+    // Its stop routine was to end what runs in it; its memory is freed only
+    // once nothing points there.
+    const u32 end = module.base + module.size;
+    const std::string left = StillIn(vm, module.base, end);
+    if (!left.empty()) {
+        Note("unload " + std::to_string(id), "IOP: " + module.name + " has stopped, but " + left +
+                                                 " is still in it: not unloaded");
+        return KE_NOT_STOPPED;
+    }
+    for (auto e = vm.exports.begin(); e != vm.exports.end();)
+        e = e->second >= module.base && e->second < end ? vm.exports.erase(e) : std::next(e);
+    vm.Free(module.base);
+    vm.modules.erase(found);
+    return id;
 }
 
 u32 Allocate(u32 size) { return TheVm().Allocate(size); }

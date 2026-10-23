@@ -1674,6 +1674,52 @@ void IopModulesAreRecorded() {
           s32(CallIop("loadcore", 7, {table}).result) == -213, "ReleaseLibraryEntries, then KE_LIBRARY_NOTFOUND");
 }
 
+// Modules the interpreter runs, stopped and unloaded as modload does it - for
+// loadfile's requests from the EE (Tekken 5 stops and unloads sbse_drv): only
+// one whose start answered MODULE_REMOVABLE_END, only once its stop (argc
+// negative, argv[0] "other") answers MODULE_NO_RESIDENT_END, and only once
+// nothing points into it. A module whose services are the host's stays.
+void IopModulesStopAndUnload() {
+    using namespace ps2host::iop;
+    Vm& vm = TheVm();
+    // _start: a stop (argc < 0) answers 1, MODULE_NO_RESIDENT_END; a start 2,
+    // MODULE_REMOVABLE_END.
+    const std::vector<u32> removable = {0x04800003u,       // bltz $a0, +3 (the stop)
+                                        0,
+                                        0x03E00008u,       // jr $ra
+                                        0x24020002u,       // li $v0, 2
+                                        0x03E00008u,       // jr $ra
+                                        0x24020001u};      // li $v0, 1
+    s32 result = -1, answer = 0;
+    Check(LoadModule("removable.irx", TestModule(removable, 0, "removable"), {}, &result, 31) && result == 2,
+          "module: started, removable");
+    const u32 base = vm.modules[31].base;
+    Check(SearchModule("removable") == 31 && SearchModule("absent") == -202,
+          "module: found by name, and KE_UNKNOWN_MODULE for none");
+    Check(UnloadModule(31) == -210, "module: not unloaded before it stops: KE_NOT_STOPPED");
+    Check(StopModule(31, {}, &answer) == 31 && answer == 1, "module: stopped, MODULE_NO_RESIDENT_END");
+    Check(StopModule(31, {}, &answer) == -208, "module: stopped already: KE_ALREADY_STOPPED");
+    Thread left;
+    left.id = 0xF00D;
+    left.entry = base;
+    vm.threads[left.id] = left;
+    Check(UnloadModule(31) == -210 && SearchModule("removable") == 31,
+          "module: with a thread still in it, not unloaded");
+    vm.threads.erase(left.id);
+    Check(UnloadModule(31) == 31 && SearchModule("removable") == -202 && !vm.used_blocks.count(base),
+          "module: unloaded, its memory freed");
+    const std::vector<u32> resident = {0x03E00008u, 0x24020000u};       // li $v0, 0: MODULE_RESIDENT_END
+    Check(LoadModule("resident.irx", TestModule(resident, 0, "resident"), {}, &result, 32) && result == 0 &&
+          StopModule(32, {}, &answer) == -211, "module: a resident one stays: KE_NOT_REMOVABLE");
+    RecordModule(33, TestModule({0x03E00008u, 0}, 0, "served"));
+    Check(SearchModule("served") == 33 && StopModule(33, {}, &answer) == -211 && UnloadModule(33) == -211,
+          "module: one the host serves is found, and stays");
+    const std::vector<u32> stubborn = {0x03E00008u, 0x24020002u};       // a stop answered with 2 too
+    Check(LoadModule("stubborn.irx", TestModule(stubborn, 0, "stubborn"), {}, &result, 34) && result == 2 &&
+          StopModule(34, {}, &answer) == -209 && answer == 2, "module: a stop it refuses: KE_CAN_NOT_STOP");
+    for (s32 id : {32, 33, 34}) vm.modules.erase(id);
+}
+
 // A stub calling the host's (library, export), as the loader patches one.
 void PatchStub(u32 at, const char* library, u32 index) {
     using namespace ps2host::iop;
@@ -2433,6 +2479,7 @@ int main() {
     IopSetjmpReturnsTwice();
     IopReadsTheDiscAsCdvdmanAndIomanDo();
     IopModulesAreRecorded();
+    IopModulesStopAndUnload();
     IopServesRequestsOneByOne();
     IopCallsTheEe();
     IopBindsWaitForTheirModules();

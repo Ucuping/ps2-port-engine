@@ -40,6 +40,22 @@ bool LoadModule(const std::string& path, const std::vector<std::uint8_t>& image,
    sizes, from its image, for modload to report (SearchModuleByName). */
 void RecordModule(std::int32_t id, const std::vector<std::uint8_t>& image);
 
+/* Loadfile's module requests, answered as modload answers them (ps2sdk's
+   kerr.h for the errors): the latest module of a name, by its ID, or
+   KE_UNKNOWN_MODULE (-202); a module stopped - its entry run with argc
+   negative and argv[0] "other" (`args` after it), `*module_result` its
+   answer - and then unloaded: the ID, or an error. Only a module the
+   interpreter runs, whose start answered MODULE_REMOVABLE_END, stops
+   (KE_NOT_REMOVABLE: one whose services are the host's stays, as a console's
+   resident modules do), and only once its stop answers MODULE_NO_RESIDENT_END
+   (KE_CAN_NOT_STOP). It is unloaded - its memory freed, its exports gone -
+   only once stopped and nothing points into it any more: no thread, handler,
+   RPC server or other module's import (KE_NOT_STOPPED otherwise, and why in
+   the log). */
+std::int32_t SearchModule(const std::string& name);
+std::int32_t StopModule(std::int32_t id, const std::vector<std::uint8_t>& args, std::int32_t* module_result);
+std::int32_t UnloadModule(std::int32_t id);
+
 /* An EE command (not one of the SIF system's) for a handler a module added;
    `data_dest`/`data` is the extra data DMA'd to IOP memory before it. False when
    no module handles the command. */

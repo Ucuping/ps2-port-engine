@@ -16,6 +16,9 @@
  *                     0x004  -                     (the answer: start result)
  *                     0x008  path, 252 bytes ("cdrom0:\\IOP\\USBD.IRX;1")
  *                     0x104  arguments, 252 bytes
+ *   procedures 9, 7, 8  look for a module by name, stop one, unload one (ps2sdk's
+ *                   LF_F_SEARCH_MOD_BY_NAME, LF_F_MOD_STOP, LF_F_MOD_UNLOAD), as
+ *                   modload answers them - iop::SearchModule and the rest
  * Any other procedure is noted and fails.
  */
 
@@ -164,6 +167,48 @@ std::vector<u8> LoadFile(u32 procedure, const std::vector<u8>& data) {
                                    " from IOP memory at " + Hex(address) + " loaded as " +
                                    std::to_string(id) + " (its services are the host's)");
         return Words(id, kResidentEnd);
+    }
+    // The module requests, as ps2sdk's loadfile-common.h lays them out, each
+    // logged with its answer.
+    if (procedure == 9 && data.size() > 8) {
+        // LF_F_SEARCH_MOD_BY_NAME: the name at +8; the answer, the module's ID
+        // or an error, at +0.
+        const char* begin = reinterpret_cast<const char*>(&data[8]);
+        const std::string name(begin, strnlen(begin, std::min<std::size_t>(252, data.size() - 8)));
+        const s32 id = iop::SearchModule(name);
+        Note("loadfile search " + name + " " + std::to_string(id),
+             "IOP: loadfile: the EE looks for module \"" + name + "\": " +
+                 (id > 0 ? "module " + std::to_string(id) : "none (" + std::to_string(id) + ")"));
+        return Words(id, 0);
+    }
+    if (procedure == 7 && data.size() >= 8) {
+        // LF_F_MOD_STOP: the ID at +0, the arguments' length at +4 and the
+        // arguments after a path's room (+8, 252 bytes); the answer, the result
+        // at +0 and the module's own at +4.
+        s32 id = 0, arg_length = 0;
+        std::memcpy(&id, &data[0], 4);
+        std::memcpy(&arg_length, &data[4], 4);
+        constexpr std::size_t kArgs = 8 + 252;
+        std::vector<u8> args;
+        if (arg_length > 0 && data.size() >= kArgs + std::size_t(arg_length))
+            args.assign(data.begin() + kArgs, data.begin() + kArgs + arg_length);
+        s32 module_result = 0;
+        const s32 result = iop::StopModule(id, args, &module_result);
+        Note("loadfile stop " + std::to_string(id) + " " + std::to_string(result),
+             "IOP: loadfile: the EE stops module " + std::to_string(id) + ": " +
+                 (result > 0 ? "stopped (it answered " + std::to_string(module_result) + ")"
+                             : "refused (" + std::to_string(result) + ")"));
+        return Words(result, u32(module_result));
+    }
+    if (procedure == 8 && data.size() >= 4) {
+        // LF_F_MOD_UNLOAD: the ID at +0; the answer, the result, at +0.
+        s32 id = 0;
+        std::memcpy(&id, &data[0], 4);
+        const s32 result = iop::UnloadModule(id);
+        Note("loadfile unload " + std::to_string(id) + " " + std::to_string(result),
+             "IOP: loadfile: the EE unloads module " + std::to_string(id) + ": " +
+                 (result > 0 ? "unloaded" : "refused (" + std::to_string(result) + ")"));
+        return Words(result, 0);
     }
     Note("loadfile " + std::to_string(procedure),
          "IOP: loadfile procedure " + std::to_string(procedure) + " is not implemented (failed)");
