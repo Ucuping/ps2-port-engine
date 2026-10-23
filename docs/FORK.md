@@ -119,6 +119,37 @@ stub dispatch table, every test) checks that it still builds and passes.
   (`-ferror-limit=0`): derive drops each function that does not compile and
   builds again, and clang's limit of twenty made that a build per handful of
   functions - seven builds of a 90 MB file for Tekken 5's game program.
+- `plzcw` and `prot3w` in the interpreter and the lifter (the MMI's leading
+  sign bits, and a rotation of three words), with a semantic test of each.
+- Two choices of a game's analysis, off by default: call targets from the
+  code only (`"calls_from_code_only"`: an overlay's image holds its data,
+  and data that decodes as `jal` made up 103 entries in Tekken 5's game
+  program), and functions that end at their returns (`"end_at_returns"`:
+  after a `jr $ra` and its delay slot, when padding or the next function's
+  prologue follows - GCC's scheduled prologues included - and nothing before
+  it branches past; a `j` to a function's start is a tail call, not a
+  branch). Against Tekken 5's FDEs the second brings seven functions' ends
+  nearer and none further.
+- Guessed functions another source confirms count as sure: a game's
+  `"confirmed"` table (`tools/confirm.py`), each entry with its sources - a
+  run's call into it (the host's `--called` record, which leaves jumps out),
+  or Ghidra's analysis of the same image. `progress.py` reports how many,
+  by source.
+- derive's compiled check compiles the emitted file in parts side by side, as
+  many at once as the cores and the memory available allow
+  (`cppcheck.split_definitions`, `compile_jobs`); the parts link into the one
+  library, and errors are reported at the emitted file's lines. Tekken 5's 88
+  MB file: 349 s with five at once, where it was 1,058 s as one.
+- `data/iop_exports.csv`: ioman's, iomanx's and stdio's names at their places
+  (a line of ps2sdk's tables that opens with a comment had been left out).
+- The IOP libraries Tekken 5's modules import: thbase's thread queries and
+  ExitDeleteThread, thvpool and thfpool, setjmp/longjmp, modload's module
+  queries over a record of the modules loaded, cdvdman's file search, ioman
+  over the disc (read-only), timrman's counter, and sifcmd's RPC to the EE's
+  servers (the EE's RPC end now reaches the module's client) and its
+  request-by-request serving. `Disc::List` gives a directory's entries.
+  modload's SearchModuleByName answers 1 for a name no module recorded has,
+  as the DirtySock stub answered every name before.
 
 Found and not yet changed, with the evidence in the Tekken 5 repository's
 `games/tekken5/docs/FINDINGS.md` ("Engine findings worth upstreaming"): a call
