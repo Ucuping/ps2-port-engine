@@ -1720,6 +1720,30 @@ void IopModulesStopAndUnload() {
     for (s32 id : {32, 33, 34}) vm.modules.erase(id);
 }
 
+// What is there twice is noted: a module loaded while one of its name still
+// is, and an RPC server registered while one of its id still is. Tekken 5's
+// sbse_drv stays loaded, stopped, its server registered: a second load, or a
+// second server, is the point to look at again.
+void IopNotesWhatIsThereTwice() {
+    using namespace ps2host::iop;
+    Vm& vm = TheVm();
+    auto noted = [](const char* part) {
+        for (const std::string& note : ps2host::RunStats().notes)
+            if (note.find(part) != std::string::npos) return true;
+        return false;
+    };
+    RecordModule(41, TestModule({0x03E00008u, 0}, 0, "twice"));
+    RecordModule(42, TestModule({0x03E00008u, 0}, 0, "twice"));
+    Check(noted("twice loaded again (module 42) while module 41"), "noted: a module loaded again");
+    vm.modules.erase(41), vm.modules.erase(42);
+    const u32 first = kIopScratch + 0x3A00, second = kIopScratch + 0x3A80, buffer = kIopScratch + 0x3B00;
+    CallIop("sifcmd", 17, {first, 0x12345678u, 0x00011110u, buffer, 0, 0, 0});
+    Check(!noted("RPC 0x12345678 registered again"), "not noted: one server of an id");
+    CallIop("sifcmd", 17, {second, 0x12345678u, 0x00022220u, buffer, 0, 0, 0});
+    Check(noted("RPC 0x12345678 registered again"), "noted: a second server of the same id");
+    vm.rpc_servers.erase(first), vm.rpc_servers.erase(second);
+}
+
 // A stub calling the host's (library, export), as the loader patches one.
 void PatchStub(u32 at, const char* library, u32 index) {
     using namespace ps2host::iop;
@@ -2480,6 +2504,7 @@ int main() {
     IopReadsTheDiscAsCdvdmanAndIomanDo();
     IopModulesAreRecorded();
     IopModulesStopAndUnload();
+    IopNotesWhatIsThereTwice();
     IopServesRequestsOneByOne();
     IopCallsTheEe();
     IopBindsWaitForTheirModules();

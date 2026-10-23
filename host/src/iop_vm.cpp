@@ -421,8 +421,29 @@ ModuleRecord Describe(const std::vector<u8>& image, u32 base) {
 
 }  // namespace
 
+namespace {
+
+// A module loaded while one of its name still is - loaded again, or one
+// whose unload was refused (Tekken 5's sbse_drv) - is noted: which of the
+// two answers the game is the host's choice.
+void NoteLoadedAgain(Vm& vm, const std::string& name, s32 id) {
+    for (const auto& [other, module] : vm.modules)
+        if (module.name == name && other != id) {
+            Note("iop load again " + name + " " + std::to_string(id),
+                 "IOP: " + name + " loaded again (module " + std::to_string(id) + ") while module " +
+                     std::to_string(other) + " of that name still is" +
+                     (module.stopped ? " (stopped, not unloaded)" : ""));
+            return;
+        }
+}
+
+}  // namespace
+
 void RecordModule(s32 id, const std::vector<u8>& image) {
-    if (id > 0) TheVm().modules[id] = Describe(image, 0);
+    if (id <= 0) return;
+    ModuleRecord record = Describe(image, 0);
+    NoteLoadedAgain(TheVm(), record.name, id);
+    TheVm().modules[id] = record;
 }
 
 // The last Run ended with threads still to run (its slice spent): the IOP
@@ -717,7 +738,11 @@ bool LoadModule(const std::string& path, const std::vector<u8>& image,
     }
     for (const std::string& name : missing)
         Note("iop missing " + name, "IOP: " + path + " imports " + name + ", which the host lacks");
-    if (id > 0) vm.modules[id] = Describe(image, base);
+    if (id > 0) {
+        ModuleRecord record = Describe(image, base);
+        NoteLoadedAgain(vm, record.name, id);
+        vm.modules[id] = record;
+    }
     // Start it: _start(argc, argv), argv[0] the path, then the argument strings.
     std::vector<std::string> words{path};
     Words(args, &words);

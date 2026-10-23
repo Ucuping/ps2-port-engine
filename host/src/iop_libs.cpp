@@ -867,6 +867,19 @@ Outcome RegisterRpc(Vm& vm, Context& c) {
     e.cfunction = A(vm, c, 4);
     e.cbuffer = A(vm, c, 5);
     e.queue = A(vm, c, 6);
+    // A server registered while another of its id still is - a module loaded
+    // again, or a stopped one's server left behind (Tekken 5's sbse_drv) - is
+    // worth a look: which of the two the EE reaches is the host's choice.
+    for (const auto& [address, other] : vm.rpc_servers)
+        if (other.sid == e.sid && address != e.server) {
+            char again[192];
+            std::snprintf(again, sizeof again,
+                          "IOP: RPC 0x%08X registered again (function 0x%08X, server 0x%08X) while it still is "
+                          "(function 0x%08X, server 0x%08X)", unsigned(e.sid), unsigned(e.function),
+                          unsigned(e.server), unsigned(other.function), unsigned(address));
+            Note("iop rpc again " + std::to_string(e.sid) + " " + std::to_string(e.server), again);
+            break;
+        }
     vm.rpc_servers[e.server] = e;
     char text[128];
     std::snprintf(text, sizeof text, "IOP: a module serves RPC 0x%08X (function 0x%08X)",
