@@ -32,9 +32,13 @@ void RunModule(const std::string& file_name);
 bool RunsModule(const std::string& path);
 
 /* Loads and starts a module image; its start routine's result (0: resident,
-   1: no resident, 2: removable) goes to *result. False if it cannot be loaded. */
+   1: no resident, 2: removable) goes to *result. False if it cannot be loaded.
+   `id` is the module ID loadfile gave it, which modload reports it by. */
 bool LoadModule(const std::string& path, const std::vector<std::uint8_t>& image,
-                const std::vector<std::uint8_t>& args, std::int32_t* result);
+                const std::vector<std::uint8_t>& args, std::int32_t* result, std::int32_t id = 0);
+/* A module loaded without running (its services are the host's): its name and
+   sizes, from its image, for modload to report (SearchModuleByName). */
+void RecordModule(std::int32_t id, const std::vector<std::uint8_t>& image);
 
 /* An EE command (not one of the SIF system's) for a handler a module added;
    `data_dest`/`data` is the extra data DMA'd to IOP memory before it. False when
@@ -51,6 +55,10 @@ void Free(std::uint32_t address);
 bool RpcServer(std::uint32_t sid, std::uint32_t* server, std::uint32_t* buffer,
                std::uint32_t* cbuffer);
 bool OwnsServer(std::uint32_t server);
+/* The EE's end of an RPC a module made (an RPC-end packet, 0x80000008): the
+   client's fields filled, its thread woken. False if no module's client
+   waits for it. */
+bool RpcEnd(const std::vector<std::uint8_t>& packet);
 /* A call to such a server: its arguments are already in the server's buffer
    (the EE DMA'd them there); the module's thread runs the function, and the
    answer goes back as the IOP's would (QueueRpcEnd). */

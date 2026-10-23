@@ -10,7 +10,11 @@
  *   intrman                  interrupts: the host has no interrupt masking
  *   thbase, thsemap, thevent the IOP kernel's threads, semaphores, event flags,
  *                            clock and alarms, on the interpreter's scheduler
- *   sifman, sifcmd           SIF DMA and commands, to and from the EE (iop.cpp)
+ *   sifman, sifcmd           SIF DMA and commands, to and from the EE (iop.cpp);
+ *                            RPC served, and made to the EE's servers
+ *   thvpool, thfpool, modload  memory pools, the modules loaded
+ *   cdvdman, ioman           the disc: sectors, and its files (read-only; no
+ *                            other device, as on a console without a host)
  *   libsd                    the sound processor (SPU2): state is kept, sound
  *                            data is copied into SPU RAM, and transfer interrupts
  *                            arrive at the rate the hardware's would - nothing
@@ -25,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <cctype>
 #include <map>
 #include <memory>
@@ -75,6 +80,9 @@ Outcome CreateThread(Vm& vm, Context& c) {
     t.entry = vm.Read(p + 8, 4);
     t.stack_size = (vm.Read(p + 12, 4) + 15) & ~15u;
     t.priority = s32(vm.Read(p + 16, 4));
+    t.attr = vm.Read(p, 4);
+    t.option = vm.Read(p + 4, 4);
+    t.initial_priority = t.priority;
     t.stack = vm.Allocate(t.stack_size);
     if (!t.stack) return Ret(c, u32(-400));          // KE_NO_MEMORY
     t.wait = Wait::Dormant;
@@ -369,6 +377,7 @@ Outcome AllocHardTimer(Vm& vm, Context& c) {
     if (vm.hard_timers.size() >= 4) return Ret(c, u32(KE_NO_TIMER));
     HardTimer t;
     t.source = A(vm, c, 0);
+    t.bits = A(vm, c, 1) == 16 ? 16 : 32;
     t.prescale = std::max(1u, A(vm, c, 2));
     const u32 id = 0x100 + u32(vm.hard_timers.size());
     vm.hard_timers[id] = t;
@@ -403,10 +412,21 @@ Outcome SetupHardTimer(Vm& vm, Context& c) {
     return Ret(c, KE_OK);
 }
 
+// A timer's counter: the counts of its clock, prescaled, since it started -
+// since its last interrupt when a handler restarts it at its compare value -
+// as wide as the timer (16 or 32 bits).
+u32 Counter(Vm& vm, const HardTimer& t) {
+    if (!t.running) return t.count;
+    u64 counts = u64(double(vm.NowUs() - t.started_us) * HardTimerHz(t) / 1e6 / t.prescale);
+    if (t.handler && t.compare) counts %= t.compare;
+    return t.bits == 16 ? u32(counts & 0xFFFF) : u32(counts);
+}
+
 Outcome StartHardTimer(Vm& vm, Context& c) {
     HardTimer* t = TimerOf(vm, c);
     if (!t) return Ret(c, u32(KE_ILLEGAL_TIMERID));
     t->running = true;
+    t->started_us = vm.NowUs();
     t->due_us = vm.NowUs() + HardTimerPeriodUs(*t);
     return Ret(c, KE_OK);
 }
@@ -414,8 +434,15 @@ Outcome StartHardTimer(Vm& vm, Context& c) {
 Outcome StopHardTimer(Vm& vm, Context& c) {
     HardTimer* t = TimerOf(vm, c);
     if (!t) return Ret(c, u32(KE_ILLEGAL_TIMERID));
+    t->count = Counter(vm, *t);
     t->running = false;
     return Ret(c, KE_OK);
+}
+
+// GetTimerCounter(id)
+Outcome GetTimerCounter(Vm& vm, Context& c) {
+    HardTimer* t = TimerOf(vm, c);
+    return Ret(c, t ? Counter(vm, *t) : u32(KE_ILLEGAL_TIMERID));
 }
 
 // sceSifGetOtherData(receive data, EE source, IOP destination, size, mode):
@@ -772,11 +799,9 @@ Outcome RemoveCmdHandler(Vm& vm, Context& c) {
     return Ret(c, KE_OK);
 }
 
-// sceSifSendCmd(command, packet, packet_size, src, dest, size): the packet goes
-// to the EE's receive buffer and `size` bytes from IOP `src` to EE `dest`.
-Outcome SendCmd(Vm& vm, Context& c) {
-    const u32 command = A(vm, c, 0), packet = A(vm, c, 1), psize = A(vm, c, 2);
-    const u32 src = A(vm, c, 3), dest = A(vm, c, 4), size = A(vm, c, 5);
+// A command to the EE: `size` bytes from IOP `src` to EE `dest`, then the
+// packet - its header written - to the EE's receive buffer.
+void SendToEe(Vm& vm, u32 command, u32 packet, u32 psize, u32 src, u32 dest, u32 size) {
     Memory& ee = GuestMemory();
     for (u32 i = 0; i < size; ++i) ee.Write(dest + i, vm.Read(src + i, 1), 1);
     vm.Write(packet, (psize & 0xFF) | (size << 8), 4);
@@ -800,6 +825,12 @@ Outcome SendCmd(Vm& vm, Context& c) {
     // sound, DMA'd back - is there for the handler 128 samples on, not one
     // frame on (the input ring played stale pieces: crackle).
     if (vm.current == 0 && !(command & 0x80000000u)) ps2host::DeliverIopPacketNow();
+}
+
+// sceSifSendCmd(command, packet, packet_size, src, dest, size): the packet goes
+// to the EE's receive buffer and `size` bytes from IOP `src` to EE `dest`.
+Outcome SendCmd(Vm& vm, Context& c) {
+    SendToEe(vm, A(vm, c, 0), A(vm, c, 1), A(vm, c, 2), A(vm, c, 3), A(vm, c, 4), A(vm, c, 5));
     return Ret(c, 1);
 }
 
@@ -1123,6 +1154,616 @@ Outcome SdGetEffectAttr(Vm& vm, Context& c) {
     return Ret(c, 0);
 }
 
+// ---------------------------------------------------------------- thread status
+
+constexpr s32 KE_ILLEGAL_TYPE = -431, KE_ILLEGAL_SIZE = -432;
+constexpr u32 THS_RUN = 0x01, THS_READY = 0x02, THS_WAIT = 0x04, THS_DORMANT = 0x10;
+
+Thread* ThreadOf(Vm& vm, u32 id) {
+    if (id == 0) return vm.Current();                // TH_SELF
+    auto found = vm.threads.find(id);
+    return found == vm.threads.end() ? nullptr : &found->second;
+}
+
+// A thread's status, and what it waits on as thbase names it: TSW_SLEEP 1,
+// DELAY 2, SEMA 3, EVENTFLAG 4, MBX 5. A wait inside the SIF library (its RPC
+// loop, an RPC to the EE) is a sleep, as the library's own is.
+void StatusOf(const Vm& vm, const Thread& t, u32* status, u32* type, u32* object) {
+    *type = *object = 0;
+    if (t.id == vm.current) *status = THS_RUN;
+    else if (t.ready) *status = THS_READY;
+    else if (t.wait == Wait::Dormant) *status = THS_DORMANT;
+    else *status = THS_WAIT;
+    if (*status != THS_WAIT) return;
+    switch (t.wait) {
+        case Wait::Sleep: case Wait::Rpc: case Wait::Client: *type = 1; break;
+        case Wait::Delay: *type = 2; break;
+        case Wait::Sema: *type = 3; *object = t.object; break;
+        case Wait::Event: *type = 4; *object = t.object; break;
+        case Wait::Mbx: *type = 5; *object = t.object; break;
+        default: break;
+    }
+}
+
+// ReferThreadStatus(id, info): iop_thread_info_t - attr, option, status,
+// entry, stack, stackSize, gpReg, initPriority, currentPriority, waitType,
+// waitId, wakeupCount, regContext, reserved[4].
+Outcome ReferThreadStatus(Vm& vm, Context& c) {
+    Thread* t = ThreadOf(vm, A(vm, c, 0));
+    if (!t) return Ret(c, u32(KE_UNKNOWN_THID));
+    u32 status, type, object;
+    StatusOf(vm, *t, &status, &type, &object);
+    const u32 words[17] = {t->attr, t->option, status, t->entry, t->stack, t->stack_size, t->c.r[28],
+                           u32(t->initial_priority), u32(t->priority), type, object, u32(t->wakeups)};
+    const u32 p = A(vm, c, 1);
+    for (u32 i = 0; i < 17; ++i) vm.Write(p + 4 * i, words[i], 4);
+    return Ret(c, KE_OK);
+}
+
+// ReferThreadRunStatus(id, status, size): iop_thread_run_status_t - status,
+// currentPriority, waitType, waitId, wakeupCount, regContext, runClocks (8
+// bytes), and three counts the host does not keep; 44 bytes, the rest zeroed.
+Outcome ReferThreadRunStatus(Vm& vm, Context& c) {
+    if (vm.in_interrupt) return Ret(c, u32(KE_ILLEGAL_CONTEXT));
+    Thread* t = ThreadOf(vm, A(vm, c, 0));
+    if (!t) return Ret(c, u32(KE_UNKNOWN_THID));
+    const u32 p = A(vm, c, 1), size = A(vm, c, 2);
+    if (size < 44) return Ret(c, u32(KE_ILLEGAL_SIZE));
+    for (u32 i = 0; i < size; ++i) vm.Write(p + i, 0, 1);
+    u32 status, type, object;
+    StatusOf(vm, *t, &status, &type, &object);
+    const u32 words[5] = {status, u32(t->priority), type, object, u32(t->wakeups)};
+    for (u32 i = 0; i < 5; ++i) vm.Write(p + 4 * i, words[i], 4);
+    return Ret(c, KE_OK);
+}
+
+// GetThreadmanIdList(type, buffer, length, &count): the ids of one kind of
+// object - TMID_Thread 1, Semaphore 2, EventFlag 3, Mbox 4, Vpl 5, Fpl 6,
+// SleepThread 7, DelayThread 8, DormantThread 9 - as many as the buffer holds;
+// returns how many it wrote, and sets the count to how many there are.
+Outcome GetThreadmanIdList(Vm& vm, Context& c) {
+    if (vm.in_interrupt) return Ret(c, u32(KE_ILLEGAL_CONTEXT));
+    const u32 type = A(vm, c, 0), buffer = A(vm, c, 1), length = A(vm, c, 2), count = A(vm, c, 3);
+    std::vector<u32> ids;
+    auto threads = [&](auto keep) { for (const auto& [id, t] : vm.threads) if (keep(t)) ids.push_back(id); };
+    switch (type) {
+        case 1: threads([](const Thread&) { return true; }); break;
+        case 2: for (const auto& entry : vm.semaphores) ids.push_back(entry.first); break;
+        case 3: for (const auto& entry : vm.events) ids.push_back(entry.first); break;
+        case 4: for (const auto& entry : vm.mailboxes) ids.push_back(entry.first); break;
+        case 5: case 6:
+            for (const auto& [id, pool] : vm.pools) if (pool.fixed == (type == 6)) ids.push_back(id);
+            break;
+        case 7: threads([](const Thread& t) { return !t.ready && t.wait == Wait::Sleep; }); break;
+        case 8: threads([](const Thread& t) { return !t.ready && t.wait == Wait::Delay; }); break;
+        case 9: threads([](const Thread& t) { return !t.ready && t.wait == Wait::Dormant; }); break;
+        default: return Ret(c, u32(KE_ILLEGAL_TYPE));
+    }
+    const u32 written = std::min<u32>(u32(ids.size()), s32(length) > 0 ? length : 0);
+    for (u32 i = 0; i < written; ++i) vm.Write(buffer + 4 * i, ids[i], 4);
+    if (count) vm.Write(count, u32(ids.size()), 4);
+    return Ret(c, written);
+}
+
+// ExitDeleteThread(): the thread ends, and is deleted once it has stopped.
+Outcome ExitDeleteThread(Vm& vm, Context& c) {
+    Thread* t = vm.Current();
+    if (!t) return Ret(c, u32(KE_ILLEGAL_CONTEXT));
+    t->ready = false;
+    t->wait = Wait::Dormant;
+    t->exit_delete = true;
+    return Outcome::Block;
+}
+
+// ---------------------------------------------------------------- setjmp
+
+// setjmp(env), longjmp(env, value) (sysclib): $s0-$s7, $sp, $fp and $ra in the
+// buffer's first eleven words, as ps2sdk's sysclib keeps them (newlib's MIPS
+// layout). longjmp returns from that setjmp again, with `value` (1 for 0).
+Outcome Setjmp(Vm& vm, Context& c) {
+    const u32 env = A(vm, c, 0);
+    for (u32 i = 0; i < 8; ++i) vm.Write(env + 4 * i, c.r[16 + i], 4);
+    vm.Write(env + 32, c.r[29], 4);
+    vm.Write(env + 36, c.r[30], 4);
+    vm.Write(env + 40, c.r[31], 4);
+    return Ret(c, 0);
+}
+
+Outcome Longjmp(Vm& vm, Context& c) {
+    const u32 env = A(vm, c, 0), value = A(vm, c, 1);
+    for (u32 i = 0; i < 8; ++i) c.r[16 + i] = vm.Read(env + 4 * i, 4);
+    c.r[29] = vm.Read(env + 32, 4);
+    c.r[30] = vm.Read(env + 36, 4);
+    c.r[31] = vm.Read(env + 40, 4);                  // where the call returns: setjmp's caller
+    return Ret(c, value ? value : 1);
+}
+
+// ---------------------------------------------------------------- memory pools
+
+constexpr s32 KE_NO_MEMORY = -400, KE_UNKNOWN_VPLID = -411, KE_UNKNOWN_FPLID = -412;
+constexpr s32 KE_ILLEGAL_MEMBLOCK = -426, KE_ILLEGAL_MEMSIZE = -427;
+
+Pool* PoolOf(Vm& vm, u32 id, bool fixed) {
+    auto found = vm.pools.find(id);
+    return found == vm.pools.end() || found->second.fixed != fixed ? nullptr : &found->second;
+}
+
+// A piece of a pool, first fit, in units of 8 bytes; 0 if none is free.
+u32 PoolTake(Pool& pool, u32 size) {
+    size = (size + 7) & ~7u;
+    for (auto it = pool.free_blocks.begin(); it != pool.free_blocks.end(); ++it) {
+        if (it->second < size) continue;
+        const u32 address = it->first, left = it->second - size;
+        pool.free_blocks.erase(it);
+        if (left) pool.free_blocks[address + size] = left;
+        pool.used_blocks[address] = size;
+        return address;
+    }
+    return 0;
+}
+
+bool PoolGive(Pool& pool, u32 address) {
+    auto used = pool.used_blocks.find(address);
+    if (used == pool.used_blocks.end()) return false;
+    u32 start = address, size = used->second;
+    pool.used_blocks.erase(used);
+    auto next = pool.free_blocks.find(start + size);
+    if (next != pool.free_blocks.end()) { size += next->second; pool.free_blocks.erase(next); }
+    auto before = pool.free_blocks.lower_bound(start);
+    if (before != pool.free_blocks.begin() && (--before)->first + before->second == start) {
+        start = before->first;
+        size += before->second;
+        pool.free_blocks.erase(before);
+    }
+    pool.free_blocks[start] = size;
+    return true;
+}
+
+u32 NewPool(Vm& vm, Pool pool) {
+    pool.base = vm.Allocate(pool.size);
+    if (!pool.base) return u32(KE_NO_MEMORY);
+    pool.free_blocks[pool.base] = pool.size;
+    const u32 id = vm.next_id++;
+    vm.pools[id] = std::move(pool);
+    return id;
+}
+
+// CreateVpl(param): iop_vpl_param - attr, option, size.
+Outcome CreateVpl(Vm& vm, Context& c) {
+    const u32 p = A(vm, c, 0);
+    const s32 size = s32(vm.Read(p + 8, 4));
+    if (size <= 0) return Ret(c, u32(KE_ILLEGAL_MEMSIZE));
+    Pool pool;
+    pool.attr = vm.Read(p, 4);
+    pool.option = vm.Read(p + 4, 4);
+    pool.size = (u32(size) + 7) & ~7u;
+    return Ret(c, NewPool(vm, std::move(pool)));
+}
+
+// CreateFpl(param): iop_fpl_param - attr, option, block_size, blocks.
+Outcome CreateFpl(Vm& vm, Context& c) {
+    const u32 p = A(vm, c, 0);
+    const s32 block_size = s32(vm.Read(p + 8, 4)), blocks = s32(vm.Read(p + 12, 4));
+    if (block_size <= 0 || blocks <= 0) return Ret(c, u32(KE_ILLEGAL_MEMSIZE));
+    Pool pool;
+    pool.fixed = true;
+    pool.attr = vm.Read(p, 4);
+    pool.option = vm.Read(p + 4, 4);
+    pool.block_size = (u32(block_size) + 7) & ~7u;
+    pool.blocks = u32(blocks);
+    pool.size = pool.block_size * pool.blocks;
+    return Ret(c, NewPool(vm, std::move(pool)));
+}
+
+Outcome DeletePool(Vm& vm, Context& c, bool fixed) {
+    Pool* pool = PoolOf(vm, A(vm, c, 0), fixed);
+    if (!pool) return Ret(c, u32(fixed ? KE_UNKNOWN_FPLID : KE_UNKNOWN_VPLID));
+    vm.Free(pool->base);
+    vm.pools.erase(A(vm, c, 0));
+    return Ret(c, KE_OK);
+}
+
+Outcome DeleteVpl(Vm& vm, Context& c) { return DeletePool(vm, c, false); }
+Outcome DeleteFpl(Vm& vm, Context& c) { return DeletePool(vm, c, true); }
+
+// pAllocateVpl(id, size): a piece, or KE_NO_MEMORY without waiting.
+Outcome PollAllocateVpl(Vm& vm, Context& c) {
+    Pool* pool = PoolOf(vm, A(vm, c, 0), false);
+    if (!pool) return Ret(c, u32(KE_UNKNOWN_VPLID));
+    const s32 size = s32(A(vm, c, 1));
+    if (size <= 0 || u32(size) > pool->size) return Ret(c, u32(KE_ILLEGAL_MEMSIZE));
+    const u32 address = PoolTake(*pool, u32(size));
+    return Ret(c, address ? address : u32(KE_NO_MEMORY));
+}
+
+Outcome FreeVpl(Vm& vm, Context& c) {
+    Pool* pool = PoolOf(vm, A(vm, c, 0), false);
+    if (!pool) return Ret(c, u32(KE_UNKNOWN_VPLID));
+    return Ret(c, PoolGive(*pool, A(vm, c, 1)) ? u32(KE_OK) : u32(KE_ILLEGAL_MEMBLOCK));
+}
+
+// ---------------------------------------------------------------- modload, loadcore
+
+constexpr s32 KE_UNKNOWN_MODULE = -202, KE_ILLEGAL_FLAG = -220, KE_LIBRARY_NOTFOUND = -213;
+
+// SearchModuleByName(name): the latest module of that name loaded, by its id.
+// A name no module recorded has - a BIOS module's (rom0:), whose image the
+// host does not have - is answered 1 and noted, as DirtySock's search was
+// before modules were recorded (iop_inet.cpp): KE_UNKNOWN_MODULE would tell
+// a module that one it needs is missing when it may be the BIOS's.
+Outcome SearchModuleByName(Vm& vm, Context& c) {
+    const std::string name = vm.String(A(vm, c, 0), 56);
+    s32 found = 0;
+    for (const auto& [id, module] : vm.modules)
+        if (module.name == name && id > found) found = id;
+    if (found) return Ret(c, u32(found));
+    Note("iop module search " + name, "IOP: SearchModuleByName(\"" + name +
+         "\"): no module loaded by that name is recorded; answered 1");
+    return Ret(c, 1);
+}
+
+// ReferModuleStatus(id, status): ModuleStatus - name (56 bytes), version and
+// flags (16 bits each), id, entry, gp, text address and size, data and BSS
+// sizes, two reserved words.
+Outcome ReferModuleStatus(Vm& vm, Context& c) {
+    const auto found = vm.modules.find(s32(A(vm, c, 0)));
+    if (found == vm.modules.end()) return Ret(c, u32(KE_UNKNOWN_MODULE));
+    const ModuleRecord& m = found->second;
+    const u32 p = A(vm, c, 1);
+    for (u32 i = 0; i < 56; ++i) vm.Write(p + i, i < 55 && i < m.name.size() ? u8(m.name[i]) : 0, 1);
+    vm.Write(p + 56, m.version, 2);
+    vm.Write(p + 58, m.flags, 2);
+    const u32 words[9] = {u32(found->first), m.entry, m.gp, m.text, m.text_size, m.data_size, m.bss_size, 0, 0};
+    for (u32 i = 0; i < 9; ++i) vm.Write(p + 60 + 4 * i, words[i], 4);
+    return Ret(c, KE_OK);
+}
+
+// SetModuleFlags(id, flag): only 0x40 (the module may be unloaded) is one.
+Outcome SetModuleFlags(Vm& vm, Context& c) {
+    if (vm.in_interrupt) return Ret(c, u32(KE_ILLEGAL_CONTEXT));
+    const u32 flag = A(vm, c, 1);
+    if (flag & ~0x40u) return Ret(c, u32(KE_ILLEGAL_FLAG));
+    const auto found = vm.modules.find(s32(A(vm, c, 0)));
+    if (found == vm.modules.end()) return Ret(c, u32(KE_UNKNOWN_MODULE));
+    found->second.flags = u16(found->second.flags | flag);
+    return Ret(c, KE_OK);
+}
+
+// ReleaseLibraryEntries(table): what RegisterLibraryEntries offered is no more.
+Outcome ReleaseLibraryEntries(Vm& vm, Context& c) {
+    const u32 table = A(vm, c, 0);
+    const auto found = vm.exports.find(vm.String(table + 12, 8));
+    if (found == vm.exports.end() || found->second != table) return Ret(c, u32(KE_LIBRARY_NOTFOUND));
+    vm.exports.erase(found);
+    return Ret(c, KE_OK);
+}
+
+// ---------------------------------------------------------------- cdvdman: files, status
+
+// sceCdSearchFile(file, path): sceCdlFILE { lsn, size, name[16], date[8] } for
+// a file on the disc ("\\DATA\\X.BIN;1"); 1 if it is there, else 0. The date
+// as cdvdman gives it: the ISO record's flags, then seconds, minutes, hours,
+// day, month, and the year in two bytes.
+Outcome CdSearchFile(Vm& vm, Context& c) {
+    const u32 out = A(vm, c, 0);
+    const std::string path = vm.String(A(vm, c, 1), 256);
+    Disc::File file;
+    if (!GuestDisc().IsOpen() || !GuestDisc().Find(path, &file)) return Ret(c, 0);
+    vm.Write(out, file.lsn, 4);
+    vm.Write(out + 4, file.size, 4);
+    const std::string name = path.substr(path.find_last_of("\\/") + 1);
+    for (u32 i = 0; i < 16; ++i) vm.Write(out + 8 + i, i < 15 && i < name.size() ? u8(name[i]) : 0, 1);
+    const u32 year = 1900 + file.date[0];
+    const u8 date[8] = {file.flags, file.date[5], file.date[4], file.date[3], file.date[2], file.date[1],
+                        u8(year), u8(year >> 8)};
+    for (u32 i = 0; i < 8; ++i) vm.Write(out + 24 + i, date[i], 1);
+    return Ret(c, 1);
+}
+
+Outcome CdSeek(Vm&, Context& c) { return Ret(c, GuestDisc().IsOpen() ? 1 : 0); }
+
+// sceCdStatus(): SCECdStatPause - spinning, its reads done - with a disc in
+// (reads finish at once here); SCECdStatShellOpen without one.
+Outcome CdStatus(Vm&, Context& c) { return Ret(c, GuestDisc().IsOpen() ? 0x0A : 0x01); }
+
+// ---------------------------------------------------------------- ioman
+// The IOP's file system for modules, on the host: "cdrom0:" is the disc,
+// read-only; there is no other device, as on a console without a development
+// host ("host0:") - its calls fail as ioman's do, with the error negated.
+
+constexpr s32 kENOENT = 2, kEBADF = 9, kENODEV = 19, kENOTDIR = 20, kEISDIR = 21, kEINVAL = 22;
+constexpr s32 kEMFILE = 24, kEROFS = 30;
+constexpr u32 kModeFile = 0x14, kModeDirectory = 0x25;     // FIO_SO_IFREG|IROTH, IFDIR|IROTH|IXOTH
+
+// A path's device and the path on it: "cdrom0:\\A\\B.BIN;1" -> ("cdrom", "\\A\\B.BIN;1"),
+// a path with no device taken in the current directory (chdir).
+std::pair<std::string, std::string> Device(Vm& vm, std::string path) {
+    if (path.find(':') == std::string::npos && !vm.current_directory.empty())
+        path = vm.current_directory + (path.empty() || path[0] == '\\' || path[0] == '/' ? "" : "\\") + path;
+    const std::size_t colon = path.find(':');
+    if (colon == std::string::npos) return {"", path};
+    std::string device = path.substr(0, colon);
+    while (!device.empty() && std::isdigit(static_cast<unsigned char>(device.back()))) device.pop_back();
+    for (char& ch : device) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    return {device, path.substr(colon + 1)};
+}
+
+bool OnDisc(const std::string& device) { return device == "cdrom" && GuestDisc().IsOpen(); }
+
+s32 NewDescriptor(Vm& vm, IoFile file) {
+    for (s32 fd = 1; fd < 64; ++fd)
+        if (!vm.files.count(fd)) {
+            vm.files[fd] = std::move(file);
+            return fd;
+        }
+    return -kEMFILE;
+}
+
+// open(path, flags, mode): flags 1 read, 2 write, 3 both, 0x200 create...
+Outcome IoOpen(Vm& vm, Context& c) {
+    const auto [device, path] = Device(vm, vm.String(A(vm, c, 0), 1024));
+    if (!OnDisc(device)) return Ret(c, u32(-kENODEV));
+    if (A(vm, c, 1) & 0x0F02u) return Ret(c, u32(-kEROFS));    // write, append, create, truncate, exclusive
+    IoFile file;
+    if (!GuestDisc().Find(path, &file.file)) return Ret(c, u32(-kENOENT));
+    if (file.file.flags & 0x02) return Ret(c, u32(-kEISDIR));
+    return Ret(c, u32(NewDescriptor(vm, std::move(file))));
+}
+
+// close(fd), dclose(fd)
+Outcome IoClose(Vm& vm, Context& c) {
+    return Ret(c, vm.files.erase(s32(A(vm, c, 0))) ? u32(KE_OK) : u32(-kEBADF));
+}
+
+IoFile* FileOf(Vm& vm, Context& c, bool directory) {
+    auto found = vm.files.find(s32(A(vm, c, 0)));
+    return found == vm.files.end() || found->second.directory != directory ? nullptr : &found->second;
+}
+
+// read(fd, buffer, size): from the position on, as much as the file holds.
+Outcome IoRead(Vm& vm, Context& c) {
+    IoFile* f = FileOf(vm, c, false);
+    if (!f) return Ret(c, u32(-kEBADF));
+    const u32 buffer = A(vm, c, 1);
+    const s32 asked = s32(A(vm, c, 2));
+    if (asked < 0) return Ret(c, u32(-kEINVAL));
+    const u32 size = std::min(u32(asked), f->file.size - std::min(f->position, f->file.size));
+    if (!size) return Ret(c, 0);
+    const u32 first = f->position / kSectorSize;
+    const u32 sectors = (f->position + size + kSectorSize - 1) / kSectorSize - first;
+    std::vector<u8> data(std::size_t(sectors) * kSectorSize);
+    if (!GuestDisc().Read(f->file.lsn + first, sectors, data.data())) return Ret(c, u32(-kEINVAL));
+    std::memcpy(vm.At(buffer, size), &data[f->position % kSectorSize], size);
+    f->position += size;
+    return Ret(c, size);
+}
+
+// write(fd, buffer, size): the disc is read-only.
+Outcome IoWrite(Vm& vm, Context& c) {
+    return Ret(c, FileOf(vm, c, false) ? u32(-kEROFS) : u32(-kEBADF));
+}
+
+// lseek(fd, offset, whence): from the start (0), the position (1), the end (2).
+Outcome IoLseek(Vm& vm, Context& c) {
+    IoFile* f = FileOf(vm, c, false);
+    if (!f) return Ret(c, u32(-kEBADF));
+    const s64 offset = s32(A(vm, c, 1));
+    const u32 whence = A(vm, c, 2);
+    if (whence > 2) return Ret(c, u32(-kEINVAL));
+    const s64 at = offset + (whence == 1 ? s64(f->position) : whence == 2 ? s64(f->file.size) : 0);
+    if (at < 0) return Ret(c, u32(-kEINVAL));
+    f->position = u32(at);
+    return Ret(c, f->position);
+}
+
+// remove, mkdir, rmdir (path): the disc's are read-only, no other device is.
+Outcome IoChange(Vm& vm, Context& c) {
+    return Ret(c, OnDisc(Device(vm, vm.String(A(vm, c, 0), 1024)).first) ? u32(-kEROFS) : u32(-kENODEV));
+}
+
+// dopen(path): a directory on the disc, its entries for dread.
+Outcome IoDopen(Vm& vm, Context& c) {
+    const auto [device, path] = Device(vm, vm.String(A(vm, c, 0), 1024));
+    if (!OnDisc(device)) return Ret(c, u32(-kENODEV));
+    IoFile dir;
+    dir.directory = true;
+    if (!GuestDisc().Find(path, &dir.file)) return Ret(c, u32(-kENOENT));
+    if (!(dir.file.flags & 0x02) || !GuestDisc().List(path, &dir.entries)) return Ret(c, u32(-kENOTDIR));
+    return Ret(c, u32(NewDescriptor(vm, std::move(dir))));
+}
+
+// io_stat_t: mode, attr, size, ctime, atime, mtime (8 bytes each: as
+// sceCdSearchFile's date), hisize.
+void PutStat(Vm& vm, u32 p, const Disc::File& file) {
+    const u32 year = 1900 + file.date[0];
+    const u8 time[8] = {0, file.date[5], file.date[4], file.date[3], file.date[2], file.date[1], u8(year), u8(year >> 8)};
+    vm.Write(p, file.flags & 0x02 ? kModeDirectory : kModeFile, 4);
+    vm.Write(p + 4, 0, 4);
+    vm.Write(p + 8, file.size, 4);
+    for (u32 t = 0; t < 3; ++t)
+        for (u32 i = 0; i < 8; ++i) vm.Write(p + 12 + 8 * t + i, time[i], 1);
+    vm.Write(p + 36, 0, 4);
+}
+
+// dread(fd, entry): io_dirent_t - its io_stat_t, the name (256 bytes), a
+// private word; the name's length, or 0 past the last.
+Outcome IoDread(Vm& vm, Context& c) {
+    IoFile* dir = FileOf(vm, c, true);
+    if (!dir) return Ret(c, u32(-kEBADF));
+    if (dir->next >= dir->entries.size()) return Ret(c, 0);
+    const Disc::Entry& entry = dir->entries[dir->next++];
+    const u32 p = A(vm, c, 1);
+    PutStat(vm, p, entry.file);
+    for (u32 i = 0; i < 256; ++i) vm.Write(p + 40 + i, i < 255 && i < entry.name.size() ? u8(entry.name[i]) : 0, 1);
+    vm.Write(p + 296, 0, 4);
+    return Ret(c, u32(entry.name.size()));
+}
+
+// getstat(path, stat)
+Outcome IoGetstat(Vm& vm, Context& c) {
+    const auto [device, path] = Device(vm, vm.String(A(vm, c, 0), 1024));
+    if (!OnDisc(device)) return Ret(c, u32(-kENODEV));
+    Disc::File file;
+    if (!GuestDisc().Find(path, &file)) return Ret(c, u32(-kENOENT));
+    PutStat(vm, A(vm, c, 1), file);
+    return Ret(c, KE_OK);
+}
+
+// chdir(path): where a path with no device is looked for - a directory on the
+// disc.
+Outcome IoChdir(Vm& vm, Context& c) {
+    const std::string asked = vm.String(A(vm, c, 0), 1024);
+    const auto [device, path] = Device(vm, asked);
+    if (!OnDisc(device)) return Ret(c, u32(-kENODEV));
+    Disc::File file;
+    if (!GuestDisc().Find(path, &file)) return Ret(c, u32(-kENOENT));
+    if (!(file.flags & 0x02)) return Ret(c, u32(-kENOTDIR));
+    vm.current_directory = asked.find(':') == std::string::npos ? "cdrom0:" + path : asked;
+    return Ret(c, KE_OK);
+}
+
+// ---------------------------------------------------------------- SIF RPC: to the EE, and request by request
+
+constexpr u32 kRpcBindCommand = 0x80000009u, kRpcCallCommand = 0x8000000Au, kRpcPacketSize = 0x40;
+constexpr u32 SIF_RPC_M_NOWAIT = 0x01;
+constexpr s32 E_SIF_PKT_ALLOC = -0xD001;
+
+// An RPC packet to the EE, the client's own while its RPC is in flight:
+// rec_id, pkt_addr, rpc_id and client after the command header, then the
+// command's fields (`fields`, from offset 32).
+u32 RpcPacket(Vm& vm, u32 client, std::initializer_list<u32> fields) {
+    static u32 rpc_id = 0;
+    const u32 packet = vm.Allocate(kRpcPacketSize);
+    if (!packet) return 0;
+    for (u32 i = 0; i < kRpcPacketSize; i += 4) vm.Write(packet + i, 0, 4);
+    vm.Write(packet + 20, packet, 4);
+    vm.Write(packet + 24, ++rpc_id, 4);
+    vm.Write(packet + 28, client, 4);
+    u32 at = 32;
+    for (u32 field : fields) { vm.Write(packet + at, field, 4); at += 4; }
+    vm.Write(client, packet, 4);                    // hdr.pkt_addr: in flight
+    vm.Write(client + 4, rpc_id, 4);                // hdr.rpc_id
+    return packet;
+}
+
+// The client's RPC goes to the EE; the calling thread waits for its end
+// (iop::RpcEnd) unless the mode says not to.
+Outcome Send(Vm& vm, Context& c, u32 client, u32 command, RpcClient call, u32 mode,
+             u32 src, u32 dest, u32 size) {
+    const bool wait = !(mode & SIF_RPC_M_NOWAIT);
+    if (wait && (!vm.Current() || vm.in_interrupt)) {
+        vm.Free(call.packet);
+        vm.Write(client, 0, 4);                     // hdr.pkt_addr: nothing in flight after all
+        return Ret(c, u32(KE_CAN_NOT_WAIT));
+    }
+    vm.Write(client + 12, mode, 4);                 // hdr.mode
+    call.thread = wait ? vm.current : 0;
+    vm.rpc_clients[client] = call;
+    SendToEe(vm, command, call.packet, kRpcPacketSize, src, dest, size);
+    Return(c, 0);
+    if (!wait) return Outcome::Return;
+    vm.Block(c, Wait::Client, client);
+    return Outcome::Block;
+}
+
+// sceSifBindRpc(client, sid, mode): a server of the EE's, by its id; its
+// address and buffers are the client's once the EE answers (server 0: the EE
+// has no such server yet).
+Outcome BindRpc(Vm& vm, Context& c) {
+    const u32 client = A(vm, c, 0), sid = A(vm, c, 1), mode = A(vm, c, 2);
+    vm.Write(client + 16, 0, 4);                    // command
+    vm.Write(client + 36, 0, 4);                    // server
+    RpcClient call;
+    call.bind = true;
+    call.packet = RpcPacket(vm, client, {sid});
+    if (!call.packet) return Ret(c, u32(E_SIF_PKT_ALLOC));
+    return Send(vm, c, client, kRpcBindCommand, call, mode, 0, 0, 0);
+}
+
+// sceSifCallRpc(client, procedure, mode, send, send_size, receive,
+// receive_size, end_function, end_param): `send` goes to the server's buffer
+// on the EE, the server's answer comes back to `receive`; the end function
+// runs once it has (as an interrupt, the SIF library's way). A call that waits
+// for nothing - no wait, no end function - asks for no end (rmode 0).
+Outcome CallRpc(Vm& vm, Context& c) {
+    const u32 client = A(vm, c, 0), procedure = A(vm, c, 1), mode = A(vm, c, 2);
+    const u32 send = A(vm, c, 3), send_size = A(vm, c, 4), receive = A(vm, c, 5), receive_size = A(vm, c, 6);
+    RpcClient call;
+    call.end_function = A(vm, c, 7);
+    call.end_param = A(vm, c, 8);
+    vm.Write(client + 28, call.end_function, 4);
+    vm.Write(client + 32, call.end_param, 4);
+    const u32 server = vm.Read(client + 36, 4), buffer = vm.Read(client + 20, 4);
+    const u32 rmode = (mode & SIF_RPC_M_NOWAIT) && !call.end_function ? 0 : 1;
+    call.packet = RpcPacket(vm, client, {procedure, send_size, receive, receive_size, rmode, server});
+    if (!call.packet) return Ret(c, u32(E_SIF_PKT_ALLOC));
+    if (!rmode) {
+        // Nothing waits for its end, and the EE sends none.
+        SendToEe(vm, kRpcCallCommand, call.packet, kRpcPacketSize, send, buffer, send_size);
+        vm.Free(call.packet);
+        vm.Write(client, 0, 4);
+        return Ret(c, 0);
+    }
+    return Send(vm, c, client, kRpcCallCommand, call, mode, send, buffer, send_size);
+}
+
+// sceSifCheckStatRpc(client): 1 while its RPC is in flight, else 0.
+Outcome CheckStatRpc(Vm& vm, Context& c) { return Ret(c, vm.rpc_clients.count(A(vm, c, 0)) ? 1 : 0); }
+
+// sceSifGetNextRequest(queue): the next request waiting in a queue, taken
+// from it for sceSifExecRequest: its server, the request's fields written into
+// the server's data (size, client, pkt_addr, rpc_number, receive, rsize,
+// rmode, rid); 0 if none waits.
+Outcome GetNextRequest(Vm& vm, Context& c) {
+    Thread* t = vm.Current();
+    auto& pending = vm.rpc_pending[A(vm, c, 0)];
+    if (!t || pending.empty()) return Ret(c, 0);
+    t->serving = pending.front();
+    pending.pop_front();
+    const RpcRequest& r = t->serving;
+    auto word = [&](std::size_t at) { u32 v = 0; if (at + 4 <= r.packet.size()) std::memcpy(&v, &r.packet[at], 4); return v; };
+    vm.Write(r.server + 12, r.size, 4);
+    vm.Write(r.server + 28, word(28), 4);
+    vm.Write(r.server + 32, word(20), 4);
+    vm.Write(r.server + 36, r.procedure, 4);
+    vm.Write(r.server + 40, r.receive, 4);
+    vm.Write(r.server + 44, r.receive_size, 4);
+    vm.Write(r.server + 48, word(48), 4);
+    vm.Write(r.server + 52, word(16), 4);
+    return Ret(c, r.server);
+}
+
+// sceSifExecRequest(server): the server's function - function(rpc_number,
+// buffer, size) - on the request sceSifGetNextRequest took, in this thread;
+// then its answer goes back and the call ends (iop_vm.cpp, at kExecReturn),
+// and this returns.
+Outcome ExecRequest(Vm& vm, Context& c) {
+    Thread* t = vm.Current();
+    if (!t || !t->serving.server || t->serving.server != A(vm, c, 0)) return Ret(c, 0);
+    const RpcServerEntry& entry = vm.rpc_servers[t->serving.server];
+    t->exec_return = c.r[31];
+    c.r[4] = t->serving.procedure;
+    c.r[5] = entry.buffer;
+    c.r[6] = t->serving.size;
+    vm.call_into = entry.function;
+    return Outcome::Return;
+}
+
+// sceSifRemoveRpc(server, queue): the server serves no more; returns it.
+Outcome RemoveRpc(Vm& vm, Context& c) {
+    const u32 server = A(vm, c, 0);
+    vm.rpc_servers.erase(server);
+    return Ret(c, server);
+}
+
+// sceSifRemoveRpcQueue(queue): no more requests come to the queue; returns it.
+Outcome RemoveRpcQueue(Vm& vm, Context& c) {
+    const u32 queue = A(vm, c, 0);
+    vm.rpc_queues.erase(queue);
+    vm.rpc_pending.erase(queue);
+    return Ret(c, queue);
+}
+
 const Map& Table() {
     static const Map table = {
         {{"sysmem", 4}, AllocSysMemory}, {{"sysmem", 5}, FreeSysMemory},
@@ -1200,6 +1841,25 @@ const Map& Table() {
         {{"libsd", 27}, SdSetSpu2IntrHandler}, {{"libsd", 28}, SdGetTransIntrHandlerArgument},
         {{"libsd", 29}, SdGetSpu2IntrHandlerArgument}, {{"libsd", 30}, SdStopTrans},
         {{"libsd", 31}, Succeed}, {{"libsd", 32}, Succeed}, {{"libsd", 33}, Succeed},
+        {{"sysclib", 4}, Setjmp}, {{"sysclib", 5}, Longjmp},
+        {{"thbase", 9}, ExitDeleteThread}, {{"thbase", 22}, ReferThreadStatus},
+        {{"thbase", 45}, ReferThreadRunStatus}, {{"thbase", 47}, GetThreadmanIdList},
+        {{"thvpool", 4}, CreateVpl}, {{"thvpool", 5}, DeleteVpl},
+        {{"thvpool", 7}, PollAllocateVpl}, {{"thvpool", 9}, FreeVpl},
+        {{"thfpool", 4}, CreateFpl}, {{"thfpool", 5}, DeleteFpl},
+        {{"timrman", 10}, GetTimerCounter},
+        {{"modload", 17}, ReferModuleStatus}, {{"modload", 22}, SearchModuleByName},
+        {{"modload", 30}, SetModuleFlags}, {{"loadcore", 7}, ReleaseLibraryEntries},
+        {{"cdvdman", 7}, CdSeek}, {{"cdvdman", 10}, CdSearchFile}, {{"cdvdman", 28}, CdStatus},
+        // ioman (1.4, the export numbers iomanX keeps for the old library's name)
+        {{"ioman", 4}, IoOpen}, {{"ioman", 5}, IoClose}, {{"ioman", 6}, IoRead},
+        {{"ioman", 7}, IoWrite}, {{"ioman", 8}, IoLseek}, {{"ioman", 10}, IoChange},
+        {{"ioman", 11}, IoChange}, {{"ioman", 12}, IoChange}, {{"ioman", 13}, IoDopen},
+        {{"ioman", 14}, IoClose}, {{"ioman", 15}, IoDread}, {{"ioman", 16}, IoGetstat},
+        {{"ioman", 26}, IoChdir},
+        {{"sifcmd", 15}, BindRpc}, {{"sifcmd", 16}, CallRpc}, {{"sifcmd", 18}, CheckStatRpc},
+        {{"sifcmd", 20}, GetNextRequest}, {{"sifcmd", 21}, ExecRequest},
+        {{"sifcmd", 24}, RemoveRpc}, {{"sifcmd", 25}, RemoveRpcQueue},
     };
     return table;
 }

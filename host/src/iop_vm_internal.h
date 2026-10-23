@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "ps2host/disc.h"
 #include "ps2host/host.h"
 
 namespace ps2host {
@@ -26,6 +27,9 @@ constexpr u32 kReturnFromCall = 0x1FFFFFF0u;
 constexpr u32 kThreadExit = 0x1FFFFFE0u;
 // Where an RPC server's function returns to, in its server thread.
 constexpr u32 kRpcReturn = 0x1FFFFFD0u;
+// Where guest code a library function runs in the calling thread returns to
+// (sceSifExecRequest's server function): the library call ends there.
+constexpr u32 kExecReturn = 0x1FFFFFC0u;
 
 struct Context {
     u32 r[32] = {};
@@ -33,7 +37,9 @@ struct Context {
     u32 pc = 0, npc = 4;
 };
 
-enum class Wait { None, Sema, Event, Sleep, Delay, Dormant, Rpc, Mbx };
+// Client: waiting for the end of an RPC it made to the EE (sceSifBindRpc,
+// sceSifCallRpc).
+enum class Wait { None, Sema, Event, Sleep, Delay, Dormant, Rpc, Mbx, Client };
 
 struct RpcRequest {
     u32 server = 0, procedure = 0, size = 0, receive = 0, receive_size = 0;
@@ -56,8 +62,49 @@ struct Thread {
     s32 wakeups = 0;
     u64 until_us = 0;               // DelayThread
     u32 entry = 0, stack = 0, stack_size = 0;
+    u32 attr = 0, option = 0;
+    s32 initial_priority = 0;
     RpcRequest serving;             // the RPC request its server function is running
     u32 rpc_queue = 0;              // the queue it serves (sceSifRpcLoop)
+    u32 exec_return = 0;            // where sceSifExecRequest returns to, once its function has
+    bool exit_delete = false;       // ExitDeleteThread: deleted once it stops running
+};
+
+// An RPC a module made to the EE, until the EE's end of it: what it waits in.
+struct RpcClient {
+    u32 thread = 0;                 // the thread that waits for it; 0: none (no wait)
+    u32 packet = 0;                 // the packet it was sent in (the client's own)
+    u32 end_function = 0, end_param = 0;
+    bool bind = false;
+};
+
+// A memory pool (thvpool, thfpool): a block of the IOP's heap, given out in
+// pieces - any size for a variable-length pool, one size for a fixed one.
+struct Pool {
+    bool fixed = false;
+    u32 attr = 0, option = 0;
+    u32 base = 0, size = 0;
+    u32 block_size = 0, blocks = 0;          // a fixed pool's
+    std::map<u32, u32> free_blocks;           // address -> size
+    std::map<u32, u32> used_blocks;
+};
+
+// A module the IOP has loaded, as modload reports it (ReferModuleStatus): from
+// its .iopmod section, and where it lies if the host runs it.
+struct ModuleRecord {
+    std::string name;
+    u16 version = 0, flags = 0;
+    u32 entry = 0, gp = 0, text = 0, text_size = 0, data_size = 0, bss_size = 0;
+};
+
+// A file a module opened through ioman: on the disc, read-only; or a
+// directory there (dopen), its entries given one by one (dread).
+struct IoFile {
+    Disc::File file;
+    u32 position = 0;
+    bool directory = false;
+    std::vector<Disc::Entry> entries;
+    std::size_t next = 0;
 };
 
 struct Semaphore {
@@ -83,11 +130,15 @@ struct MessageBox {
 // the timer stops).
 struct HardTimer {
     u32 source = 1, prescale = 1, compare = 0, handler = 0, common = 0;
+    u32 bits = 32;                  // its counter's width
     bool running = false;
-    u64 due_us = 0;
+    u64 due_us = 0, started_us = 0;
+    u32 count = 0;                  // its counter when it stopped
 };
 
-/* The time between a hardware timer's interrupts. */
+/* A hardware timer's clock, before its prescaler; the time between its
+   interrupts. */
+double HardTimerHz(const HardTimer& t);
 u64 HardTimerPeriodUs(const HardTimer& t);
 
 struct Alarm {
@@ -134,6 +185,12 @@ struct Vm {
     std::map<u32, RpcServerEntry> rpc_servers;            // server address -> entry
     std::map<u32, u32> rpc_queues;                        // queue address -> thread
     std::map<u32, std::deque<RpcRequest>> rpc_pending;    // queue address -> requests
+    std::map<u32, RpcClient> rpc_clients;                 // client data -> its RPC to the EE in flight
+    u32 call_into = 0;                           // guest code a library function runs next (ExecRequest)
+    std::map<u32, Pool> pools;                   // vpl and fpl ids -> their pools
+    std::map<s32, ModuleRecord> modules;         // loadfile's module ids -> what each is
+    std::map<s32, IoFile> files;                 // ioman descriptors -> their files
+    std::string current_directory;               // ioman's chdir
     u32 command_buffer = 0;                      // where arriving packets are put (the host's)
     u32 handler_table = 0;                       // sceSifSetCmdBuffer's, for its answer
     u64 instructions = 0;

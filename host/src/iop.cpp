@@ -11,7 +11,9 @@
  * hardware's would arrive.
  *
  * RPC: binding to a server (0x80000009) and calling one (0x8000000A) are
- * answered with an RPC-end packet (0x80000008). A call runs a host
+ * answered with an RPC-end packet (0x80000008); a module the host runs may
+ * bind and call the EE's servers too, and the EE's end of those goes back to
+ * it (iop::RpcEnd). A call runs a host
  * implementation of the server, if there is one, with the data the EE sent;
  * what it returns is written to the EE's receive buffer. A server with no host
  * implementation still binds, so the game goes on; its calls are noted - server
@@ -154,6 +156,13 @@ void Command(const std::vector<u8>& packet, const std::vector<u8>& data) {
             QueueEnd(packet, kRpcBind, server, server + 0x100, server + 0x200);
             return;
         }
+        case kRpcEnd:
+            // The EE's end of an RPC a module made to it - a bind, a call -
+            // whose answer it has already DMA'd to the module's buffer.
+            if (iop::RpcEnd(packet)) return;
+            Note("sif end " + Hex(Word(packet, 28)), "SIF: the EE ended an RPC no module made (client " +
+                 Hex(Word(packet, 28)) + "; dropped)");
+            return;
         case kRpcCall: {
             // struct SifRpcCallPkt: header, rec_id, pkt_addr, rpc_id, client,
             // rpc_number, send_size, receive, recv_size, rmode, server

@@ -65,7 +65,7 @@ std::vector<u8> RunFromDisc(s32 id, const std::string& path, const std::vector<u
     if (arg_length > 0 && data.size() >= 0x104 + std::size_t(arg_length))
         args.assign(data.begin() + 0x104, data.begin() + 0x104 + arg_length);
     s32 result = 0;
-    if (!iop::LoadModule(path, image, args, &result))
+    if (!iop::LoadModule(path, image, args, &result, id))
         throw Unimplemented{"IOP: " + path + " is not a module the interpreter can load"};
     return Words(id, u32(result));
 }
@@ -124,6 +124,14 @@ std::vector<u8> LoadFile(u32 procedure, const std::vector<u8>& data) {
         if (iop::RunsModule(path)) return RunFromDisc(id, path, data);
         Note("module " + path, "IOP: module " + path + " loaded as " + std::to_string(id) +
                                    " (its services are the host's)");
+        // Its name, for modload to report (the disc's modules; the BIOS's, rom0:,
+        // are not on it).
+        std::string disc_path = path;
+        const std::size_t colon = disc_path.find(':');
+        if (colon != std::string::npos) disc_path = disc_path.substr(colon + 1);
+        std::vector<u8> image;
+        if (path.rfind("cdrom", 0) == 0 && GuestDisc().IsOpen() && GuestDisc().ReadFile(disc_path, &image))
+            iop::RecordModule(id, image);
         return Words(id, kResidentEnd);
     }
     if (procedure == 6 && data.size() >= 8) {
@@ -147,10 +155,11 @@ std::vector<u8> LoadFile(u32 procedure, const std::vector<u8>& data) {
             if (arg_length > 0 && data.size() >= 0x104 + std::size_t(arg_length))
                 args.assign(data.begin() + 0x104, data.begin() + 0x104 + arg_length);
             s32 result = 0;
-            if (!iop::LoadModule(name, image, args, &result))
+            if (!iop::LoadModule(name, image, args, &result, id))
                 throw Unimplemented{"IOP: " + name + " is not a module the interpreter can load"};
             return Words(id, u32(result));
         }
+        iop::RecordModule(id, image);
         Note("module " + name, "IOP: module " + name +
                                    " from IOP memory at " + Hex(address) + " loaded as " +
                                    std::to_string(id) + " (its services are the host's)");

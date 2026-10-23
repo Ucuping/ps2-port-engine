@@ -22,6 +22,7 @@
 #include "ps2host/run.h"
 #include "ps2host/ipu.h"
 #include "iop_vm_internal.h"
+#include "ps2host/iop_vm.h"
 #include "spu2.h"
 #include "ps2host/mc2.h"
 #include "ps2host/memory.h"
@@ -1386,6 +1387,382 @@ void IopInstructionsMatchTheR5900() {
     Check(failures == 0, "every IOP instruction vector matches");
 }
 
+// ---- The IOP libraries a game's modules import (iop_libs.cpp), called as a
+// module's import stub calls them: arguments in $a0-$a3, then the stack.
+struct IopCall {
+    u32 result;
+    ps2host::iop::Outcome outcome;
+    ps2host::iop::Context c;
+};
+
+constexpr u32 kIopScratch = 0x001C0000u;        // above the IOP heap: the tests' own memory
+
+IopCall CallIop(const char* library, u32 index, std::vector<u32> args, u32 thread = 0) {
+    using namespace ps2host::iop;
+    Vm& vm = TheVm();
+    Context c;
+    c.r[29] = kIopScratch + 0x3F000u;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (i < 4) c.r[4 + i] = args[i];
+        else vm.Write(c.r[29] + 16 + 4 * u32(i - 4), args[i], 4);
+    }
+    c.r[31] = 0x00170000u;
+    const u32 previous = vm.current;
+    vm.current = thread;
+    const Library f = FindLibrary(library, index);
+    const Outcome outcome = f ? f(vm, c) : Outcome::Return;
+    vm.current = previous;
+    if (!f) Check(false, (std::string("the host implements ") + library + "#" + std::to_string(index)).c_str());
+    return {c.r[2], outcome, c};
+}
+
+// A thread of the tests' own, waiting to be given something to run.
+u32 TestThread(s32 priority = 20) {
+    using namespace ps2host::iop;
+    Vm& vm = TheVm();
+    Thread t;
+    t.id = vm.next_id++;
+    t.priority = t.initial_priority = priority;
+    t.wait = Wait::Dormant;
+    vm.threads[t.id] = t;
+    return t.id;
+}
+
+void IopPoolsLendAndTakeBack() {
+    using namespace ps2host::iop;
+    Vm& vm = TheVm();
+    const u32 param = kIopScratch;
+    vm.Write(param, 0, 4), vm.Write(param + 4, 0, 4), vm.Write(param + 8, 256, 4);
+    const u32 vpl = CallIop("thvpool", 4, {param}).result;
+    Check(s32(vpl) > 0, "vpl: created");
+    const u32 a = CallIop("thvpool", 7, {vpl, 100}).result, b = CallIop("thvpool", 7, {vpl, 100}).result;
+    Check(s32(a) > 0 && s32(b) > 0 && b == a + 104, "vpl: two pieces, in units of 8 bytes");
+    Check(s32(CallIop("thvpool", 7, {vpl, 100}).result) == -400, "vpl: no room for a third: KE_NO_MEMORY");
+    Check(CallIop("thvpool", 9, {vpl, a}).result == 0, "vpl: the first given back");
+    Check(CallIop("thvpool", 7, {vpl, 100}).result == a, "vpl: and lent again");
+    Check(s32(CallIop("thvpool", 9, {vpl, a + 4}).result) == -426, "vpl: not a piece: KE_ILLEGAL_MEMBLOCK");
+    Check(CallIop("thvpool", 5, {vpl}).result == 0, "vpl: deleted");
+    Check(s32(CallIop("thvpool", 5, {vpl}).result) == -411, "vpl: deleted already: KE_UNKNOWN_VPLID");
+    vm.Write(param + 8, 16, 4), vm.Write(param + 12, 4, 4);
+    const u32 fpl = CallIop("thfpool", 4, {param}).result;
+    Check(s32(fpl) > 0, "fpl: created");
+    Check(s32(CallIop("thvpool", 5, {fpl}).result) == -411, "fpl: not a vpl");
+    Check(CallIop("thfpool", 5, {fpl}).result == 0, "fpl: deleted");
+}
+
+void IopThreadsAreReportedAsThbaseDoes() {
+    using namespace ps2host::iop;
+    Vm& vm = TheVm();
+    const u32 param = kIopScratch;
+    const u32 words[5] = {0x02000000u, 0, 0x00120000u, 0x800, 33};          // attr, option, entry, stack, priority
+    for (u32 i = 0; i < 5; ++i) vm.Write(param + 4 * i, words[i], 4);
+    const u32 id = CallIop("thbase", 4, {param}).result;
+    const u32 info = kIopScratch + 0x100;
+    Check(CallIop("thbase", 22, {id, info}).result == 0, "ReferThreadStatus: known");
+    Check(vm.Read(info, 4) == 0x02000000u && vm.Read(info + 8, 4) == 0x10 && vm.Read(info + 12, 4) == 0x00120000u &&
+          vm.Read(info + 20, 4) == 0x800 && vm.Read(info + 28, 4) == 33,
+          "ReferThreadStatus: attr, dormant, entry, stack size, priority");
+    Check(s32(CallIop("thbase", 45, {id, info, 40}).result) == -432, "ReferThreadRunStatus: too small: KE_ILLEGAL_SIZE");
+    Check(CallIop("thbase", 45, {id, info, 44}, id).result == 0 && vm.Read(info, 4) == 0x01 && vm.Read(info + 4, 4) == 33,
+          "ReferThreadRunStatus: the thread running, its priority");
+    const u32 list = kIopScratch + 0x200, count = kIopScratch + 0x2FC;
+    const u32 written = CallIop("thbase", 47, {9, list, 64, count}).result;
+    bool listed = false;
+    for (u32 i = 0; i < written; ++i) listed = listed || vm.Read(list + 4 * i, 4) == id;
+    Check(listed && vm.Read(count, 4) == written, "GetThreadmanIdList: the dormant threads");
+    Check(CallIop("thbase", 47, {1, list, 0, count}).result == 0 && vm.Read(count, 4) >= 1,
+          "GetThreadmanIdList: no room, still counted");
+    Check(s32(CallIop("thbase", 47, {99, list, 64, count}).result) == -431, "GetThreadmanIdList: KE_ILLEGAL_TYPE");
+    const IopCall exit = CallIop("thbase", 9, {}, id);
+    Check(exit.outcome == Outcome::Block && vm.threads[id].exit_delete && vm.threads[id].wait == Wait::Dormant,
+          "ExitDeleteThread: ends, to be deleted");
+    vm.Free(vm.threads[id].stack);
+    vm.threads.erase(id);
+}
+
+void IopSetjmpReturnsTwice() {
+    using namespace ps2host::iop;
+    Vm& vm = TheVm();
+    const u32 env = kIopScratch;
+    Context c;
+    for (u32 r = 16; r < 24; ++r) c.r[r] = 0x1000u + r;
+    c.r[29] = 0x0011FF00u, c.r[30] = 0x0011FF80u, c.r[31] = 0x00101234u;
+    c.r[4] = env;
+    Check(FindLibrary("sysclib", 4)(vm, c) == Outcome::Return && c.r[2] == 0, "setjmp: 0 the first time");
+    Context later;
+    later.r[4] = env;
+    later.r[5] = 0;
+    FindLibrary("sysclib", 5)(vm, later);
+    bool same = later.r[29] == 0x0011FF00u && later.r[30] == 0x0011FF80u && later.r[31] == 0x00101234u;
+    for (u32 r = 16; r < 24; ++r) same = same && later.r[r] == 0x1000u + r;
+    Check(same && later.r[2] == 1, "longjmp: back to setjmp's caller, 0 made 1");
+    later.r[4] = env, later.r[5] = 7;
+    FindLibrary("sysclib", 5)(vm, later);
+    Check(later.r[2] == 7, "longjmp: its value");
+}
+
+// The disc of DiscFindsFilesByPath, with a date on FILE.BIN: 2005-03-31 12:34:56.
+std::vector<u8> SmallDisc() {
+    using ps2host::kSectorSize;
+    std::vector<u8> image(24 * kSectorSize, 0);
+    u8* pvd = &image[16 * kSectorSize];
+    pvd[0] = 1;
+    std::memcpy(pvd + 1, "CD001", 5);
+    Record(image, 16 * kSectorSize + 156, 20, kSectorSize, 2, std::string(1, '\0'));
+    u32 at = 20 * kSectorSize;
+    Record(image, at, 20, kSectorSize, 2, std::string(1, '\0')); at += 34;
+    Record(image, at, 20, kSectorSize, 2, std::string(1, '\1')); at += 34;
+    Record(image, at, 21, 5, 0, "FILE.BIN;1");
+    const u8 date[7] = {105, 3, 31, 12, 34, 56, 0};
+    std::memcpy(&image[at + 18], date, 7);
+    at += image[at];
+    Record(image, at, 22, kSectorSize, 2, "DIR");
+    Record(image, 22 * kSectorSize, 23, 3, 0, "INNER.DAT;1");
+    std::memcpy(&image[21 * kSectorSize], "hello", 5);
+    std::memcpy(&image[23 * kSectorSize], "abc", 3);
+    return image;
+}
+
+void IopReadsTheDiscAsCdvdmanAndIomanDo() {
+    using namespace ps2host::iop;
+    Vm& vm = TheVm();
+    ps2host::GuestDisc().Use(SmallDisc());
+    auto text = [&](u32 address, const char* s) {
+        std::memcpy(vm.ram + address, s, std::strlen(s) + 1);
+        return address;
+    };
+    const u32 path = kIopScratch, out = kIopScratch + 0x400, buffer = kIopScratch + 0x800;
+    Check(CallIop("cdvdman", 10, {out, text(path, "\\FILE.BIN;1")}).result == 1 && vm.Read(out, 4) == 21 &&
+          vm.Read(out + 4, 4) == 5 && vm.String(out + 8, 16) == "FILE.BIN;1",
+          "sceCdSearchFile: the file's sector, size, name");
+    Check(vm.Read(out + 25, 1) == 56 && vm.Read(out + 26, 1) == 34 && vm.Read(out + 27, 1) == 12 &&
+          vm.Read(out + 28, 1) == 31 && vm.Read(out + 29, 1) == 3 && vm.Read(out + 30, 2) == 2005,
+          "sceCdSearchFile: its date as cdvdman gives it");
+    Check(CallIop("cdvdman", 10, {out, text(path, "\\NONE.BIN;1")}).result == 0, "sceCdSearchFile: a missing file");
+    Check(CallIop("cdvdman", 7, {21}).result == 1 && CallIop("cdvdman", 28, {}).result == 0x0A,
+          "sceCdSeek done; sceCdStatus paused");
+
+    const s32 fd = s32(CallIop("ioman", 4, {text(path, "cdrom0:\\FILE.BIN;1"), 1}).result);
+    Check(fd > 0, "ioman open: a file on the disc");
+    Check(CallIop("ioman", 6, {u32(fd), buffer, 3}).result == 3 && vm.String(buffer, 3) == "hel", "ioman read");
+    Check(CallIop("ioman", 6, {u32(fd), buffer, 10}).result == 2 && vm.String(buffer, 2) == "lo", "ioman read: to the end");
+    Check(CallIop("ioman", 8, {u32(fd), 1, 0}).result == 1 && CallIop("ioman", 8, {u32(fd), u32(-1), 2}).result == 4,
+          "ioman lseek: from the start, from the end");
+    Check(s32(CallIop("ioman", 8, {u32(fd), 0, 5}).result) == -22, "ioman lseek: EINVAL");
+    Check(s32(CallIop("ioman", 7, {u32(fd), buffer, 1}).result) == -30, "ioman write: EROFS");
+    Check(CallIop("ioman", 5, {u32(fd)}).result == 0 && s32(CallIop("ioman", 5, {u32(fd)}).result) == -9,
+          "ioman close, then EBADF");
+    Check(s32(CallIop("ioman", 4, {text(path, "cdrom0:\\FILE.BIN;1"), 2}).result) == -30, "ioman open to write: EROFS");
+    Check(s32(CallIop("ioman", 4, {text(path, "host0:file.bin"), 1}).result) == -19, "ioman open: no host0: ENODEV");
+    Check(s32(CallIop("ioman", 4, {text(path, "cdrom0:\\NONE;1"), 1}).result) == -2, "ioman open: ENOENT");
+    Check(s32(CallIop("ioman", 4, {text(path, "cdrom0:\\DIR"), 1}).result) == -21, "ioman open: a directory, EISDIR");
+    Check(CallIop("ioman", 16, {text(path, "cdrom0:\\FILE.BIN;1"), out}).result == 0 && vm.Read(out, 4) == 0x14 &&
+          vm.Read(out + 8, 4) == 5 && vm.Read(out + 28 + 1, 1) == 56,
+          "ioman getstat: a file - its mode, size, time");
+    Check(CallIop("ioman", 16, {text(path, "cdrom0:\\DIR"), out}).result == 0 && vm.Read(out, 4) == 0x25,
+          "ioman getstat: a directory");
+    const s32 dir = s32(CallIop("ioman", 13, {text(path, "cdrom0:\\")}).result);
+    const u32 first = CallIop("ioman", 15, {u32(dir), out}).result;
+    const std::string first_name = vm.String(out + 40, 256);
+    const u32 second = CallIop("ioman", 15, {u32(dir), out}).result;
+    Check(dir > 0 && first == 10 && first_name == "FILE.BIN;1" && second == 3 && vm.String(out + 40, 256) == "DIR" &&
+          CallIop("ioman", 15, {u32(dir), out}).result == 0 && CallIop("ioman", 14, {u32(dir)}).result == 0,
+          "ioman dopen, dread each entry, then 0; dclose");
+    Check(s32(CallIop("ioman", 11, {text(path, "cdrom0:\\NEW")}).result) == -30 &&
+          s32(CallIop("ioman", 10, {text(path, "host0:x")}).result) == -19,
+          "ioman mkdir on the disc: EROFS; remove on host0: ENODEV");
+    Check(CallIop("ioman", 26, {text(path, "cdrom0:\\DIR")}).result == 0, "ioman chdir: a directory on the disc");
+    const s32 inner = s32(CallIop("ioman", 4, {text(path, "INNER.DAT;1"), 1}).result);
+    Check(inner > 0 && CallIop("ioman", 6, {u32(inner), buffer, 8}).result == 3 && vm.String(buffer, 3) == "abc",
+          "ioman: a path with no device, in the directory chdir named");
+    CallIop("ioman", 5, {u32(inner)});
+    Check(s32(CallIop("ioman", 26, {text(path, "host0:")}).result) == -19 &&
+          s32(CallIop("ioman", 26, {text(path, "cdrom0:\\FILE.BIN;1")}).result) == -20,
+          "ioman chdir: ENODEV, ENOTDIR");
+    vm.current_directory.clear();
+    ps2host::GuestDisc().Use({});
+}
+
+// A module image as small as the IOP's loader takes: an ELF with one PT_LOAD
+// segment holding `words` (linked at 0, entered at `entry`), and an .iopmod
+// section naming it.
+std::vector<u8> TestModule(const std::vector<u32>& words, u32 entry, const std::string& name) {
+    std::vector<u8> image(0x100 + 4 * words.size() + 0x40, 0);
+    auto put = [&](std::size_t at, u32 v, int bytes) { std::memcpy(&image[at], &v, std::size_t(bytes)); };
+    std::memcpy(image.data(), "\x7F" "ELF\x01\x01\x01", 7);
+    const u32 code = 0x100, iopmod = code + 4 * u32(words.size());
+    put(16, 0xFF80, 2), put(18, 8, 2), put(20, 1, 4), put(24, entry, 4), put(28, 52, 4);
+    put(32, 0x60, 4), put(42, 32, 2), put(44, 1, 2), put(46, 40, 2), put(48, 2, 2);
+    put(52, 1, 4), put(56, code, 4), put(68, 4 * u32(words.size()), 4), put(72, 4 * u32(words.size()), 4);
+    // Section 1: .iopmod - info, entry, gp, text, data, BSS sizes, version, name.
+    put(0x60 + 40 + 4, 0x70000080u, 4), put(0x60 + 40 + 16, iopmod, 4), put(0x60 + 40 + 20, 0x40, 4);
+    for (std::size_t i = 0; i < words.size(); ++i) put(code + 4 * i, words[i], 4);
+    put(iopmod + 4, entry, 4), put(iopmod + 8, 0x7FF0, 4), put(iopmod + 12, 4 * u32(words.size()), 4);
+    put(iopmod + 24, 0x0102, 2);
+    std::memcpy(&image[iopmod + 26], name.c_str(), name.size() + 1);
+    return image;
+}
+
+void IopModulesAreRecorded() {
+    using namespace ps2host::iop;
+    Vm& vm = TheVm();
+    RecordModule(5, TestModule({0x03E00008u, 0}, 0, "test_module"));
+    const u32 name = kIopScratch, status = kIopScratch + 0x100;
+    std::memcpy(vm.ram + name, "test_module", 12);
+    Check(CallIop("modload", 22, {name}).result == 5, "SearchModuleByName: a module loaded");
+    Check(CallIop("modload", 17, {5, status}).result == 0 && vm.String(status, 56) == "test_module" &&
+          vm.Read(status + 56, 2) == 0x0102 && vm.Read(status + 60, 4) == 5 && vm.Read(status + 76, 4) == 8,
+          "ReferModuleStatus: name, version, id, text size");
+    Check(CallIop("modload", 30, {5, 0x40}, 1).result == 0 && vm.modules[5].flags == 0x40 &&
+          s32(CallIop("modload", 30, {5, 1}, 1).result) == -220, "SetModuleFlags: 0x40 only");
+    std::memcpy(vm.ram + name, "rom_module", 11);
+    Check(CallIop("modload", 22, {name}).result == 1, "SearchModuleByName: a name not recorded, answered 1");
+    vm.modules.erase(5);
+    const u32 table = kIopScratch + 0x200;
+    std::memcpy(vm.ram + table + 12, "testlib\0", 8);
+    vm.exports["testlib"] = table;
+    Check(CallIop("loadcore", 7, {table}).result == 0 && !vm.exports.count("testlib") &&
+          s32(CallIop("loadcore", 7, {table}).result) == -213, "ReleaseLibraryEntries, then KE_LIBRARY_NOTFOUND");
+}
+
+// A stub calling the host's (library, export), as the loader patches one.
+void PatchStub(u32 at, const char* library, u32 index) {
+    using namespace ps2host::iop;
+    Vm& vm = TheVm();
+    vm.libraries.push_back(FindLibrary(library, index));
+    vm.stubs[at] = {library, index};
+    vm.Write(at, ((0x80000u + u32(vm.libraries.size() - 1)) << 6) | 0x0C, 4);       // kHleCode + id: a host call
+    vm.Write(at + 4, 0, 4);
+}
+
+// A server thread that takes its requests itself: sleep, then
+// sceSifGetNextRequest and sceSifExecRequest until none is left - Tekken 5's
+// NU_File_Manager's way. A request wakes it, its function runs in it, and the
+// answer reaches the EE.
+void IopServesRequestsOneByOne() {
+    using namespace ps2host::iop;
+    Vm& vm = TheVm();
+    const u32 code = kIopScratch + 0x1000, server_data = kIopScratch + 0x2000, queue = kIopScratch + 0x2100;
+    const u32 buffer = kIopScratch + 0x2200, function = code + 0x100;
+    const u32 next = code + 0x200, exec = code + 0x208, sleep = code + 0x210;
+    PatchStub(next, "sifcmd", 20), PatchStub(exec, "sifcmd", 21), PatchStub(sleep, "thbase", 24);
+    auto jal = [](u32 target) { return 0x0C000000u | ((target >> 2) & 0x03FFFFFFu); };
+    auto j = [](u32 target) { return 0x08000000u | ((target >> 2) & 0x03FFFFFFu); };
+    const u32 program[] = {
+        jal(next), 0x02002021u,                    // loop: v0 = GetNextRequest(s0)  (move a0, s0)
+        0x10400005u, 0,                            //   if v0 == 0: to sleep
+        jal(exec), 0x00402021u,                    //   ExecRequest(v0)  (move a0, v0)
+        j(code), 0,                                //   loop
+        jal(sleep), 0,                             // sleep: SleepThread()
+        j(code), 0,
+    };
+    for (u32 i = 0; i < sizeof program / 4; ++i) vm.Write(code + 4 * i, program[i], 4);
+    vm.Write(function, 0x00A01021u, 4);             // the server: return its buffer (move v0, a1)
+    vm.Write(function + 4, 0x03E00008u, 4), vm.Write(function + 8, 0, 4);
+    const u32 id = TestThread();
+    Thread& t = vm.threads[id];
+    t.c.pc = code, t.c.npc = code + 4;
+    t.c.r[16] = queue, t.c.r[29] = kIopScratch + 0x3E000u, t.c.r[31] = kThreadExit;
+    vm.MakeReady(t);
+    RpcServerEntry entry;
+    entry.sid = 0x4E554649u, entry.server = server_data, entry.function = function;
+    entry.buffer = buffer, entry.queue = queue;
+    vm.rpc_servers[server_data] = entry;
+    vm.rpc_queues[queue] = id;
+    Run();
+    Check(!vm.threads[id].ready && vm.threads[id].wait == Wait::Sleep, "a server thread sleeps until a request comes");
+    std::memcpy(vm.ram + buffer, "NUFI", 4);         // the EE's arguments, DMA'd to the server's buffer
+    std::vector<u8> packet(0x40, 0);
+    const u32 receive = 0x00300000u;
+    RpcCall(server_data, 7, 4, receive, 4, packet);
+    char answer[5] = {};
+    for (u32 i = 0; i < 4; ++i) answer[i] = char(ps2host::GuestMemory().Read(receive + i, 1));
+    Check(std::string(answer) == "NUFI", "the request's answer is in the EE's receive buffer");
+    Check(vm.Read(server_data + 36, 4) == 7 && vm.Read(server_data + 12, 4) == 4,
+          "sceSifGetNextRequest: the request in the server's data");
+    Check(!vm.threads[id].ready && vm.threads[id].wait == Wait::Sleep && vm.threads[id].c.pc == code + 0x28,
+          "and its thread, after sceSifExecRequest, back asleep");
+    vm.rpc_servers.erase(server_data);
+    vm.rpc_queues.erase(queue);
+    vm.rpc_pending.erase(queue);
+    vm.threads.erase(id);
+}
+
+// A module calling a server of the EE's: the bind and the call wait for the
+// EE's end of them; the call's arguments reach the server's buffer on the EE.
+void IopCallsTheEe() {
+    using namespace ps2host::iop;
+    Vm& vm = TheVm();
+    const u32 client = kIopScratch + 0x3000, send = kIopScratch + 0x3100, receive = kIopScratch + 0x3200;
+    const u32 id = TestThread();
+    vm.threads[id].ready = true;
+    vm.threads[id].c.pc = kThreadExit;             // woken, it has nothing more to run
+    vm.threads[id].c.npc = kThreadExit + 4;
+    for (u32 i = 0; i < 40; i += 4) vm.Write(client + i, 0, 4);
+    const IopCall bind = CallIop("sifcmd", 15, {client, 0x4E554645u, 0}, id);
+    vm.threads[id].ready = false;                  // as Block left it, CallIop not being the scheduler
+    Check(bind.outcome == Outcome::Block && vm.threads[id].wait == Wait::Client && vm.Read(client, 4) != 0 &&
+          CallIop("sifcmd", 18, {client}).result == 1, "sceSifBindRpc: sent, waiting for the EE");
+    std::vector<u8> end(0x40, 0);
+    auto put = [&](u32 at, u32 v) { std::memcpy(&end[at], &v, 4); };
+    put(8, 0x80000008u), put(28, client), put(32, 0x80000009u), put(36, 0x00ABCD00u), put(40, 0x00380000u), put(44, 0x00381000u);
+    Check(RpcEnd(end), "the EE's end of the bind");
+    Check(vm.Read(client + 36, 4) == 0x00ABCD00u && vm.Read(client + 20, 4) == 0x00380000u &&
+          vm.Read(client + 24, 4) == 0x00381000u && vm.Read(client, 4) == 0 && CallIop("sifcmd", 18, {client}).result == 0,
+          "the bind's server and buffers are the client's; nothing in flight");
+    Check(vm.threads[id].wait != Wait::Client, "the bind's thread goes on");
+    std::memcpy(vm.ram + send, "ping", 4);
+    vm.threads[id].ready = true;
+    vm.threads[id].c.pc = kThreadExit;
+    vm.threads[id].c.npc = kThreadExit + 4;
+    const IopCall call = CallIop("sifcmd", 16, {client, 3, 0, send, 4, receive, 4, 0, 0}, id);
+    vm.threads[id].ready = false;
+    char sent[5] = {};
+    for (u32 i = 0; i < 4; ++i) sent[i] = char(ps2host::GuestMemory().Read(0x00380000u + i, 1));
+    Check(call.outcome == Outcome::Block && std::string(sent) == "ping", "sceSifCallRpc: the arguments in the server's buffer");
+    put(32, 0x8000000Au);
+    std::memcpy(vm.ram + receive, "pong", 4);       // the EE's answer, DMA'd first
+    Check(RpcEnd(end) && vm.threads[id].wait != Wait::Client, "the EE's end of the call");
+    Check(CallIop("sifcmd", 16, {client, 4, 1, send, 4, 0, 0, 0, 0}, id).result == 0 &&
+          CallIop("sifcmd", 18, {client}).result == 0, "a call that waits for nothing is not in flight");
+    put(28, 0x12345678u);
+    Check(!RpcEnd(end), "an end no module waits for");
+    vm.threads.erase(id);
+}
+
+// A module importing what the host lacks loads, and stops the run when it
+// calls that, naming it.
+void IopImportsTheHostLacksStopTheRun() {
+    using namespace ps2host::iop;
+    Vm& vm = TheVm();
+    const std::size_t threads = vm.threads.size();
+    // _start: bgezal $zero, the stub; then return 0. The import table: magic,
+    // 0, version 1.1, "nolib", a stub for export 9.
+    const std::vector<u32> words = {
+        0x04110005u, 0, 0x00001021u, 0x03E00008u, 0,          // 0x00: call the stub at 0x18 (+5 words past the slot)
+        0,                                                      // 0x14
+        0x41E00000u, 0, 0x0101u, 0x696C6F6Eu, 0x00000062u,     // 0x18: the table, "nolib"
+        0x03E00008u, 0x24000009u, 0, 0,                         // 0x2C: stub 9, then the end
+    };
+    std::vector<u32> fixed = words;
+    fixed[0] = 0x04110000u | ((0x2C - 0x04) >> 2);              // bgezal $zero, stub
+    bool stopped = false;
+    std::string message;
+    s32 result = 0;
+    try {
+        LoadModule("nolib_user.irx", TestModule(fixed, 0, "nolib_user"), {}, &result, 9);
+    } catch (const ps2host::Unimplemented& e) {
+        stopped = true;
+        message = e.what;
+    }
+    Check(stopped && message.find("nolib#9") != std::string::npos && message.find("is not implemented") != std::string::npos,
+          "an import the host lacks stops the run, naming it");
+    Check(vm.modules.count(9) && vm.modules[9].name == "nolib_user", "the module is recorded by its id");
+    vm.modules.erase(9);
+    for (auto it = vm.threads.begin(); it != vm.threads.end();)
+        it = vm.threads.size() > threads && it->second.entry ? vm.threads.erase(it) : std::next(it);
+}
+
 }  // namespace
 
 // A core's sound-data input (a block transfer's PCM): heard at its BVOL in the
@@ -1964,6 +2341,14 @@ int main() {
     MmiLanesAreScalar();
     IpuDecodesAndRetriesCleanly();
     IopInstructionsMatchTheR5900();
+    IopPoolsLendAndTakeBack();
+    IopThreadsAreReportedAsThbaseDoes();
+    IopSetjmpReturnsTwice();
+    IopReadsTheDiscAsCdvdmanAndIomanDo();
+    IopModulesAreRecorded();
+    IopServesRequestsOneByOne();
+    IopCallsTheEe();
+    IopImportsTheHostLacksStopTheRun();
     SpuDecodesAdpcmAndPlaysAVoice();
     SpuPlaysItsSoundDataInput();
     SpuInputInterruptsAtEachHalf();

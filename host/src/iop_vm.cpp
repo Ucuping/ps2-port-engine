@@ -180,7 +180,7 @@ Outcome Execute(Vm& vm, Context& c, u32 stop, u64 limit, bool* stopped) {
             *stopped = true;
             return Outcome::Return;
         }
-        if (c.pc == kThreadExit || c.pc == kRpcReturn) {
+        if (c.pc == kThreadExit || c.pc == kRpcReturn || c.pc == kExecReturn) {
             *stopped = true;
             return Outcome::Block;
         }
@@ -234,6 +234,12 @@ Outcome Execute(Vm& vm, Context& c, u32 stop, u64 limit, bool* stopped) {
                         }
                         c.pc = r[31];
                         c.npc = r[31] + 4;
+                        if (vm.call_into) {          // the library call goes on in guest code
+                            c.pc = vm.call_into;
+                            c.npc = vm.call_into + 4;
+                            r[31] = kExecReturn;
+                            vm.call_into = 0;
+                        }
                         if (outcome != Outcome::Return) return outcome;
                         if (vm.reschedule && !vm.in_interrupt) return Outcome::Yield;
                         break;
@@ -365,9 +371,55 @@ u32 Vm::Call(u32 function, std::vector<u32> args) {
 // `compare` counts of the timer's clock - the system clock (36.864 MHz), the
 // pixel clock (13.5 MHz) or the horizontal blank (15,734 Hz, NTSC) - after its
 // prescaler.
+double HardTimerHz(const HardTimer& t) {
+    return t.source & 4 ? 15734.25 : t.source & 2 ? 13500000.0 : 36864000.0;
+}
+
 u64 HardTimerPeriodUs(const HardTimer& t) {
-    const double hz = t.source & 4 ? 15734.25 : t.source & 2 ? 13500000.0 : 36864000.0;
-    return std::max<u64>(1, u64(double(t.compare) * t.prescale * 1e6 / hz));
+    return std::max<u64>(1, u64(double(t.compare) * t.prescale * 1e6 / HardTimerHz(t)));
+}
+
+namespace {
+
+// A request's answer, its server function having returned `answer`: that
+// buffer's receive_size bytes into the EE's receive buffer, then the end of
+// the call.
+void Answer(Vm& vm, const RpcRequest& done, u32 answer) {
+    Memory& ee = GuestMemory();
+    for (u32 i = 0; i < done.receive_size && done.receive && answer; ++i)
+        ee.Write(done.receive + i, vm.Read(answer + i, 1), 1);
+    const RpcServerEntry& entry = vm.rpc_servers[done.server];
+    QueueRpcEnd(done.packet, entry.server, entry.buffer, entry.cbuffer);
+}
+
+// A module image's .iopmod section (type 0x70000080): its module-info word,
+// entry, gp, text, data and BSS sizes, a 16-bit version, then the name.
+ModuleRecord Describe(const std::vector<u8>& image, u32 base) {
+    ModuleRecord record;
+    auto u16at = [&](std::size_t o) { u16 v = 0; if (o + 2 <= image.size()) std::memcpy(&v, &image[o], 2); return v; };
+    auto u32at = [&](std::size_t o) { u32 v = 0; if (o + 4 <= image.size()) std::memcpy(&v, &image[o], 4); return v; };
+    const u32 shoff = u32at(0x20);
+    const u16 shentsize = u16at(0x2E), shnum = u16at(0x30);
+    for (u16 i = 0; i < shnum; ++i) {
+        const std::size_t sh = shoff + std::size_t(i) * shentsize;
+        if (u32at(sh + 4) != 0x70000080u) continue;
+        const std::size_t at = u32at(sh + 16);
+        record.entry = base + u32at(at + 4);
+        record.gp = base + u32at(at + 8);
+        record.text = base;
+        record.text_size = u32at(at + 12);
+        record.data_size = u32at(at + 16);
+        record.bss_size = u32at(at + 20);
+        record.version = u16at(at + 24);
+        for (std::size_t k = at + 26; k < image.size() && image[k]; ++k) record.name += char(image[k]);
+    }
+    return record;
+}
+
+}  // namespace
+
+void RecordModule(s32 id, const std::vector<u8>& image) {
+    if (id > 0) TheVm().modules[id] = Describe(image, 0);
 }
 
 // The last Run ended with threads still to run (its slice spent): the IOP
@@ -433,16 +485,16 @@ void Run(u64 slice) {
         bool stopped = false;
         const Outcome outcome = Execute(vm, best->c, kReturnFromCall, kQuantum, &stopped);
         if (best->c.pc == kRpcReturn) {                      // a server function returned
-            const RpcRequest& done = best->serving;
-            Memory& ee = GuestMemory();
-            const u32 answer = best->c.r[2];
-            for (u32 i = 0; i < done.receive_size && done.receive && answer; ++i)
-                ee.Write(done.receive + i, vm.Read(answer + i, 1), 1);
-            const RpcServerEntry& entry = vm.rpc_servers[done.server];
-            QueueRpcEnd(done.packet, entry.server, entry.buffer, entry.cbuffer);
+            Answer(vm, best->serving, best->c.r[2]);
             best->ready = false;
             best->wait = Wait::Rpc;
             ServeNext(vm, *best);
+        } else if (best->c.pc == kExecReturn) {              // sceSifExecRequest's, in its caller
+            Answer(vm, best->serving, best->c.r[2]);
+            best->serving = RpcRequest{};
+            best->c.r[2] = 0;
+            best->c.pc = best->exec_return;
+            best->c.npc = best->exec_return + 4;
         } else if (best->c.pc == kThreadExit) {              // returned from its entry
             best->ready = false;
             best->wait = Wait::Dormant;
@@ -452,6 +504,10 @@ void Run(u64 slice) {
         // A thread that has just entered sceSifRpcLoop serves what is waiting.
         if (!best->ready && best->wait == Wait::Rpc) ServeNext(vm, *best);
         vm.current = 0;
+        if (best->exit_delete && !best->ready) {             // ExitDeleteThread
+            vm.Free(best->stack);
+            vm.threads.erase(best->id);
+        }
     }
 }
 
@@ -471,7 +527,7 @@ bool RunsModule(const std::string& path) {
 }
 
 bool LoadModule(const std::string& path, const std::vector<u8>& image,
-                const std::vector<u8>& args, s32* result) {
+                const std::vector<u8>& args, s32* result, s32 id) {
     Vm& vm = TheVm();
     auto u16at = [&](std::size_t o) { u16 v = 0; std::memcpy(&v, &image[o], 2); return v; };
     auto u32at = [&](std::size_t o) { u32 v = 0; std::memcpy(&v, &image[o], 4); return v; };
@@ -560,6 +616,7 @@ bool LoadModule(const std::string& path, const std::vector<u8>& image,
     }
     for (const std::string& name : missing)
         Note("iop missing " + name, "IOP: " + path + " imports " + name + ", which the host lacks");
+    if (id > 0) vm.modules[id] = Describe(image, base);
     // Start it: _start(argc, argv), argv[0] the path, then the argument strings.
     std::vector<std::string> words{path};
     std::string current;
@@ -673,8 +730,50 @@ void RpcCall(u32 server, u32 procedure, u32 size, u32 receive, u32 receive_size,
     RpcRequest request{server, procedure, size, receive, receive_size, packet};
     vm.rpc_pending[entry.queue].push_back(request);
     auto thread = vm.rpc_queues.find(entry.queue);
-    if (thread != vm.rpc_queues.end()) ServeNext(vm, vm.threads[thread->second]);
+    if (thread != vm.rpc_queues.end()) {
+        Thread& t = vm.threads[thread->second];
+        if (t.wait == Wait::Rpc) {
+            ServeNext(vm, t);
+        } else if (!t.ready && t.wait == Wait::Sleep) {
+            // A thread that takes its requests itself (sceSifGetNextRequest)
+            // sleeps between them: the request wakes it, as the SIF library's
+            // handler does.
+            t.c.r[2] = 0;
+            vm.MakeReady(t);
+        } else {
+            ++t.wakeups;
+        }
+    }
     Run();
+}
+
+bool RpcEnd(const std::vector<u8>& packet) {
+    // struct SifRpcRendPkt: header, rec_id, pkt_addr, rpc_id, client, cid,
+    // server, buffer, cbuffer.
+    Vm& vm = TheVm();
+    auto word = [&](std::size_t at) { u32 v = 0; if (at + 4 <= packet.size()) std::memcpy(&v, &packet[at], 4); return v; };
+    const u32 client = word(28);
+    const auto found = vm.rpc_clients.find(client);
+    if (found == vm.rpc_clients.end()) return false;
+    const RpcClient call = found->second;
+    vm.rpc_clients.erase(found);
+    vm.Free(call.packet);
+    if (word(32) == 0x80000009u) {                  // a bind's: the server, its buffers
+        vm.Write(client + 36, word(36), 4);
+        vm.Write(client + 20, word(40), 4);
+        vm.Write(client + 24, word(44), 4);
+    }
+    vm.Write(client, 0, 4);                         // hdr.pkt_addr: nothing in flight
+    if (call.end_function) vm.Call(call.end_function, {call.end_param});
+    if (call.thread) {
+        auto waiting = vm.threads.find(call.thread);
+        if (waiting != vm.threads.end() && waiting->second.wait == Wait::Client && !waiting->second.ready) {
+            waiting->second.c.r[2] = 0;
+            vm.MakeReady(waiting->second);
+        }
+    }
+    Run();
+    return true;
 }
 
 u32 Allocate(u32 size) { return TheVm().Allocate(size); }
