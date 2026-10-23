@@ -14,7 +14,9 @@ against the interpreter. A function only counts if its *compiled* form agrees.
 
 The compiler is MSVC, found through vswhere, on Windows, and clang++ elsewhere
 (`$CXX` names another), built with the port's own float rule. Where none is
-installed the check reports itself unavailable rather than passing.
+installed the check reports itself unavailable rather than passing. clang++
+compiles the emitted file in parts, side by side, as many at once as the cores
+and the memory available allow (split_definitions, compile_jobs).
 """
 
 from __future__ import annotations
@@ -120,6 +122,141 @@ CLANG_FLAGS = ["-std=c++17", "-O3", "-fPIC", "-ffp-contract=off", "-Wno-unknown-
                "-ferror-limit=0"]
 
 _CLANG_ERROR = re.compile(r"^(.*?):(\d+):\d+: (?:fatal )?error: (.*)$")
+
+# The emitted file is compiled in parts side by side (split_definitions): each
+# part its declarations and at most this much source of definitions past its
+# first function, whose size is never limited. As one file, Tekken 5's game
+# program - 88 MB - was one compiler for 18 minutes, the other cores idle.
+PART_BYTES = 1500000
+
+# What one compiler takes, by the size of a part's definitions - clang 21 at -O3
+# on Tekken 5's game program: its declarations and types alone 123 MB, then
+# about 144 bytes for each byte of definitions (387 functions in 3.6 MB: 640 MB;
+# one function of 4.6 MB: 290 MB). The estimate is above both.
+COMPILER_BASE_BYTES = 150 << 20
+COMPILER_BYTES_PER_BYTE = 160
+
+_DEFINITION = re.compile(r"^(?:s32|u32|void) func_[0-9A-F]{8}\(.*\) \{$")
+_NAMESPACE_END = "}  // namespace generated"
+
+
+class Part:
+    """One part of an emitted file (split_definitions): its path, the size of its
+    definitions, and where its lines come from - its first `prelude` lines are
+    the file's own, then each segment (the file's first line, how many lines)."""
+
+    def __init__(self, path: str, size: int, prelude: int, segments: list) -> None:
+        self.path, self.size, self.prelude, self.segments = path, size, prelude, segments
+
+    def emitted_line(self, line: int) -> int:
+        """The emitted file's line that the part's `line` (from 1) copies."""
+        if line <= self.prelude:
+            return line
+        offset = line - self.prelude
+        for first, count in self.segments:
+            if offset <= count:
+                return first + offset - 1
+            offset -= count
+        return 0                                # the namespace's end, added
+
+
+def split_definitions(generated_path: str, work_dir: str, part_bytes: int = None) -> list:
+    """The emitted file as Parts to compile side by side, written to `work_dir`:
+    each the file's prelude - its includes and every declaration, so the
+    functions call one another across parts - then its share of the function
+    definitions, in order, at most `part_bytes` of them past its first, and the
+    namespace's end. A file with no definitions is one part, itself."""
+    part_bytes = PART_BYTES if part_bytes is None else part_bytes
+    with open(generated_path, encoding="utf-8") as handle:
+        lines = handle.read().splitlines(keepends=True)
+    starts = [n for n, line in enumerate(lines) if _DEFINITION.match(line.rstrip("\r\n"))]
+    ends = [n for n, line in enumerate(lines) if line.rstrip("\r\n") == _NAMESPACE_END]
+    if not starts or not ends or ends[-1] < starts[-1]:
+        return [Part(os.path.abspath(generated_path), os.path.getsize(generated_path), len(lines), [])]
+    bounds = starts + [ends[-1]]
+    prelude = lines[:starts[0]]
+    stem = os.path.splitext(os.path.basename(generated_path))[0]
+    groups, group, size = [], [], 0
+    for k in range(len(starts)):
+        length = sum(len(line) for line in lines[bounds[k]:bounds[k + 1]])
+        if group and size + length > part_bytes:
+            groups.append((group, size))
+            group, size = [], 0
+        group.append(k)
+        size += length
+    groups.append((group, size))
+    parts = []
+    for number, (group, size) in enumerate(groups):
+        path = os.path.join(os.path.abspath(work_dir), "%s.part%d.cpp" % (stem, number))
+        segments = [(bounds[k] + 1, bounds[k + 1] - bounds[k]) for k in group]
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.writelines(prelude)
+            for k in group:
+                handle.writelines(lines[bounds[k]:bounds[k + 1]])
+            handle.write(_NAMESPACE_END + "\n")
+        parts.append(Part(path, size, len(prelude), segments))
+    return parts
+
+
+def _in_emitted_lines(errors: str, parts: list, generated_path: str) -> str:
+    """Compiler errors in the parts, as errors in the emitted file's own lines -
+    which is how the callers find the functions to drop."""
+    by_path = {os.path.normcase(part.path): part for part in parts}
+
+    def back(match):
+        part = by_path.get(os.path.normcase(match.group(1)))
+        if part is None:
+            return match.group(0)
+        return "%s(%d)" % (os.path.abspath(generated_path), part.emitted_line(int(match.group(2))))
+    return re.sub(r"(\S+?\.part\d+\.cpp)\((\d+)\)", back, errors)
+
+
+def available_memory() -> int:
+    """Bytes of memory free for more processes, as the system counts them:
+    macOS's kernel's free share (kern.memorystatus_level, the percentage
+    memory_pressure prints, which counts what it can compress or purge - its
+    free and inactive pages alone were a third of it), Linux's MemAvailable,
+    Windows' available physical memory; else half the physical memory."""
+    try:
+        if sys.platform == "darwin":
+            def sysctl(name):
+                return int(subprocess.run(["sysctl", "-n", name], capture_output=True, text=True).stdout)
+            return sysctl("hw.memsize") * sysctl("kern.memorystatus_level") // 100
+        if os.path.exists("/proc/meminfo"):
+            with open("/proc/meminfo", encoding="ascii") as handle:
+                return int(re.search(r"^MemAvailable:\s+(\d+) kB", handle.read(), re.M).group(1)) * 1024
+        if os.name == "nt":
+            class Status(ctypes.Structure):
+                _fields_ = [("length", ctypes.c_uint32), ("load", ctypes.c_uint32),
+                            ("total", ctypes.c_uint64), ("available", ctypes.c_uint64),
+                            ("page_total", ctypes.c_uint64), ("page_available", ctypes.c_uint64),
+                            ("virtual_total", ctypes.c_uint64), ("virtual_available", ctypes.c_uint64),
+                            ("extended", ctypes.c_uint64)]
+            status = Status(length=ctypes.sizeof(Status))
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return status.available
+    except (OSError, AttributeError, ValueError):
+        pass
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 2
+    except (OSError, AttributeError, ValueError):
+        return 4 << 30
+
+
+def compile_jobs(sizes, available: int = None, cpus: int = None) -> int:
+    """How many compilers to run at once on parts of these sizes, largest first:
+    one per core, as long as the largest that run together fit in four fifths
+    of the memory available (COMPILER_BASE_BYTES and COMPILER_BYTES_PER_BYTE
+    each); at least one."""
+    available = available_memory() if available is None else available
+    cpus = cpus or os.cpu_count() or 1
+    needs = sorted((COMPILER_BASE_BYTES + COMPILER_BYTES_PER_BYTE * size for size in sizes), reverse=True)
+    jobs, used = 0, 0
+    for need in needs[:cpus]:
+        if jobs and used + need > available * 4 // 5:
+            break
+        jobs, used = jobs + 1, used + need
+    return max(1, jobs)
 
 
 def clang_build(sources, include_dirs, library: str, parallel: int = 4) -> None:
@@ -324,7 +461,14 @@ def build(generated_path: str, runtime_sources, include_dir: str, work_dir: str)
         os.path.abspath(path) for path in runtime_sources
     ]
     if os.name != "nt":
-        clang_build(sources, [include_dir, generated_dir], dll, parallel=len(sources))
+        parts = sorted(split_definitions(generated_path, work_dir), key=lambda part: -part.size)
+        jobs = compile_jobs([part.size for part in parts])
+        print("  compiling the emitted file in %d parts, %d at a time" % (len(parts), jobs), flush=True)
+        try:
+            clang_build([part.path for part in parts] + sources[1:], [include_dir, generated_dir], dll,
+                        parallel=jobs)
+        except CompileError as exc:
+            raise CompileError(_in_emitted_lines(str(exc), parts, generated_path)) from None
         return dll, functions
     # /O2 on purpose: an optimiser is what turns undefined behaviour into wrong
     # answers, so checking an unoptimised build would hide exactly the problems
