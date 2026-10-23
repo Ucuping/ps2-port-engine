@@ -21,7 +21,7 @@ from __future__ import annotations
 import struct
 import sys
 
-from . import layout, vu0
+from . import cpumodel, layout, vu0
 from .r5900 import DISASM, GPR
 
 MASK64 = (1 << 64) - 1
@@ -309,6 +309,7 @@ class Machine:
         self.vc = vu0.initial_vc()
         self.vacc = [0, 0, 0, 0]
         self.sa = 0          # the shift amount qfsrv uses, in bits (mtsab/mtsah)
+        self.di = 0          # COP0 Status's EIE cleared: after `di`, until `ei` (cpumodel)
         self.pc = 0
         self.instructions_executed = 0
         self.call_log = []
@@ -1435,12 +1436,15 @@ _HANDLERS = {
 #              in SYSCALL_RESULTS.
 #   mfc0     - every system-control register reads as 0. Count in particular is
 #              constant, so a busy-wait on it never ends and the test runs out
-#              of budget, rather than finishing with a made-up time.
+#              of budget, rather than finishing with a made-up time. A game
+#              may take Status as a thread sees it instead (cpumodel.py's
+#              cop0_status): IE set, and EIE until `di`, again after `ei`.
 #   traps    - trap exactly as the hardware does, which ends the test.
 #   calls outside the executable - return 0 and do nothing (Machine._stubbed_call).
 #   ei/di    - do nothing. No interrupt ever arrives during a test, so whether
 #              they are enabled changes nothing observable, and mfc0 reading
-#              Status as 0 already reports them disabled either way.
+#              Status as 0 already reports them disabled either way. With
+#              cop0_status they set and clear EIE, which mfc0 then reads.
 
 # Services whose stub result is not 0. SifGetReg reads a SIF register, and code
 # polls it until the IOP sets a flag (`while (!(SifGetReg(4) & 0x20000))`); with
@@ -1507,7 +1511,20 @@ def _op_syscall(m: Machine, ins) -> None:
 
 
 def _op_mfc0(m: Machine, ins) -> None:
-    m.set(ins.rt, 0)
+    if cpumodel.CURRENT.cop0_status and ins.rd == cpumodel.STATUS:
+        m.set(ins.rt, cpumodel.status(m.di))
+    else:
+        m.set(ins.rt, 0)
+
+
+def _op_di(m: Machine, ins) -> None:
+    if cpumodel.CURRENT.cop0_status:
+        m.di = 1
+
+
+def _op_ei(m: Machine, ins) -> None:
+    if cpumodel.CURRENT.cop0_status:
+        m.di = 0
 
 
 def _trap(condition):
@@ -1539,8 +1556,8 @@ def _fp_accumulate(fn, write_fd: bool):
 _HANDLERS.update({
     "syscall": _op_syscall,
     "mfc0": _op_mfc0,
-    "ei": lambda m, ins: None,
-    "di": lambda m, ins: None,
+    "ei": _op_ei,
+    "di": _op_di,
     "lqc2": _op_lqc2,
     "sqc2": _op_sqc2,
     "break": _trap(lambda a, b: True),

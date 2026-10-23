@@ -39,6 +39,10 @@ struct Context {
     /* Set by another thread to get control at this context's next loop head
        (Tick), whatever its budget: the host's blank timer, in real time. */
     u32 attention;
+    /* COP0 Status's EIE, cleared: 1 after `di` until `ei`, for a game that
+       takes Status as a thread sees it (ps2decomp/cpumodel.py); a context
+       starts with it 0, enabled. */
+    u32 di;
 };
 
 /* Thrown, and caught at the entry point, when a run cannot go on: a trap

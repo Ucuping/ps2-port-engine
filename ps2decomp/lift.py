@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import struct
 
-from . import vu0
+from . import cpumodel, vu0
 from .emu import is_supported
 from .r5900 import DISASM
 
@@ -109,6 +109,8 @@ def statement(ins) -> str:
     a, b = _r(rs), _r(rt)
     address = "(u32)%s + %s" % (a, _u32(imm))
 
+    if m in ("di", "ei") and cpumodel.CURRENT.cop0_status:
+        return "c.di = %du;" % (m == "di")
     if m in _NOTHING:
         return ""
     if ins.raw >> 26 == 0x12:
@@ -353,6 +355,9 @@ def statement(ins) -> str:
     if m == "syscall":
         return "lifted::Syscall(c);"
     if m == "mfc0":
+        if cpumodel.CURRENT.cop0_status and rd == cpumodel.STATUS:
+            # Status as a thread sees it (cpumodel.py): IE, and EIE unless `di`.
+            return _set(rt, "(c.di ? 0x%Xull : 0x%Xull)" % (cpumodel.status(1), cpumodel.status(0)))
         return _set(rt, "0ull")
     raise Refused("no translation for %s at 0x%08X" % (m, ins.addr))
 

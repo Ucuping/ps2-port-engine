@@ -43,6 +43,7 @@ class Context(ctypes.Structure):
         ("vacc", ctypes.c_uint32 * 4),
         ("sa", ctypes.c_uint32),
         ("attention", ctypes.c_uint32),     # another thread's request (the port's); 0 here
+        ("di", ctypes.c_uint32),            # COP0 Status's EIE cleared (cpumodel.py)
     ]
 
 
@@ -204,7 +205,7 @@ def machine_state(machine) -> tuple:
             machine.hi1, machine.lo1, tuple(f & 0xFFFFFFFF for f in machine.fpr),
             machine.fp_acc & 0xFFFFFFFF, int(bool(machine.fp_cond)),
             tuple(tuple(v) for v in machine.vf), tuple(machine.vc), tuple(machine.vacc),
-            machine.sa)
+            machine.sa, machine.di)
 
 
 def context_state(context: Context) -> tuple:
@@ -213,7 +214,7 @@ def context_state(context: Context) -> tuple:
     return (tuple(regs), tuple(context.rh), context.hi, context.lo, context.hi1,
             context.lo1, tuple(context.f), context.acc, int(context.fcc != 0),
             tuple(tuple(v) for v in context.vf), tuple(context.vc), tuple(context.vacc),
-            context.sa)
+            context.sa, context.di)
 
 
 def load_machine(machine, context: Context) -> None:
@@ -229,6 +230,7 @@ def load_machine(machine, context: Context) -> None:
     machine.vc = list(context.vc)
     machine.vacc = list(context.vacc)
     machine.sa = context.sa
+    machine.di = context.di
 
 
 def store_context(context: Context, machine) -> None:
@@ -247,6 +249,7 @@ def store_context(context: Context, machine) -> None:
     for lane in range(4):
         context.vacc[lane] = machine.vacc[lane] & 0xFFFFFFFF
     context.sa = machine.sa
+    context.di = machine.di
 
 
 def entry_context(args, stack_top=None) -> Context:

@@ -26,6 +26,7 @@ import json
 import os
 import struct
 
+from . import cpumodel
 from . import layout as layout_module
 from . import overlay as overlay_module
 from .elf import ElfFile
@@ -94,6 +95,10 @@ DEFAULTS = {
     # A function ends after a `jr $ra` that padding or the next function's
     # prologue follows, when nothing in it branches past (analysis.py).
     "end_at_returns": False,
+    # COP0's Status as a thread sees it - IE set, EIE until `di` - rather than 0
+    # (cpumodel.py), in the interpreter and the translations alike. An overlay
+    # takes its game's choice.
+    "cop0_status": False,
     # The guessed functions another source confirms, counted as sure
     # (confidence_label): a table of their addresses and sources, written by
     # tools/confirm.py - e.g. "config/confirmed.csv".
@@ -127,6 +132,7 @@ class Game:
     end_at_returns: bool = False
     # The guessed functions another source confirms: {address: source}; and the
     # table they are read from, None for a game without one.
+    cop0_status: bool = False
     confirmed: dict = dataclasses.field(default_factory=dict)
     confirmed_path: "str | None" = None
 
@@ -154,7 +160,8 @@ def load(directory: str) -> Game:
     if os.path.isfile(directory):
         directory = os.path.dirname(directory)
     with open(os.path.join(directory, "game.json"), encoding="utf-8") as handle:
-        values = dict(DEFAULTS, **json.load(handle))
+        own = json.load(handle)
+    values = dict(DEFAULTS, **own)
     base = None
     if values["overlay"]:
         # An overlay (ps2decomp/overlay.py): its executable is the base game's
@@ -169,6 +176,8 @@ def load(directory: str) -> Game:
         images = [(os.path.normpath(os.path.join(directory, entry["image"])),
                    _number(entry["address"]), _number(entry.get("size", 0)))
                   for entry in described.get("resident", []) + [described]]
+        if "cop0_status" not in own:
+            values["cop0_status"] = base.cop0_status
         target = os.path.join(directory, values["build"], values["executable"])
         if all(os.path.exists(path) for path in [base.elf_path] + [i[0] for i in images]):
             overlay_module.build(base.elf_path, images, target)
@@ -184,11 +193,13 @@ def load(directory: str) -> Game:
                 base=base, overlays=list(values["overlays"]),
                 eh_frame_boundaries=bool(values["eh_frame_boundaries"]),
                 calls_from_code_only=bool(values["calls_from_code_only"]),
-                end_at_returns=bool(values["end_at_returns"]))
+                end_at_returns=bool(values["end_at_returns"]),
+                cop0_status=bool(values["cop0_status"]))
     if values["confirmed"]:
         game.confirmed_path = game.path(values["confirmed"])
         game.confirmed = read_confirmed(game.confirmed_path)
     configure_layout(game)
+    cpumodel.configure(cop0_status=game.cop0_status)
     return game
 
 
