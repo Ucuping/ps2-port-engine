@@ -3435,6 +3435,19 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (swizzle_) vkDestroyShaderModule(g_.device, swizzle_, nullptr);
     if (decode_pipeline_) vkDestroyPipeline(g_.device, decode_pipeline_, nullptr);
     if (decode_) vkDestroyShaderModule(g_.device, decode_, nullptr);
+    // The swizzle to and from an image's, the decode into one's, the patch's
+    // and the depth buffer's.
+    for (VkPipeline pipeline : {swizzle_image_pipeline_, decode_image_pipeline_, patch_pipeline_,
+                                swizzle_depth_pipeline_, depth_load_pipeline_})
+        if (pipeline) vkDestroyPipeline(g_.device, pipeline, nullptr);
+    for (VkPipelineLayout layout : {swizzle_image_layout_, patch_layout_, swizzle_depth_layout_, depth_load_layout_})
+        if (layout) vkDestroyPipelineLayout(g_.device, layout, nullptr);
+    for (VkDescriptorSetLayout layout : {image_set_layout_, depth_set_layout_})
+        if (layout) vkDestroyDescriptorSetLayout(g_.device, layout, nullptr);
+    if (storage_pool_) vkDestroyDescriptorPool(g_.device, storage_pool_, nullptr);
+    for (VkShaderModule module : {swizzle_image_, decode_image_, patch_, swizzle_depth_, depth_load_vert_,
+                                  depth_load_frag_})
+        if (module) vkDestroyShaderModule(g_.device, module, nullptr);
     for (auto [buffer, memory] : {std::pair{gsmem_, gsmem_memory_}, std::pair{linear_, linear_memory_},
                                   std::pair{clut_, clut_memory_}, std::pair{tables_, tables_memory_}}) {
         if (buffer) vkDestroyBuffer(g_.device, buffer, nullptr);
