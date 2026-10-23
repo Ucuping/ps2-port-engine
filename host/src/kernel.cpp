@@ -78,7 +78,7 @@ const Service kServices[] = {
     {0x37, "SuspendThread"}, {0x39, "ResumeThread"}, {0x3C, "SetupThread"},
     {0x3D, "SetupHeap"}, {0x3E, "EndOfHeap"}, {0x40, "CreateSema"},
     {0x41, "DeleteSema"}, {0x42, "SignalSema"}, {0x43, "iSignalSema"},
-    {0x44, "WaitSema"}, {0x45, "PollSema"}, {0x47, "ReferSemaStatus"},
+    {0x44, "WaitSema"}, {0x45, "PollSema"}, {0x47, "ReferSemaStatus"}, {0x48, "iReferSemaStatus"},
     {0x4A, "SetOsdConfigParam"}, {0x4B, "GetOsdConfigParam"}, {0x5A, "kCopy"},
     {0x64, "FlushCache"},
     {0x70, "GsGetIMR"}, {0x71, "GsPutIMR"}, {0x73, "SetVSyncFlag"},

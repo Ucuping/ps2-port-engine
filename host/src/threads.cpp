@@ -106,7 +106,8 @@ struct Coroutine {
 namespace {
 
 struct Semaphore {
-    s32 count = 0, max = 0;
+    s32 count = 0, max = 0, init = 0;
+    u32 attr = 0, option = 0;       // as CreateSema had them, for ReferSemaStatus
 };
 
 struct Handler {
@@ -1201,9 +1202,12 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
             return true;
         }
         case 0x40: {                                 // CreateSema(param*): count, max, init
+            // ps2sdk's ee_sema_t: count, max_count, init_count, wait_threads, attr, option.
             Semaphore sema;
-            sema.count = s32(m.Read(a0 + 8, 4));     // struct SemaParam { count, max_count, init_count, ... }
+            sema.count = sema.init = s32(m.Read(a0 + 8, 4));
             sema.max = s32(m.Read(a0 + 4, 4));
+            sema.attr = u32(m.Read(a0 + 16, 4));
+            sema.option = u32(m.Read(a0 + 20, 4));
             const u32 id = s.next_semaphore++;
             s.semaphores[id] = sema;
             result = id;
@@ -1244,6 +1248,18 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
                 s.current->queued = ++s.counter;
                 GiveWay();
             }
+            result = a0;
+            return true;
+        }
+        case 0x47: case 0x48: case -0x47: case -0x48: {   // ReferSemaStatus / iReferSemaStatus(id, sema*)
+            auto found = s.semaphores.find(a0);
+            if (found == s.semaphores.end()) { result = u64(-1); return true; }
+            const Semaphore& sema = found->second;
+            u32 waiting = 0;
+            for (const auto& [id, t] : s.threads)
+                if (t->state == State::Waiting && t->waiting_on == a0) ++waiting;
+            const u32 fields[6] = {u32(sema.count), u32(sema.max), u32(sema.init), waiting, sema.attr, sema.option};
+            for (u32 i = 0; i < 6; ++i) m.Write(a1 + 4 * i, fields[i], 4);
             result = a0;
             return true;
         }

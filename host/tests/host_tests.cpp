@@ -1383,6 +1383,38 @@ void IopInstructionsMatchTheR5900() {
     Check(failures == 0, "every IOP instruction vector matches");
 }
 
+// The EE kernel's semaphores report their state as the kernel does
+// (ReferSemaStatus, iReferSemaStatus; ps2sdk's ee_sema_t): count, max_count,
+// init_count, wait_threads, attr, option. Tekken 5's file requests take the
+// address a result goes to from a semaphore's option - unreported, a file's
+// handle never reached the game, and NU_File_Manager read an empty one.
+void EeSemaphoresReportTheirState() {
+    ps2host::Memory& m = ps2host::GuestMemory();
+    constexpr u32 kParam = 0x00350000u, kStatus = 0x00350100u;
+    const u32 param[6] = {0, 4, 2, 0, 0x1, 0x00123450};
+    for (u32 i = 0; i < 6; ++i) m.Write(kParam + 4 * i, param[i], 4);
+    lifted::Context c{};
+    u64 id = 0, result = 0;
+    c.r[4] = kParam;
+    Check(ps2host::ThreadSyscall(c, 0x40, id) && s32(id) > 0, "CreateSema");
+    c.r[4] = id;
+    ps2host::ThreadSyscall(c, 0x42, result);                         // SignalSema: 3
+    for (s32 service : {0x47, 0x48}) {
+        for (u32 i = 0; i < 24; i += 4) m.Write(kStatus + i, 0xEEEEEEEEu, 4);
+        c.r[4] = id, c.r[5] = kStatus;
+        Check(ps2host::ThreadSyscall(c, service, result) && result == id,
+              "ReferSemaStatus: answers the semaphore's id");
+        Check(m.Read(kStatus, 4) == 3 && m.Read(kStatus + 4, 4) == 4 && m.Read(kStatus + 8, 4) == 2 &&
+                  m.Read(kStatus + 12, 4) == 0 && m.Read(kStatus + 16, 4) == 1 &&
+                  m.Read(kStatus + 20, 4) == 0x00123450,
+              "ReferSemaStatus: count, max_count, init_count, wait_threads, attr, option");
+    }
+    c.r[4] = id + 1000, c.r[5] = kStatus;
+    Check(ps2host::ThreadSyscall(c, 0x47, result) && s32(u32(result)) < 0, "ReferSemaStatus: no such semaphore");
+    c.r[4] = id;
+    ps2host::ThreadSyscall(c, 0x41, result);                         // DeleteSema
+}
+
 }  // namespace
 
 // A core's sound-data input (a block transfer's PCM): heard at its BVOL in the
@@ -1834,6 +1866,7 @@ int main() {
     MmiLanesAreScalar();
     IpuDecodesAndRetriesCleanly();
     IopInstructionsMatchTheR5900();
+    EeSemaphoresReportTheirState();
     SpuDecodesAdpcmAndPlaysAVoice();
     SpuPlaysItsSoundDataInput();
     SpuInputInterruptsAtEachHalf();
