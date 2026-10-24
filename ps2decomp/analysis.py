@@ -41,6 +41,10 @@ CONF_PROLOGUE = "prologue"    # found by frame-setup pattern
 CONF_POINTER = "pointer"      # referenced by a plausible pointer word
 CONF_RUN = "run"              # a run reached it, and no function covered it (run entries)
 
+# The run entries that are pieces of a function, never functions themselves:
+# a switch's case, a label a branch leads to (game.RUN_ENTRY_KINDS).
+PIECE_KINDS = ("case", "branch")
+
 
 @dataclasses.dataclass
 class Function:
@@ -631,14 +635,19 @@ class ImageAnalyzer:
                 1 for a in visited if func.start <= a < func.end
             )
 
-        # Code a run reached that no function covered (game.json "run_entries"):
-        # sure starts, unless one found since covers it - a run entry inside a
-        # function would cut that function short.
+        # Code a run reached that no translation started at (game.json
+        # "run_entries"): sure starts. One inside a function found since is
+        # a start the analysis took for part of it - a `j`'s target, a
+        # pointer's - and cuts it short (_tighten_bounds); a piece inside one
+        # is that function's own - a case of its switch, a label - and a start
+        # there would cut it short wrongly: its run-time translation stays
+        # until the switch's table is read.
         for addr in sorted(self.run_entries):
             if not self.contains(addr):
                 self.stats["run_entries_outside"] += 1
                 continue
-            if addr in self.functions or any(f.start < addr < f.end for f in self.functions.values()):
+            inside = any(f.start < addr < f.end for f in self.functions.values())
+            if addr in self.functions or (inside and self.run_entries[addr] in PIECE_KINDS):
                 self.stats["run_entries_covered"] += 1
                 continue
             func = Function(start=addr, confidence=CONF_RUN, run_kind=self.run_entries[addr])

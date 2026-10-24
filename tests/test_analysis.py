@@ -170,6 +170,14 @@ class TestRunEntries(unittest.TestCase):
         self.assertEqual((found[BASE + 16].confidence, found[BASE + 16].run_kind), ("run", "pointer"))
         self.assertEqual(found[BASE + 16].end, BASE + 28)       # its delay slot with it
 
+    def test_a_start_inside_a_function_cuts_it_short(self):
+        # A `j` lands in what the analysis took for the middle of one function.
+        words = [self.ADDIU_V0, self.ADDIU_V0, self.ADDIU_V0, JR_RA, NOP]
+        self.assertEqual(self.functions(words)[BASE].end, BASE + 20)
+        found = self.functions(words, {BASE + 8: "j"})
+        self.assertEqual(sorted(found), [BASE, BASE + 8])
+        self.assertEqual((found[BASE].end, found[BASE + 8].end), (BASE + 8, BASE + 20))
+
     def test_a_covered_one_cuts_no_function_short(self):
         # A case of the switch the analysis read: its function covers it.
         words = TestSwitches.CODE + [NOP] * (0x40 - len(TestSwitches.CODE))

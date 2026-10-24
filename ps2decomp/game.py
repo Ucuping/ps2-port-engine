@@ -29,6 +29,7 @@ import struct
 from . import cpumodel
 from . import layout as layout_module
 from . import overlay as overlay_module
+from .analysis import PIECE_KINDS
 from .elf import ElfFile
 from .r5900 import DISASM
 
@@ -52,8 +53,7 @@ CONFIDENT = ("entry", "called", "pointer", "run")
 #   call      a `jal` to it the analysis does not see (an overlay's)
 #   computed  an address worked out at run time: no word or jump names it
 RUN_ENTRY_KINDS = ("case", "branch", "pointer", "j", "call", "computed")
-# The kinds that are pieces of a function, never functions themselves.
-PIECE_KINDS = ("case", "branch")
+# (PIECE_KINDS, analysis.py's: the kinds that are pieces of a function.)
 # The run entries' columns: where, how it was reached, and what shows it.
 RUN_ENTRY_FIELDS = ["address", "kind", "evidence"]
 
