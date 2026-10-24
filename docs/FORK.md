@@ -197,6 +197,15 @@ stub dispatch table, every test) checks that it still builds and passes.
 - The IOP notes a module loaded while one of its name still is, and an RPC
   server registered while one of its id still is, with both: which of the
   two a game reaches is the host's choice.
+- VIF1's interrupt bit, off by default (`SetVif1InterruptBit`; a port turns
+  it on): a VIFcode with bit 31 set raises INTC's VIF1 cause, and VIF1_STAT
+  shows INT and VIS until FBRST's STC, unless VIF1_ERR's MII masks the bit.
+  It is looked for where the EE hands VIF1 its words (`Vif1Sent`, by
+  `VifCodeScan`, which follows the commands' data lengths as the decoder
+  does), so VIF1's worker changes nothing. INTC causes a device posts
+  (`PostIntc`) are delivered as DMA completions are, before them. VIF1 does
+  not stand still at the bit; the transfer still completes at once. Tekken 5
+  lets its texture uploads end only once its VIF1 handler has seen INT.
 
 Found and not yet changed, with the evidence in the Tekken 5 repository's
 `games/tekken5/docs/FINDINGS.md` ("Engine findings worth upstreaming"): a call
@@ -207,6 +216,4 @@ compiled check catches and drops; `callers_known` holds for an executable
 whose own modules, loaded at run time, call it, until they are listed as
 overlays; a store made in kernel mode and ended by `eret` has no
 translation (Tekken 5 overrides its one; if another game has the same form,
-the lifter should learn it); a VIFcode's interrupt bit is ignored - VIF1
-raises no interrupt and VIF1_STAT never shows INT - so a game that waits for
-it to let PATH3 go on waits for ever (Tekken 5's texture uploads).
+the lifter should learn it).
