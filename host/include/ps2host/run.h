@@ -159,6 +159,9 @@ void RaiseDmac(u32 channel);
    thread's next loop head, or between threads - never inside the store that
    started the transfer, since code goes on to set up for the interrupt. */
 void PostDmac(u32 channel);
+/* An INTC cause a device raised (VIF1's interrupt bit): INTC_STAT shows it at
+   once, and its handlers run as PostDmac's interrupts do, before them. */
+void PostIntc(u32 cause);
 /* A channel a device moves at its own pace (the IPU's) has finished: its
    D_STAT bit, and its interrupt as PostDmac (devices.cpp). */
 void DmaChannelEnded(u32 channel);
@@ -238,6 +241,18 @@ void SetPresentAtBlankEnd(bool on);
 void StartVif1Worker();
 /* Whether real time runs VIF1 on its worker (default yes; --vif1-sync: no). */
 void SetVif1Worker(bool on);
+/* VIF1's interrupt bit: a VIFcode with bit 31 set raises INTC's VIF1 cause,
+   and VIF1_STAT shows INT and VIS until FBRST's STC, as on the console -
+   unless VIF1_ERR's MII masks the bit. VIF1 does not stand still there: the
+   transfer still completes at once, and a transfer with several such codes
+   raises the cause once. Off by default; a game that waits for it has its
+   port turn it on (Tekken 5 lets each frame's PATH3 texture uploads end only
+   once its VIF1 handler has seen INT). */
+void SetVif1InterruptBit(bool on);
+/* Words the EE hands VIF1 - a DMA transfer's, the FIFO's - in order, as they
+   go: where VIF1's interrupt bit is looked for (devices.cpp), on the EE's
+   thread, so a run with VIF1's worker sees what one without it sees. */
+void Vif1Sent(const u32* words, u32 count);
 /* A VIF1 DMA chain as it is sent: its words, in runs (each: how many, and
    the address they were read from) - the chain walked, its tags followed. */
 struct Vif1Chain {

@@ -134,6 +134,7 @@ struct Scheduler {
     bool in_interrupt = false;
     lifted::Context interrupt_context = NewContext();
     u32 pending_dmac = 0;                   // channels whose interrupt waits
+    u32 pending_intc = 0;                   // INTC causes a device raised, their handlers still to run
     u32 dmac_missed = 0;                    // channels that ended while their interrupt was off
     bool realtime = false;                  // a vblank timer runs (unlimited budget)
     // --virtual-time: the scheduler keeps the clock. A thread runs a slice of
@@ -318,9 +319,18 @@ bool DeliverFrame() {
     return ran;
 }
 
-void DeliverPendingDmac() {
+// What devices posted (PostIntc, PostDmac), each cause's handlers in turn:
+// INTC's first - VIF1 stops at its interrupt bit before its transfer can end.
+void DeliverPendingInterrupts() {
     Scheduler& s = S();
-    while (s.pending_dmac) {
+    while (s.pending_intc || s.pending_dmac) {
+        if (s.pending_intc) {
+            u32 cause = 0;
+            while (!((s.pending_intc >> cause) & 1)) ++cause;
+            s.pending_intc &= s.pending_intc - 1;
+            if (s.intc_mask & (1u << cause)) RunHandlers(s.handlers, cause);
+            continue;
+        }
         u32 channel = 0;
         while (!((s.pending_dmac >> channel) & 1)) ++channel;
         s.pending_dmac &= s.pending_dmac - 1;
@@ -617,7 +627,7 @@ void LoopHead(lifted::Context& c, u32 address) {
     }
     while (DeliverIopReply()) {
     }
-    DeliverPendingDmac();
+    DeliverPendingInterrupts();
     // Returning from the interrupt, a thread its handler woke may run first.
     Thread* best = PickReady();
     if (best && best->priority < s.current->priority) {
@@ -680,6 +690,12 @@ void ClearIntcStat(u32 bits) { g_intc_stat.fetch_and(~bits, std::memory_order_re
 
 void PostDmac(u32 channel) {
     S().pending_dmac |= 1u << channel;
+    RequestDelivery();
+}
+
+void PostIntc(u32 cause) {
+    g_intc_stat.fetch_or(1u << cause, std::memory_order_relaxed);   // INTC_STAT shows it at once
+    S().pending_intc |= 1u << cause;
     RequestDelivery();
 }
 
@@ -868,7 +884,7 @@ void RunThreads(const lifted::Context& initial, u32 entry, s64 loop_budget) {
         // Answers from the IOP arrive between threads, as interrupts.
         while (DeliverIopReply()) {
         }
-        DeliverPendingDmac();
+        DeliverPendingInterrupts();
         Thread* next = PickReady();
         if (!next) {
             if (first.state == State::Dormant)
@@ -1308,7 +1324,7 @@ bool RunIopBetweenSteps() {
     }
     while (DeliverIopReply()) {
     }
-    DeliverPendingDmac();
+    DeliverPendingInterrupts();
     if (s.timer_due.exchange(false)) {
         DeliverTimers();
         DeliverAlarms();

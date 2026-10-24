@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -215,6 +216,58 @@ void VifSkipsDataAndAppliesMaskPath3() {
     vif.Word(0x06000000u);
     vif.Word(0x06000000u);
     Check(masks == 3, "MPG data is not decoded");
+}
+
+// The interrupt bit is a VIFcode's, never its data's: the scan skips each
+// command's data as the decoder does (above).
+void VifCodesAreFoundWithoutDecoding() {
+    ps2host::VifCodeScan scan;
+    const u32 i = 0x80000000u;                      // the interrupt bit
+    auto feed = [&scan](std::initializer_list<u32> words) {
+        const std::vector<u32> v(words);
+        return scan.Words(v.data(), u32(v.size()));
+    };
+    Check(feed({i}) == 1, "a NOP with the interrupt bit");
+    Check(feed({0x50000001u, i, i, i, i}) == 0, "DIRECT's data is data");
+    Check(feed({i | 0x6C020000u, i, i, i, i, i, i, i, i}) == 1, "UNPACK's data is data, its command not");
+    // STCYCL CL=1 WL=2: an UNPACK V4-32 of 4 reads 2 elements, 8 words.
+    Check(feed({0x01000201u, 0x6C040000u, i, i, i, i, i, i, i, i, i}) == 1,
+          "UNPACK with WL > CL reads CL of every WL");
+    feed({0x01000101u});
+    Check(feed({0x4A010000u, i, i, 0x20000000u, i, 0x30000000u, i, i, i, i, 0x31000000u, i, i, i, i}) == 0,
+          "MPG's, STMASK's, STROW's and STCOL's data is data");
+    Check(feed({0x50000002u, i, i, i}) == 0 && feed({i, i, i, i, i, i}) == 1,
+          "a command's data split between two runs");
+}
+
+// VIF1's interrupt bit, where a port turns it on (Tekken 5's texture uploads
+// wait for it): VIF1_STAT's INT and VIS and INTC's VIF1 cause, until FBRST's
+// STC.
+void Vif1InterruptBitRaisesItsInterrupt() {
+    ps2host::Memory& m = ps2host::GuestMemory();
+    const u32 stat = 0x10003C00u, fbrst = 0x10003C10u, err = 0x10003C20u;
+    const u32 shown = 0xC00u, cause = 1u << 5;
+    const u32 nop = 0x80000000u, direct[] = {0x50000001u, nop, nop, nop, nop};
+    auto raised = [&] { return (m.Read(stat, 4) & shown) == shown && (ps2host::IntcStat() & cause); };
+    auto quiet = [&] { return (m.Read(stat, 4) & shown) == 0 && !(ps2host::IntcStat() & cause); };
+    m.Write(stat, 0, 4);
+    m.Write(err, 0, 4);
+    ps2host::ClearIntcStat(cause);
+    ps2host::Vif1Sent(&nop, 1);
+    Check(quiet(), "VIF1's interrupt bit is off by default");
+    ps2host::SetVif1InterruptBit(true);
+    ps2host::Vif1Sent(direct, 5);
+    Check(quiet(), "the bit in a command's data raises nothing");
+    ps2host::Vif1Sent(&nop, 1);
+    Check(raised(), "a VIFcode's interrupt bit: INT, VIS and INTC's VIF1 cause");
+    m.Write(fbrst, 8, 4);
+    ps2host::ClearIntcStat(cause);
+    Check(quiet(), "FBRST's STC clears INT and VIS");
+    m.Write(err, 1, 4);
+    ps2host::Vif1Sent(&nop, 1);
+    Check(quiet(), "VIF1_ERR's MII masks the bit");
+    m.Write(err, 0, 4);
+    ps2host::SetVif1InterruptBit(false);
 }
 
 void PutTag(u32 at, u32 qwc, u32 id, u32 address, u32 upper0, u32 upper1) {
@@ -2467,6 +2520,8 @@ int main() {
     DiscFindsFilesByPath();
     WideWritesReachEveryWordsHook();
     VifSkipsDataAndAppliesMaskPath3();
+    VifCodesAreFoundWithoutDecoding();
+    Vif1InterruptBitRaisesItsInterrupt();
     DmaChainsAreWalked();
     GsLayoutsArePermutations();
     GsDrawsASprite();

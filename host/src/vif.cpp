@@ -26,18 +26,57 @@
 
 namespace ps2host {
 
-std::uint32_t VifStream::UnpackWords(std::uint32_t format, std::uint32_t num) const {
+namespace {
+
+std::uint32_t UnpackDataWords(std::uint32_t format, std::uint32_t num, std::uint32_t cl, std::uint32_t wl) {
     const std::uint32_t vl = format & 3, vn = (format >> 2) & 3;
     // Bits per element: components (vn + 1) of 32 >> vl bits; V4-5 packs 16.
     const std::uint32_t bits = (vn == 3 && vl == 3) ? 16 : (vn + 1) * (32u >> vl);
     // With WL > CL (filling writes) only CL of every WL elements come from data.
     std::uint32_t elements = num;
-    if (write_length_ > cycle_length_ && write_length_ != 0) {
-        const std::uint32_t partial = num % write_length_;
-        elements = cycle_length_ * (num / write_length_) +
-                   (partial < cycle_length_ ? partial : cycle_length_);
+    if (wl > cl && wl != 0) {
+        const std::uint32_t partial = num % wl;
+        elements = cl * (num / wl) + (partial < cl ? partial : cl);
     }
     return (elements * bits + 31) / 32;
+}
+
+}  // namespace
+
+std::uint32_t VifStream::UnpackWords(std::uint32_t format, std::uint32_t num) const {
+    return UnpackDataWords(format, num, cycle_length_, write_length_);
+}
+
+std::uint32_t VifDataWords(std::uint32_t code, std::uint32_t cycle_length, std::uint32_t write_length) {
+    const std::uint32_t command = (code >> 24) & 0x7F, num = (code >> 16) & 0xFF, immediate = code & 0xFFFF;
+    if (command >= 0x60) return UnpackDataWords(command & 0xF, num ? num : 256, cycle_length, write_length);
+    switch (command) {
+        case 0x20: return 1;                                    // STMASK
+        case 0x30: case 0x31: return 4;                         // STROW, STCOL
+        case 0x4A: return (num ? num : 256) * 2;                // MPG
+        case 0x50: case 0x51: return (immediate ? immediate : 0x10000) * 4;    // DIRECT, DIRECTHL
+        default: return 0;
+    }
+}
+
+std::uint32_t VifCodeScan::Words(const std::uint32_t* words, std::uint32_t count) {
+    std::uint32_t interrupts = 0;
+    for (std::uint32_t i = 0; i < count;) {
+        if (pending_) {                                         // a command's data, skipped whole
+            const std::uint32_t run = std::min(pending_, count - i);
+            pending_ -= run;
+            i += run;
+            continue;
+        }
+        const std::uint32_t code = words[i++];
+        if (code >> 31) ++interrupts;
+        if (((code >> 24) & 0x7F) == 0x01) {                    // STCYCL
+            cycle_length_ = code & 0xFF;
+            write_length_ = (code >> 8) & 0xFF;
+        }
+        pending_ = VifDataWords(code, cycle_length_, write_length_);
+    }
+    return interrupts;
 }
 
 void VifStream::WriteElement(const std::uint32_t value[4], bool from_data) {

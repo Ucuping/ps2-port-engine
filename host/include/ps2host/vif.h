@@ -84,6 +84,24 @@ private:
     void Start(std::uint32_t pc);
 };
 
+/* Words of data the VIFcode `code` is followed by, with STCYCL's CL and WL
+   as `cycle_length` and `write_length` - VifStream's lengths (vif.cpp). */
+std::uint32_t VifDataWords(std::uint32_t code, std::uint32_t cycle_length, std::uint32_t write_length);
+
+/* Where a VIF's commands begin among its words, followed without decoding
+   them: what the EE can tell of VIF1's stream as it hands VIF1 its words,
+   VIF1's worker decoding them later (VIF1's interrupt bit, devices.cpp). */
+class VifCodeScan {
+public:
+    /* The next `count` words of the stream; how many of them are VIFcodes
+       with the interrupt bit (bit 31) set. */
+    std::uint32_t Words(const std::uint32_t* words, std::uint32_t count);
+
+private:
+    std::uint32_t pending_ = 0;     /* data words still owed to the last command */
+    std::uint32_t cycle_length_ = 0, write_length_ = 0;     /* STCYCL's CL and WL */
+};
+
 /* The VIF1 stream fed by stores to its FIFO, 0x10005000. */
 VifStream& Vif1();
 /* VIF0's, at 0x10004000; it feeds VU0. */

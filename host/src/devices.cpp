@@ -16,7 +16,8 @@
  * Timers: in host time, with their interrupts (timers.cpp).
  * VIF1: quadwords stored to its FIFO are decoded as VIFcodes (vif.cpp);
  *      MSKPATH3 shows in GIF_STAT's M3P bit, which code that hands PATH3 over
- *      waits on.
+ *      waits on. A VIFcode's interrupt bit, where a port turns it on, raises
+ *      INTC's VIF1 cause and shows in VIF1_STAT (SetVif1InterruptBit).
  *
  * Every register the game touches is counted for the report, so the next device
  * to implement is the one the game leans on.
@@ -92,6 +93,14 @@ constexpr u32 kGsCsr = 0x12001000u;
 constexpr u32 kGifStat = 0x10003020u;
 constexpr u32 kGifStatM3P = 1u << 1;
 constexpr u32 kGifStatFqcShift = 24, kGifStatFqc = 0x1Fu << kGifStatFqcShift;
+
+// VIF1's interrupt bit (SetVif1InterruptBit), looked for in the words the EE
+// hands VIF1 (Vif1Sent).
+constexpr u32 kVif1Stat = 0x10003C00u, kVif1Fbrst = 0x10003C10u, kVif1Err = 0x10003C20u;
+constexpr u32 kVif1StatVis = 1u << 10, kVif1StatInt = 1u << 11;
+constexpr u32 kIntcVif1 = 5;
+bool g_vif1_interrupt_bit = false;
+VifCodeScan g_vif1_codes;           // where VIF1's commands begin, as the EE hands it words
 
 // PATH3: GIF DMA data to the GS, held while VIF1 has PATH3 masked - it goes
 // after the PATH2 data VIF1 sends meanwhile, as the GIF arbitrates.
@@ -289,7 +298,11 @@ std::string Walk(const Channel& ch, u32 chcr, bool describe) {
     };
     DmaBlockSink sink = [](const u32*, u32, u32) {};
     if (ch.base == 0x10008000u) sink = to_vif(Vif0());
-    if (ch.base == 0x10009000u) sink = to_vif(Vif1());
+    if (ch.base == 0x10009000u)
+        sink = [](const u32* words, u32 count, u32 from) {
+            Vif1Sent(words, count);
+            Vif1().Words(words, count, from);
+        };
     if (ch.base == 0x1000A000u) sink = Path3;
     // With VIF1's worker, VIF1's and the GIF's words are copied as the chain
     // is walked and handed to it in a command (the transfer ends here, as on
@@ -335,6 +348,8 @@ std::string Walk(const Channel& ch, u32 chcr, bool describe) {
                 }
             }
         }
+        // For VIF1's worker the words are copied, as they will go: seen here.
+        if (queued && ch.base == 0x10009000u) Vif1Sent(copy->words.data(), u32(copy->words.size()));
         if (describe)
             std::snprintf(text, sizeof text, "%llu quadwords, %u tags%s",
                       static_cast<unsigned long long>(outcome.quadwords), outcome.tags,
@@ -390,6 +405,23 @@ constexpr u32 kVif1Fifo = 0x10005000u;
 }  // namespace
 
 void SetVif1ChainFilter(std::function<void(Vif1Chain&)> filter) { g_vif1_filter = std::move(filter); }
+
+void SetVif1InterruptBit(bool on) {
+    g_vif1_interrupt_bit = on;
+    // FBRST's STC (bit 3) ends a stall and clears what it showed: VSS, VFS,
+    // VIS, INT, ER0 and ER1.
+    if (on)
+        GuestMemory().OnWrite(kVif1Fbrst, [](u32, u64 value) {
+            if (g_vif1_interrupt_bit && (value & 8)) *Register(kVif1Stat) &= ~0x3F00u;
+        });
+}
+
+void Vif1Sent(const u32* words, u32 count) {
+    if (!g_vif1_interrupt_bit || !g_vif1_codes.Words(words, count)) return;
+    if (*Register(kVif1Err) & 1) return;                    // VIF1_ERR's MII masks the bit
+    *Register(kVif1Stat) |= kVif1StatVis | kVif1StatInt;
+    PostIntc(kIntcVif1);
+}
 
 namespace {
 std::string g_frames_dir;
@@ -844,6 +876,7 @@ void InstallDevices() {
                     g_gif_shadow.known = false;
             }
         }
+        Vif1Sent(words.data(), 4);
         Vif1Run([words] {
             for (u32 word : words) Vif1().Word(word);
         });
