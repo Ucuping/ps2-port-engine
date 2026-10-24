@@ -143,3 +143,52 @@ class TestCallersKnown(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReadOnlySections(unittest.TestCase):
+    """The verification's interpreter loads the program's read-only sections
+    (.rodata) with its code where a game asks (game.json
+    "verify_read_only_sections"): a switch's table there is read under test as
+    on the console. Off, by default, they read zero as before."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from test_port import tiny_elf, SHF_ALLOC, SHF_WRITE, SHF_EXECINSTR, SHT_PROGBITS, SHT_NOBITS
+        self.rodata = struct.pack("<2I", 0x00100008, 0x0010000C)
+        self.image = tiny_elf([
+            (".text", 0x00100000, struct.pack("<4I", 0x03E00008, 0, 0x03E00008, 0), SHF_ALLOC | SHF_EXECINSTR,
+             SHT_PROGBITS),
+            (".data", 0x00100100, struct.pack("<I", 0x11111111), SHF_ALLOC | SHF_WRITE, SHT_PROGBITS),
+            (".rodata", 0x00100200, self.rodata, SHF_ALLOC, SHT_PROGBITS),
+            (".bss", 0x00100300, bytes(16), SHF_ALLOC | SHF_WRITE, SHT_NOBITS),
+        ])
+        self.directory = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.directory, "extracted"))
+        with open(os.path.join(self.directory, "extracted", "TEST.ELF"), "wb") as handle:
+            handle.write(self.image)
+
+    def tearDown(self):
+        from ps2decomp import emu
+        emu.configure(())
+
+    def load(self, **settings):
+        with open(os.path.join(self.directory, "game.json"), "w") as handle:
+            json.dump(dict({"executable": "TEST.ELF"}, **settings), handle)
+        return game.load(self.directory)
+
+    def test_off_by_default(self):
+        from ps2decomp import emu
+        loaded = self.load()
+        self.assertFalse(loaded.verify_read_only_sections or loaded.jump_tables_anywhere)
+        machine = emu.Machine.from_elf(loaded.load_elf())
+        self.assertEqual(machine.memory.read(0x00100200, 8), bytes(8))
+
+    def test_the_read_only_sections_alone_are_loaded(self):
+        from ps2decomp import emu
+        loaded = self.load(verify_read_only_sections=True, jump_tables_anywhere=True)
+        self.assertTrue(loaded.jump_tables_anywhere)
+        self.assertEqual(game.read_only_sections(loaded), [(0x00100200, self.rodata)])
+        machine = emu.Machine.from_elf(loaded.load_elf())
+        self.assertEqual(machine.memory.read(0x00100200, 8), self.rodata)
+        self.assertEqual(machine.memory.read(0x00100100, 4), bytes(4))         # .data: not read-only
+        self.assertNotEqual(emu.read_only_key(), ())

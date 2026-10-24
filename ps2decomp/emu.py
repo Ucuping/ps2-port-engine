@@ -99,6 +99,23 @@ WINDOWS = (
     (0x70000000, 0x70004000),     # scratchpad RAM, 16 KB
 )
 
+# The program's read-only sections, [(address, bytes)], which Machine.from_elf
+# loads with its code (game.json "verify_read_only_sections", set through
+# configure): a switch whose table is in .rodata jumps under test where it
+# does on the console, instead of to 0. Empty: the code alone, the rest zero.
+READ_ONLY_SECTIONS = []
+
+
+def configure(read_only_sections=()) -> None:
+    """Set what Machine.from_elf loads besides the code, for what runs after."""
+    READ_ONLY_SECTIONS[:] = [(address, bytes(blob)) for address, blob in read_only_sections]
+
+
+def read_only_key() -> tuple:
+    """What verdicts depend on of READ_ONLY_SECTIONS (verdicts.fingerprint)."""
+    import hashlib
+    return tuple((address, hashlib.sha256(blob).hexdigest()) for address, blob in READ_ONLY_SECTIONS)
+
 
 class Memory:
     """Main RAM from the image's base, plus the fixed windows; all else faults."""
@@ -348,7 +365,16 @@ class Machine:
         )
         total = max(len(data), memsz,
                     layout.CURRENT.stack_top + layout.CURRENT.stack_size - section.addr)
-        return cls(section.addr, data, total)
+        machine = cls(section.addr, data, total)
+        # The read-only sections configured (READ_ONLY_SECTIONS), where they
+        # fall in main RAM on bytes nothing else holds: past the code, or in
+        # an overlay's image where the executable's code section ends.
+        for address, blob in READ_ONLY_SECTIONS:
+            offset = address - section.addr
+            if 0 <= offset and offset + len(blob) <= machine.memory.size \
+                    and not any(machine.memory.bytes[offset:offset + len(blob)]):
+                machine.memory.bytes[offset:offset + len(blob)] = blob
+        return machine
 
     # -- execution -----------------------------------------------------
 

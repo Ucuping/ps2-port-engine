@@ -27,7 +27,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path[:0] = [HERE, os.path.dirname(HERE)]
 
-from ps2decomp import cppcheck, cpumodel, lift, liftcheck, testplan, verdicts
+from ps2decomp import cppcheck, cpumodel, emu, lift, liftcheck, testplan, verdicts
 from ps2decomp.liftverify import abi_view, verify  # noqa: F401  (also used by tests)
 from ps2decomp import game as game_config
 from ps2decomp.emu import Machine
@@ -536,7 +536,8 @@ def main(argv=None) -> int:
     with open(game.database_path, "rb") as handle:
         analysis = handle.read()
     environment = verdicts.fingerprint(os.path.dirname(os.path.dirname(HERE)),
-                                       (bytes(image), analysis, sorted(seeds), cpumodel.CURRENT))
+                                       (bytes(image), analysis, sorted(seeds), cpumodel.CURRENT,
+                                        emu.read_only_key()))
     cache = verdicts.Verdicts(game.path(os.path.join(game.build, "verdicts.json")),
                               environment, use=not args.no_cache)
 

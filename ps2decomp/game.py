@@ -27,6 +27,7 @@ import os
 import struct
 
 from . import cpumodel
+from . import emu
 from . import layout as layout_module
 from . import overlay as overlay_module
 from .analysis import PIECE_KINDS
@@ -150,6 +151,10 @@ DEFAULTS = {
     # (analysis.py, _jump_table_far); each table read and each jump through
     # a register no table explains is reported (analyze.py).
     "jump_tables_anywhere": False,
+    # The verification's interpreter loads the program's read-only sections
+    # (.rodata) with its code (emu.py): a switch whose table is there jumps
+    # where it does on the console under test. Off: they read zero.
+    "verify_read_only_sections": False,
 }
 
 
@@ -186,8 +191,9 @@ class Game:
     # table it is read from, None for a game without one.
     run_entries: dict = dataclasses.field(default_factory=dict)
     run_entries_path: "str | None" = None
-    # game.json's "jump_tables_anywhere".
+    # game.json's "jump_tables_anywhere" and "verify_read_only_sections".
     jump_tables_anywhere: bool = False
+    verify_read_only_sections: bool = False
 
     def path(self, relative: str) -> str:
         return os.path.normpath(os.path.join(self.directory, relative))
@@ -248,7 +254,8 @@ def load(directory: str) -> Game:
                 calls_from_code_only=bool(values["calls_from_code_only"]),
                 end_at_returns=bool(values["end_at_returns"]),
                 cop0_status=bool(values["cop0_status"]),
-                jump_tables_anywhere=bool(values["jump_tables_anywhere"]))
+                jump_tables_anywhere=bool(values["jump_tables_anywhere"]),
+                verify_read_only_sections=bool(values["verify_read_only_sections"]))
     if values["confirmed"]:
         game.confirmed_path = game.path(values["confirmed"])
         game.confirmed = read_confirmed(game.confirmed_path)
@@ -257,7 +264,21 @@ def load(directory: str) -> Game:
         game.run_entries = read_run_entries(game.run_entries_path)
     configure_layout(game)
     cpumodel.configure(cop0_status=game.cop0_status)
+    emu.configure(read_only_sections=read_only_sections(game) if game.verify_read_only_sections else ())
     return game
+
+
+def read_only_sections(game: Game) -> list:
+    """[(address, bytes)] of the program's read-only sections: allocated,
+    with contents, neither written nor run (.rodata). An overlay's are its
+    executable's - its own image holds its data with its code."""
+    owner = game.base or game
+    if not os.path.exists(owner.elf_path):
+        return []
+    elf = owner.load_elf()
+    return [(s.addr, elf.section_data(s)) for s in elf.sections
+            if s.is_alloc and s.size and s.occupies_file and s.type == 1 and not s.is_write
+            and not s.is_exec]
 
 
 def _overlay_images(directory: str):
