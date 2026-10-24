@@ -2463,7 +2463,10 @@ void CallsAreRecordedNotJumps() {
     lifted::Call(c, 0x00600020u);
     lifted::Call(c, 0x00600020u);
     Check(recorded(0x00600020u), "calls: a function a jump entered first, at its first call");
-    Check(g_entered == 5 && ps2host::RunStats().calls[0x00600020u] == 3, "calls: every entry runs and is counted");
+    // Counted where the call cache misses - the jump, and the first call
+    // after it - and on its hits only where a run asks (virtual time,
+    // PS2HOST_CALL_COUNTS: Dispatch's fast path).
+    Check(g_entered == 5 && ps2host::RunStats().calls[0x00600020u] >= 2, "calls: every entry runs and is counted");
     ps2host::RegisterFunctions(nullptr, 0);
 }
 

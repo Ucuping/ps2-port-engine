@@ -655,7 +655,7 @@ void WaitForGuestEvent() {
         u32 seen = g_timer_seq.load(std::memory_order_acquire);
         if (s.vblank_due || s.timer_due || s.current->delivery_requested || StopRequested() || IopReplyPending())
             break;
-        WaitOnAddress(&g_timer_seq, &seen, sizeof seen, 2);
+        platform::WaitOnU32(g_timer_seq, seen, 2);
     }
     g_idle_ns.fetch_add(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - idle_from).count()),
