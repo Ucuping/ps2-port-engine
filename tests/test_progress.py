@@ -29,6 +29,13 @@ class TestConfidence(unittest.TestCase):
         for confidence in ("prologue", "recovered: adjacent", "recovered: entry inside 0x00100000", None):
             self.assertEqual(game_config.confidence_label({"confidence": confidence}), "low")
 
+    def test_a_run_entry_is_sure_and_a_case_is_no_function(self):
+        for kind in ("pointer", "j", "call", "computed"):
+            self.assertEqual(game_config.confidence_label({"confidence": "run", "run_kind": kind}), "high")
+        case = {"addr": 0x100, "confidence": "run", "run_kind": "case"}
+        self.assertEqual(game_config.confidence_label(case), "case")
+        self.assertEqual(game_config.confidence_label(case, {0x100: "run"}), "case")
+
 
 class TestSummary(unittest.TestCase):
     def setUp(self):
@@ -55,6 +62,19 @@ class TestSummary(unittest.TestCase):
         markdown = progress.render_markdown(summary)
         self.assertIn("**66.6667%**", markdown)
         self.assertIn("## Counted apart", markdown)
+
+    def test_the_cases_a_run_reached_are_counted_apart_too(self):
+        cases = dict(function(0x500, 20, "run"), run_kind="case")
+        entry = dict(function(0x600, 10, "run"), run_kind="pointer")
+        self.database["functions"] += [cases, entry]
+        self.status.update({0x500: {"status": "lifted"}, 0x600: {"status": "lifted"}})
+        summary = progress.summarise(self.database, self.status)
+        self.assertEqual((summary["total_functions"], summary["total_code"]), (3, 160))
+        self.assertEqual((summary["guessed_functions"], summary["case_pieces"], summary["case_code"]),
+                         (2, 1, 20))
+        self.assertEqual(summary["case_by_tier"]["lifted"], {"count": 1, "bytes": 20})
+        self.assertIn("COUNTED APART: 1 cases of switches (20 bytes)", progress.render_text(summary, "test"))
+        self.assertIn("1 cases of switches (20 code bytes)", progress.render_markdown(summary))
 
 
 class TestStatusTable(unittest.TestCase):

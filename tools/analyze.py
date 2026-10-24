@@ -30,7 +30,7 @@ from ps2decomp.symbols import SymbolRecovery
 
 
 def build_database(elf_path: str, verbose: bool = True, keep=(), bounds=(), call_ranges=None,
-                   end_at_returns: bool = False) -> dict:
+                   end_at_returns: bool = False, run_entries=None) -> dict:
     started = time.time()
     elf = ElfFile.load(elf_path)
     exec_sections = elf.exec_sections
@@ -48,10 +48,14 @@ def build_database(elf_path: str, verbose: bool = True, keep=(), bounds=(), call
     log("entry      : 0x%08x" % elf.e_entry)
 
     log("discovering functions...")
-    analyzer = ImageAnalyzer(data, section.addr, elf.e_entry, call_ranges, end_at_returns)
+    analyzer = ImageAnalyzer(data, section.addr, elf.e_entry, call_ranges, end_at_returns, run_entries)
     analyzer.run()
     log("  %s functions, %.1f%% of the image proven to be code"
         % (format(len(analyzer.functions), ","), analyzer.coverage()))
+    if run_entries:
+        log("  %d run entries started functions, %d already covered, %d outside the image"
+            % (analyzer.stats["run_entries"], analyzer.stats["run_entries_covered"],
+               analyzer.stats["run_entries_outside"]))
 
     log("recovering symbols...")
     symbols = SymbolRecovery(data, section.addr)
@@ -119,6 +123,8 @@ def build_database(elf_path: str, verbose: bool = True, keep=(), bounds=(), call
                 "status": "undecompiled",
             }
         )
+        if f.run_kind:
+            functions[-1]["run_kind"] = f.run_kind
 
     # The recovered functions, described as the analysis describes its own.
     by_address = {f["addr"]: f for f in functions}
@@ -182,7 +188,8 @@ def build_database(elf_path: str, verbose: bool = True, keep=(), bounds=(), call
     functions = [by_address[a] for a in sorted(by_address)]
     # Each function's out-of-line pieces (analysis.py `chunks`): translated with
     # it, so a branch to one stays inside the function.
-    entries = {f["addr"] for f in functions if f["confidence"] in ("called", "entry")}
+    # (A run entry is one: the run reached it, and a translation must start there.)
+    entries = {f["addr"] for f in functions if f["confidence"] in ("called", "entry", "run")}
     # A "function" found by a pointer-shaped word or in a gap, that nothing
     # calls, and that a called function reaches by its own branches or by
     # falling through, is a label of that function: Burnout 3's 0x00186850, a
@@ -190,7 +197,7 @@ def build_database(elf_path: str, verbose: bool = True, keep=(), bounds=(), call
     # cut at the first, its cases left out of every translation.
     labels = set()
     candidates = {f["addr"] for f in functions
-                  if f["confidence"] not in ("called", "entry") and not f["callers"]
+                  if f["confidence"] not in ("called", "entry", "run") and not f["callers"]
                   and not f["confidence"].startswith("recovered: entry inside")}
     sources = ("called", "entry", "recovered: built", "recovered: call")
     for f in functions:
@@ -316,7 +323,7 @@ def main(argv=None) -> int:
         call_ranges = list(game.code_ranges) + [(executable.addr, executable.addr + executable.size)]
     database = build_database(game.elf_path, verbose=not args.quiet,
                               keep=game.code_ranges, bounds=bounds, call_ranges=call_ranges,
-                              end_at_returns=game.end_at_returns)
+                              end_at_returns=game.end_at_returns, run_entries=game.run_entries)
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     with open(output, "w", encoding="utf-8") as handle:
         json.dump(database, handle, indent=1)

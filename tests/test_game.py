@@ -82,6 +82,30 @@ class TestConfiguration(unittest.TestCase):
         with self.assertRaises(KeyError):
             layout.configure(not_a_field=1)
 
+    def test_run_entries_come_with_how_they_were_reached(self):
+        directory = tempfile.mkdtemp()
+        os.makedirs(os.path.join(directory, "config"))
+        with open(os.path.join(directory, "game.json"), "w") as handle:
+            json.dump({"executable": "NONE.00", "run_entries": "config/run_entries.csv"}, handle)
+        table = os.path.join(directory, "config", "run_entries.csv")
+        with open(table, "w") as handle:
+            handle.write("address,kind,evidence\n0x0012AE58,case,.rodata 0x0014F87C\n"
+                         "0x004B2080,j,j at 0x004B1AB8\n")
+        loaded = game.load(directory)
+        self.assertEqual(loaded.run_entries, {0x0012AE58: "case", 0x004B2080: "j"})
+        self.assertEqual(loaded.run_entries_path, os.path.normpath(table))
+        with open(table, "a") as handle:
+            handle.write("0x00100000,maybe,\n")
+        with self.assertRaises(SystemExit):
+            game.read_run_entries(table)
+
+    def test_no_run_entries_by_default(self):
+        directory = tempfile.mkdtemp()
+        with open(os.path.join(directory, "game.json"), "w") as handle:
+            json.dump({"executable": "NONE.00"}, handle)
+        loaded = game.load(directory)
+        self.assertEqual((loaded.run_entries, loaded.run_entries_path), ({}, None))
+
 
 class TestCallersKnown(unittest.TestCase):
     """A loads with B resident; C loads with B too. B's callers include C,

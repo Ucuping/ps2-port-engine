@@ -38,17 +38,31 @@ from .r5900 import DISASM
 STATUS_FIELDS = ["address", "name", "status", "source", "notes", "confidence"]
 
 # What the analysis is sure of (analysis.py): the ELF's entry, a jal's target,
-# a pointer's target that ends in a return. The prologue scan and the recovery
-# from the gaps guess; their functions are counted apart (progress.py), whatever
-# their tests say.
-CONFIDENT = ("entry", "called", "pointer")
+# a pointer's target that ends in a return, code a run reached that no function
+# covered (a run entry). The prologue scan and the recovery from the gaps guess;
+# their functions are counted apart (progress.py), whatever their tests say.
+CONFIDENT = ("entry", "called", "pointer", "run")
+
+# How a run reached code no function covered (game.json's "run_entries"):
+#   case      a switch's case, through a jump table the analysis did not read
+#   pointer   a word in data that points at it (a callback, a virtual method)
+#   j         a `j` to it from outside it (a tail call)
+#   call      a `jal` to it the analysis does not see (an overlay's)
+#   computed  an address worked out at run time: no word or jump names it
+RUN_ENTRY_KINDS = ("case", "pointer", "j", "call", "computed")
+# The run entries' columns: where, how it was reached, and what shows it.
+RUN_ENTRY_FIELDS = ["address", "kind", "evidence"]
 
 
 def confidence_label(function: dict, confirmed=None) -> str:
     """"high" for a function the analysis is sure of - that an FDE in the
     executable's .eh_frame describes (ehframe.py), or that another source
     confirms (`confirmed`, the game's: tools/confirm.py) - "low" for one it
-    guessed."""
+    guessed, and "case" for a switch's case a run reached (a run entry): a
+    piece of the function that jumps to it, translated and tested as the
+    functions are but never counted as one."""
+    if function.get("run_kind") == "case":
+        return "case"
     sure = (function.get("confidence") in CONFIDENT or function.get("bounds") == "eh_frame"
             or function.get("addr") in (confirmed or ()))
     return "high" if sure else "low"
@@ -72,6 +86,22 @@ def read_confirmed(path: str) -> dict:
                 raise SystemExit("%s:%d: a confirmation needs an address and its source" % (path, line))
             confirmed[int(address, 16)] = source
     return confirmed
+
+
+def read_run_entries(path: str) -> dict:
+    """{address: kind} from a run-entries table (RUN_ENTRY_FIELDS); empty if
+    there is none."""
+    if not os.path.exists(path):
+        return {}
+    entries = {}
+    with open(path, newline="", encoding="utf-8") as handle:
+        for line, row in enumerate(csv.DictReader(handle), 2):
+            address, kind = (row.get("address") or "").strip(), (row.get("kind") or "").strip()
+            if not address or kind not in RUN_ENTRY_KINDS:
+                raise SystemExit("%s:%d: a run entry needs an address and a kind (%s)"
+                                 % (path, line, ", ".join(RUN_ENTRY_KINDS)))
+            entries[int(address, 16)] = kind
+    return entries
 
 
 DEFAULTS = {
@@ -103,6 +133,12 @@ DEFAULTS = {
     # (confidence_label): a table of their addresses and sources, written by
     # tools/confirm.py - e.g. "config/confirmed.csv".
     "confirmed": None,
+    # Code a run reached that no function covered, and how it was reached
+    # (RUN_ENTRY_KINDS): starts the analysis takes as sure, so a pass derives,
+    # lifts and verifies them with the rest - a table of RUN_ENTRY_FIELDS,
+    # e.g. "config/run_entries.csv". A switch's case among them is counted
+    # apart, never as a function (confidence_label).
+    "run_entries": None,
 }
 
 
@@ -135,6 +171,10 @@ class Game:
     cop0_status: bool = False
     confirmed: dict = dataclasses.field(default_factory=dict)
     confirmed_path: "str | None" = None
+    # Code a run reached that no function covered: {address: kind}; and the
+    # table it is read from, None for a game without one.
+    run_entries: dict = dataclasses.field(default_factory=dict)
+    run_entries_path: "str | None" = None
 
     def path(self, relative: str) -> str:
         return os.path.normpath(os.path.join(self.directory, relative))
@@ -198,6 +238,9 @@ def load(directory: str) -> Game:
     if values["confirmed"]:
         game.confirmed_path = game.path(values["confirmed"])
         game.confirmed = read_confirmed(game.confirmed_path)
+    if values["run_entries"]:
+        game.run_entries_path = game.path(values["run_entries"])
+        game.run_entries = read_run_entries(game.run_entries_path)
     configure_layout(game)
     cpumodel.configure(cop0_status=game.cop0_status)
     return game

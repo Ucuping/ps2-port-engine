@@ -148,5 +148,36 @@ class TestScheduledEntry(unittest.TestCase):
         self.assertNotIn(BASE + 8, self.run_on(words))
 
 
+class TestRunEntries(unittest.TestCase):
+    """Code a run reached that no function covered (game.json "run_entries"):
+    a sure start, with how the run reached it - unless a function covers it."""
+
+    ADDIU_V0 = (0x09 << 26) | (2 << 21) | (2 << 16) | 1     # addiu $v0, $v0, 1
+
+    def functions(self, words, run_entries=None):
+        words = list(words) + [NOP] * 64
+        a = ImageAnalyzer(struct.pack("<%dI" % len(words), *words), BASE, BASE,
+                          run_entries=run_entries)
+        a.run()
+        return a.functions
+
+    def test_code_nothing_calls_starts_a_function(self):
+        # The entry returns at once; the block after it is reached only by a run.
+        words = [JR_RA, NOP, NOP, NOP, self.ADDIU_V0, JR_RA, NOP]
+        self.assertEqual(sorted(self.functions(words)), [BASE])
+        found = self.functions(words, {BASE + 16: "pointer"})
+        self.assertEqual(sorted(found), [BASE, BASE + 16])
+        self.assertEqual((found[BASE + 16].confidence, found[BASE + 16].run_kind), ("run", "pointer"))
+        self.assertEqual(found[BASE + 16].end, BASE + 28)       # its delay slot with it
+
+    def test_a_covered_one_cuts_no_function_short(self):
+        # A case of the switch the analysis read: its function covers it.
+        words = TestSwitches.CODE + [NOP] * (0x40 - len(TestSwitches.CODE))
+        words += [BASE + 0x28, BASE + 0x34]
+        found = self.functions(words, {BASE + 0x28: "case"})
+        self.assertEqual(sorted(found), [BASE])
+        self.assertEqual(found[BASE].end, BASE + 0x40)
+
+
 if __name__ == "__main__":
     unittest.main()

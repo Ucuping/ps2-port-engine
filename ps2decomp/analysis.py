@@ -39,6 +39,7 @@ CONF_ENTRY = "entry"          # the ELF entry point
 CONF_CALLED = "called"        # at least one direct jal targets it
 CONF_PROLOGUE = "prologue"    # found by frame-setup pattern
 CONF_POINTER = "pointer"      # referenced by a plausible pointer word
+CONF_RUN = "run"              # a run reached it, and no function covered it (run entries)
 
 
 @dataclasses.dataclass
@@ -54,6 +55,8 @@ class Function:
     has_return: bool = False
     uses_vu: bool = False
     name: str = ""
+    # For CONF_RUN: how the run reached it (game.RUN_ENTRY_KINDS).
+    run_kind: str = ""
 
     @property
     def size(self) -> int:
@@ -81,7 +84,7 @@ class ImageAnalyzer:
     """Recovers functions and code/data boundaries from a flat loaded image."""
 
     def __init__(self, data: bytes, base_addr: int, entry_point: int = 0, call_ranges=None,
-                 end_at_returns: bool = False) -> None:
+                 end_at_returns: bool = False, run_entries=None) -> None:
         self.data = data
         self.base = base_addr
         self.end = base_addr + len(data)
@@ -93,6 +96,9 @@ class ImageAnalyzer:
         # Whether a function ends after a `jr $ra` that padding or the next
         # function's prologue follows (game.json "end_at_returns", _cut_after_return).
         self.end_at_returns = end_at_returns
+        # Code a run reached that no function covered, {address: kind}
+        # (game.json "run_entries"): sure starts. None: none.
+        self.run_entries = dict(run_entries) if run_entries else {}
         self.words = struct.unpack("<%dI" % (len(data) // 4), data[: (len(data) // 4) * 4])
         self.functions: dict = {}
         self.code_bytes = bytearray(len(data))  # 1 where traversal proved code
@@ -624,6 +630,27 @@ class ImageAnalyzer:
             func.instruction_count = sum(
                 1 for a in visited if func.start <= a < func.end
             )
+
+        # Code a run reached that no function covered (game.json "run_entries"):
+        # sure starts, unless one found since covers it - a run entry inside a
+        # function would cut that function short.
+        for addr in sorted(self.run_entries):
+            if not self.contains(addr):
+                self.stats["run_entries_outside"] += 1
+                continue
+            if addr in self.functions or any(f.start < addr < f.end for f in self.functions.values()):
+                self.stats["run_entries_covered"] += 1
+                continue
+            func = Function(start=addr, confidence=CONF_RUN, run_kind=self.run_entries[addr])
+            self.functions[addr] = func
+            visited = self.traverse(addr, func)
+            func.end = self.extent_from(addr, visited)
+            if self.end_at_returns:
+                func.end = self._cut_after_return(addr, func.end)
+            func.instruction_count = sum(
+                1 for a in visited if func.start <= a < func.end
+            )
+            self.stats["run_entries"] += 1
 
         # Functions reached only through pointer tables emit no jal at all, so
         # harvest plausible pointer targets before falling back to a blind scan.

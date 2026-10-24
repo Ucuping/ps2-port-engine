@@ -29,6 +29,11 @@ tools/confirm.py): a call a run saw enter it, Ghidra's analysis of the same
 image. Passing its tests confirms nothing: a piece of a function passes them as
 well as a function does.
 
+A switch's case a run reached, through a jump table the analysis did not read
+(a run entry, game.json's "run_entries"), is such a piece: translated and
+tested as the functions are, so the game can run it, but counted apart again,
+never as a function.
+
     python engine/tools/progress.py
     python engine/tools/progress.py --markdown > games/burnout3/docs/PROGRESS.md
 """
@@ -86,7 +91,10 @@ def summarise(database: dict, status: dict, confirmed=None) -> dict:
     functions = [f for f in database["functions"]
                  if game_config.confidence_label(f, confirmed) == "high"]
     guessed = [f for f in database["functions"]
-               if game_config.confidence_label(f, confirmed) != "high"]
+               if game_config.confidence_label(f, confirmed) == "low"]
+    # The switches' cases a run reached: pieces of functions, apart from both.
+    cases = [f for f in database["functions"]
+             if game_config.confidence_label(f, confirmed) == "case"]
     by_confirmation = {}
     for f in functions:
         if game_config.confidence_label(f) != "high":
@@ -113,6 +121,9 @@ def summarise(database: dict, status: dict, confirmed=None) -> dict:
         "guessed_functions": len(guessed),
         "guessed_code": sum(f["size"] for f in guessed),
         "guessed_by_tier": _by_tier(guessed, status),
+        "case_pieces": len(cases),
+        "case_code": sum(f["size"] for f in cases),
+        "case_by_tier": _by_tier(cases, status),
         "strings": len(database.get("strings", [])),
         "xrefs": len(database.get("xrefs", [])),
         "pointer_tables": len(database.get("pointer_tables", [])),
@@ -173,6 +184,13 @@ def render_text(summary: dict, title: str) -> str:
                      "scan's, the gaps' - which may not be functions:"
                      % (format(summary["guessed_functions"], ","), format(summary["guessed_code"], ",")))
         lines.append("  " + ", ".join("%s %s" % (tier, format(summary["guessed_by_tier"][tier]["count"], ","))
+                                      for tier in TIERS))
+    if summary["case_pieces"]:
+        lines.append("")
+        lines.append("COUNTED APART: %s cases of switches (%s bytes) a run reached - pieces of "
+                     "functions, not functions:"
+                     % (format(summary["case_pieces"], ","), format(summary["case_code"], ",")))
+        lines.append("  " + ", ".join("%s %s" % (tier, format(summary["case_by_tier"][tier]["count"], ","))
                                       for tier in TIERS))
     return "\n".join(lines)
 
@@ -245,9 +263,10 @@ def render_markdown(summary: dict) -> str:
             )
         )
     lines.append("")
-    if summary["guessed_functions"]:
+    if summary["guessed_functions"] or summary["case_pieces"]:
         lines.append("## Counted apart")
         lines.append("")
+    if summary["guessed_functions"]:
         lines.append("%s functions (%s code bytes) the analysis guessed - found by the prologue "
                      "scan or recovered from the gaps, not called, pointed to or entered. They may "
                      "not be functions at all, so none of the figures above counts them, whatever "
@@ -258,6 +277,18 @@ def render_markdown(summary: dict) -> str:
         lines.append("| --- | ---: | ---: |")
         for tier in TIERS:
             row = summary["guessed_by_tier"][tier]
+            lines.append("| `%s` | %s | %s |" % (tier, format(row["count"], ","), format(row["bytes"], ",")))
+        lines.append("")
+    if summary["case_pieces"]:
+        lines.append("%s cases of switches (%s code bytes) a run reached through a jump table the "
+                     "analysis did not read (run entries): pieces of the functions that jump to "
+                     "them, translated and tested so the game can run them, never counted as "
+                     "functions." % (format(summary["case_pieces"], ","), format(summary["case_code"], ",")))
+        lines.append("")
+        lines.append("| tier | cases | code bytes |")
+        lines.append("| --- | ---: | ---: |")
+        for tier in TIERS:
+            row = summary["case_by_tier"][tier]
             lines.append("| `%s` | %s | %s |" % (tier, format(row["count"], ","), format(row["bytes"], ",")))
         lines.append("")
     lines.append("Tier meanings are defined in [METHODOLOGY.md](../../../engine/docs/METHODOLOGY.md).")

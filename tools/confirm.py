@@ -135,7 +135,8 @@ def main(argv=None) -> int:
                          "and no --ghidra" % run)
 
     database = game.load_database()
-    guessed = [f["addr"] for f in database["functions"] if game_config.confidence_label(f) != "high"]
+    # (A switch's case a run reached is no guess: a piece of a function, not one.)
+    guessed = [f["addr"] for f in database["functions"] if game_config.confidence_label(f) == "low"]
     confirmed = confirmations(guessed, game.confirmed, given)
     write(game.confirmed_path, confirmed)
     refreshed = refresh_status(game.path(game.status), database, confirmed)
