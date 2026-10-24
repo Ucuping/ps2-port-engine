@@ -91,7 +91,7 @@ class TestConditionalAssignment(unittest.TestCase):
 class _Block:
     def __init__(self, code, kind="cond", taken=None, next=None, condition=None):
         self.code, self.kind, self.taken, self.next = code, kind, taken, next
-        self.condition, self.slot = condition, ""
+        self.condition, self.slot, self.likely = condition, "", False
 
 
 class TestLeavingBranch(unittest.TestCase):
@@ -109,6 +109,46 @@ class TestLeavingBranch(unittest.TestCase):
         code, _ = liveness.fold(blocks[0x100].code, "v1 == s3", live[0x100], synced, set())
         self.assertIn("s3 = 0x5ull;", code)
 
+
+
+class TestLikelySlot(unittest.TestCase):
+    def test_a_likely_slot_kills_nothing_on_the_untaken_path(self):
+        # Tekken 5's 0x0032C740, a map's erase: `lw v1, 0(a2)`, `bne v1, a3`; then
+        # `bnel v0, a3` with `addiu v1, a2, 4` in its slot, and `sw v1, 0(t0)` on
+        # the path it does not take - where the slot never ran and v1 is still
+        # the loaded child. Counting the slot's definition on both paths folded
+        # the load into the bne's condition and dropped it: the store wrote
+        # a2 + 4, the map's tree got a cycle, and the game spun in its lookup.
+        synced = {"v0", "v1", "a2", "a3", "t0"}
+        blocks = {0x100: _Block(["v1 = ReadS32((u32)a2);"], taken=0x120, next=0x110,
+                                condition="v1 != a3"),
+                  0x110: _Block(["Write32((u32)t0, (u32)v0);"], kind="return"),
+                  0x120: _Block([], taken=0x140, next=0x130, condition="v0 != a3"),
+                  0x130: _Block(["Write32((u32)t0, (u32)v1);"], kind="return"),
+                  0x140: _Block(["Write32((u32)t0, (u32)ReadS32((u32)v1));"], kind="return")}
+        blocks[0x100].slot = "v0 = ReadS32((u32)a2 + 0x4u);"
+        blocks[0x120].slot, blocks[0x120].likely = "v1 = Sx32(a2 + 0x4u);", True
+        succs = {0x100: [0x110, 0x120], 0x110: [], 0x120: [0x130, 0x140], 0x130: [], 0x140: []}
+        live = liveness.live_out(blocks, succs, synced, set(), lambda b: b.condition, lambda b: b.slot)
+        self.assertIn("v1", live[0x100])
+        code, condition = liveness.fold(blocks[0x100].code, "v1 != a3", live[0x100], synced, set(),
+                                        [blocks[0x100].slot])
+        self.assertEqual((code, condition), (["v1 = ReadS32((u32)a2);"], "v1 != a3"))
+
+    def test_a_slot_that_always_runs_still_kills(self):
+        # The same shape with a plain branch: its slot runs on both paths, so the
+        # loaded v1 is dead past it and folds as before.
+        synced = {"v0", "v1", "a2", "a3", "t0"}
+        blocks = {0x100: _Block(["v1 = ReadS32((u32)a2);"], taken=0x120, next=0x110,
+                                condition="v1 != a3"),
+                  0x110: _Block(["Write32((u32)t0, (u32)v0);"], kind="return"),
+                  0x120: _Block([], taken=0x140, next=0x130, condition="v0 != a3"),
+                  0x130: _Block(["Write32((u32)t0, (u32)v1);"], kind="return"),
+                  0x140: _Block(["Write32((u32)t0, (u32)v1);"], kind="return")}
+        blocks[0x120].slot = "v1 = Sx32(a2 + 0x4u);"
+        succs = {0x100: [0x110, 0x120], 0x110: [], 0x120: [0x130, 0x140], 0x130: [], 0x140: []}
+        live = liveness.live_out(blocks, succs, synced, set(), lambda b: b.condition, lambda b: b.slot)
+        self.assertNotIn("v1", live[0x100])
 
 if __name__ == "__main__":
     unittest.main()

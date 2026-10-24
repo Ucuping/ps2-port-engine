@@ -120,20 +120,25 @@ def live_out(blocks, succs, synced, returned, condition_of, slot_of):
         taken = getattr(block, "taken", None)
         leaving[address] = set(synced) if taken is not None and taken not in blocks else set()
         u, d = set(), set()
-        sequence = list(block.code)
+        sequence = [(statement, True) for statement in block.code]
         if condition_of(block):
-            sequence.append("if (%s)" % condition_of(block))
+            sequence.append(("if (%s)" % condition_of(block), True))
         if slot_of(block):
-            sequence.append(slot_of(block))
+            # A likely branch's slot runs on its taken path only: what it reads
+            # is live, but what it writes keeps its old value on the other path.
+            # Killed on both, `lw v1` folded into Tekken 5's `bne v1` at
+            # 0x0032C790 and the `sw v1` its untaken `bnel` reaches stored a2 + 4.
+            sequence.append((slot_of(block), not getattr(block, "likely", False)))
         if block.kind == "return":
-            sequence.append("leave(); return;")
+            sequence.append(("leave(); return;", True))
         elif block.kind == "tail" or (block.next is not None and block.next not in blocks
                                       and block.kind in ("fall", "jump", "cond")):
-            sequence.append("out(); TailCall(c);")
-        for statement in sequence:
+            sequence.append(("out(); TailCall(c);", True))
+        for statement, kills in sequence:
             s_use, s_def = uses_defs(statement, synced, returned)
             u |= s_use - d
-            d |= s_def
+            if kills:
+                d |= s_def
         use[address], define[address] = u, d
     live_in = {a: set(use[a]) for a in blocks}
     out = {a: set() for a in blocks}
