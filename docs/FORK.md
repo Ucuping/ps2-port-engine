@@ -226,13 +226,28 @@ stub dispatch table, every test) checks that it still builds and passes.
   branch's label is a piece of a function, not one:
   `confidence_label` calls it by its kind, progress.py counts the pieces
   apart from the functions and from the guesses, and confirm.py leaves them
-  out.
+  out. Pieces are seeded last, once every function is found, and only where
+  none covers them.
+- Jump tables read wherever they are, off by default
+  (`jump_tables_anywhere`): a switch's table is read in any of the
+  program's sections; where the code next to the `jr` does not show it,
+  its base and bound are followed back to what sets them - past calls for
+  a register a call keeps - and without a bound the table is read entry by
+  entry while each is word-aligned and names code of the switch's own
+  region (its function's start to the next start the analysis is sure of),
+  ending at the first that does not, at its section's end, where the code
+  builds another address, or at 256 entries. analyze.py reports every table
+  - those sized by their words alone flagged - and every jump through a
+  register no table explains. A gaps-recovered "function" at a case goes.
+- The verification's interpreter loads the program's read-only sections
+  (`.rodata`) with its code, off by default (`verify_read_only_sections`),
+  on bytes nothing else holds (an overlay's image takes its executable's in
+  the gap); they are part of lift's verdict fingerprint.
 
 Found and not yet changed, with the evidence in the Tekken 5 repository's
 `games/tekken5/docs/FINDINGS.md` ("Engine findings worth upstreaming"): a call
-that never returns makes the analysis swallow the next function; tables
-outside the code section are invisible to the analysis; only the first
-executable section is analysed; four faults of the C++ rendering, which the
+that never returns makes the analysis swallow the next function; only the
+first executable section is analysed; four faults of the C++ rendering, which the
 compiled check catches and drops; `callers_known` holds for an executable
 whose own modules, loaded at run time, call it, until they are listed as
 overlays; a store made in kernel mode and ended by `eret` has no
