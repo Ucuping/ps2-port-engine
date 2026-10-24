@@ -135,7 +135,7 @@ def main(argv=None) -> int:
                          "and no --ghidra" % run)
 
     database = game.load_database()
-    # (A switch's case a run reached is no guess: a piece of a function, not one.)
+    # (A piece of a function a run reached - a case, a label - is no guess, nor a function.)
     guessed = [f["addr"] for f in database["functions"] if game_config.confidence_label(f) == "low"]
     confirmed = confirmations(guessed, game.confirmed, given)
     write(game.confirmed_path, confirmed)

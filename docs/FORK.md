@@ -208,11 +208,12 @@ stub dispatch table, every test) checks that it still builds and passes.
   lets its texture uploads end only once its VIF1 handler has seen INT.
 - Run entries, off by default (`run_entries` in game.json, a table of
   address, kind and evidence): code a run reached that no function covered
-  - by a switch's case, a pointer, a `j`, a `jal` the analysis does not
-  see, or an address computed - which the analysis then takes as a sure
-  start (confidence `run`), unless a function covers it, so a pass derives,
-  lifts and verifies it with the rest. A case is a piece of a function, not
-  one: `confidence_label` calls it `case`, progress.py counts the cases
+  - by a switch's case, a branch from another such piece, a pointer, a
+  `j`, a `jal` the analysis does not see, or an address computed - which
+  the analysis then takes as a sure start (confidence `run`), unless a
+  function covers it, so a pass derives, lifts and verifies it with the
+  rest. A case or a branch's label is a piece of a function, not one:
+  `confidence_label` calls it by its kind, progress.py counts the pieces
   apart from the functions and from the guesses, and confirm.py leaves them
   out.
 

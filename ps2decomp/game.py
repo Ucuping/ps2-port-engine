@@ -45,11 +45,15 @@ CONFIDENT = ("entry", "called", "pointer", "run")
 
 # How a run reached code no function covered (game.json's "run_entries"):
 #   case      a switch's case, through a jump table the analysis did not read
+#   branch    a label a branch leads to from another piece found at run time
+#             (a case's `b` back to its switch's loop), translated apart
 #   pointer   a word in data that points at it (a callback, a virtual method)
 #   j         a `j` to it from outside it (a tail call)
 #   call      a `jal` to it the analysis does not see (an overlay's)
 #   computed  an address worked out at run time: no word or jump names it
-RUN_ENTRY_KINDS = ("case", "pointer", "j", "call", "computed")
+RUN_ENTRY_KINDS = ("case", "branch", "pointer", "j", "call", "computed")
+# The kinds that are pieces of a function, never functions themselves.
+PIECE_KINDS = ("case", "branch")
 # The run entries' columns: where, how it was reached, and what shows it.
 RUN_ENTRY_FIELDS = ["address", "kind", "evidence"]
 
@@ -58,11 +62,11 @@ def confidence_label(function: dict, confirmed=None) -> str:
     """"high" for a function the analysis is sure of - that an FDE in the
     executable's .eh_frame describes (ehframe.py), or that another source
     confirms (`confirmed`, the game's: tools/confirm.py) - "low" for one it
-    guessed, and "case" for a switch's case a run reached (a run entry): a
-    piece of the function that jumps to it, translated and tested as the
+    guessed, and its kind for a piece of a function a run reached (a run
+    entry of PIECE_KINDS: "case", "branch"), translated and tested as the
     functions are but never counted as one."""
-    if function.get("run_kind") == "case":
-        return "case"
+    if function.get("run_kind") in PIECE_KINDS:
+        return function["run_kind"]
     sure = (function.get("confidence") in CONFIDENT or function.get("bounds") == "eh_frame"
             or function.get("addr") in (confirmed or ()))
     return "high" if sure else "low"
@@ -136,8 +140,9 @@ DEFAULTS = {
     # Code a run reached that no function covered, and how it was reached
     # (RUN_ENTRY_KINDS): starts the analysis takes as sure, so a pass derives,
     # lifts and verifies them with the rest - a table of RUN_ENTRY_FIELDS,
-    # e.g. "config/run_entries.csv". A switch's case among them is counted
-    # apart, never as a function (confidence_label).
+    # e.g. "config/run_entries.csv". A piece of a function among them - a
+    # switch's case, a label - is counted apart, never as a function
+    # (confidence_label).
     "run_entries": None,
 }
 
