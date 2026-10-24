@@ -243,11 +243,13 @@ void StartVif1Worker();
 void SetVif1Worker(bool on);
 /* VIF1's interrupt bit: a VIFcode with bit 31 set raises INTC's VIF1 cause,
    and VIF1_STAT shows INT and VIS until FBRST's STC, as on the console -
-   unless VIF1_ERR's MII masks the bit. VIF1 does not stand still there: the
-   transfer still completes at once, and a transfer with several such codes
-   raises the cause once. Off by default; a game that waits for it has its
-   port turn it on (Tekken 5 lets each frame's PATH3 texture uploads end only
-   once its VIF1 handler has seen INT). */
+   unless VIF1_ERR's MII masks the bit. Each such code raises it in turn: the
+   next once FBRST's STC has acknowledged the last (RST leaves none owed).
+   VIF1 does not stand still there: the transfer still completes at once,
+   its data drawn before what the game lets go meanwhile. Off by default; a
+   game that waits for it has its port turn it on (Tekken 5 lets each
+   frame's PATH3 texture uploads end only once its VIF1 handler has seen
+   INT). */
 void SetVif1InterruptBit(bool on);
 /* Words the EE hands VIF1 - a DMA transfer's, the FIFO's - in order, as they
    go: where VIF1's interrupt bit is looked for (devices.cpp), on the EE's

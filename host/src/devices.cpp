@@ -101,6 +101,9 @@ constexpr u32 kVif1StatVis = 1u << 10, kVif1StatInt = 1u << 11;
 constexpr u32 kIntcVif1 = 5;
 bool g_vif1_interrupt_bit = false;
 VifCodeScan g_vif1_codes;           // where VIF1's commands begin, as the EE hands it words
+// Interrupt bits VIF1 has passed whose interrupt is still to come: on the
+// console VIF1 stops at each until FBRST's STC, so each gets its own, in turn.
+u32 g_vif1_interrupts_owed = 0;
 
 // PATH3: GIF DMA data to the GS, held while VIF1 has PATH3 masked - it goes
 // after the PATH2 data VIF1 sends meanwhile, as the GIF arbitrates.
@@ -406,21 +409,40 @@ constexpr u32 kVif1Fifo = 0x10005000u;
 
 void SetVif1ChainFilter(std::function<void(Vif1Chain&)> filter) { g_vif1_filter = std::move(filter); }
 
+namespace {
+// VIF1 at an interrupt bit: INT and VIS shown, INTC's VIF1 cause raised.
+void Vif1Interrupts() {
+    *Register(kVif1Stat) |= kVif1StatVis | kVif1StatInt;
+    PostIntc(kIntcVif1);
+}
+}  // namespace
+
 void SetVif1InterruptBit(bool on) {
     g_vif1_interrupt_bit = on;
     // FBRST's STC (bit 3) ends a stall and clears what it showed: VSS, VFS,
-    // VIS, INT, ER0 and ER1.
+    // VIS, INT, ER0 and ER1 - and VIF1 goes on to its next interrupt bit, if
+    // it has passed one. RST (bit 0) resets VIF1: none is owed any more.
     if (on)
         GuestMemory().OnWrite(kVif1Fbrst, [](u32, u64 value) {
-            if (g_vif1_interrupt_bit && (value & 8)) *Register(kVif1Stat) &= ~0x3F00u;
+            if (!g_vif1_interrupt_bit || !(value & 9)) return;
+            *Register(kVif1Stat) &= ~0x3F00u;
+            if (value & 1) g_vif1_interrupts_owed = 0;
+            else if (g_vif1_interrupts_owed) {
+                --g_vif1_interrupts_owed;
+                Vif1Interrupts();
+            }
         });
 }
 
 void Vif1Sent(const u32* words, u32 count) {
-    if (!g_vif1_interrupt_bit || !g_vif1_codes.Words(words, count)) return;
-    if (*Register(kVif1Err) & 1) return;                    // VIF1_ERR's MII masks the bit
-    *Register(kVif1Stat) |= kVif1StatVis | kVif1StatInt;
-    PostIntc(kIntcVif1);
+    if (!g_vif1_interrupt_bit) return;
+    const u32 bits = g_vif1_codes.Words(words, count);
+    if (!bits || (*Register(kVif1Err) & 1)) return;         // VIF1_ERR's MII masks the bit
+    // Tekken 5's movie needs one each: two per frame, each letting one of the
+    // frame's two texture uploads end.
+    const bool waiting = *Register(kVif1Stat) & kVif1StatInt;
+    g_vif1_interrupts_owed += waiting ? bits : bits - 1;
+    if (!waiting) Vif1Interrupts();
 }
 
 namespace {

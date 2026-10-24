@@ -267,6 +267,22 @@ void Vif1InterruptBitRaisesItsInterrupt() {
     ps2host::Vif1Sent(&nop, 1);
     Check(quiet(), "VIF1_ERR's MII masks the bit");
     m.Write(err, 0, 4);
+    // Two in one transfer (Tekken 5's movie, each frame): one each, the
+    // second once STC has acknowledged the first.
+    const u32 two[] = {nop, 0, nop};
+    ps2host::Vif1Sent(two, 3);
+    Check(raised(), "two interrupt bits: the first raises the cause");
+    ps2host::ClearIntcStat(cause);
+    m.Write(fbrst, 8, 4);
+    Check(raised(), "two interrupt bits: STC raises the second");
+    ps2host::ClearIntcStat(cause);
+    m.Write(fbrst, 8, 4);
+    Check(quiet(), "two interrupt bits: none after the second STC");
+    ps2host::Vif1Sent(two, 3);
+    ps2host::ClearIntcStat(cause);
+    m.Write(fbrst, 1, 4);
+    m.Write(fbrst, 8, 4);
+    Check(quiet(), "FBRST's RST leaves no interrupt owed");
     ps2host::SetVif1InterruptBit(false);
 }
 
