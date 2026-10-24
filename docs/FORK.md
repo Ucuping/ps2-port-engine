@@ -31,6 +31,19 @@ None of these changes what the Windows build does; the Windows CI
 (`.github/workflows/windows.yml`: MSVC, AVX2 on and off, a port linked from a
 stub dispatch table, every test) checks that it still builds and passes.
 
+Five are on branches of their own for upstream, each from `upstream/master`
+(6226b59) with the one fix and a test that fails without it, pushed to this
+fork only: `pr/osd-config-syscalls` (services 0x4A and 0x4B),
+`pr/iop-export-names` (ioman's, iomanx's and stdio's names),
+`pr/lift-without-compiler`, `pr/elf-segment-overlap` (the ELF loader's
+zeroed tails, with `LoadExecutable` for the test) and
+`pr/ee-refer-sema-status` (ReferSemaStatus, CreateSema's attr and option).
+The two in the host cannot be built on macOS from upstream's tree; they
+were checked on MSVC by the throwaway branches `ci-check/*`
+(`.github/workflows/pr-check.yml` there): upstream's host tests with the
+fix, all passing, and without it, where only the new checks failed (the
+ELF loader's one, ReferSemaStatus's five).
+
 - Kernel services 0x4A and 0x4B were swapped in `data/ee_syscalls.csv` (and so
   in the signature library), against ps2sdk, PCSX2 and the host's own
   `kernel.cpp`.
@@ -253,3 +266,23 @@ whose own modules, loaded at run time, call it, until they are listed as
 overlays; a store made in kernel mode and ended by `eret` has no
 translation (Tekken 5 overrides its one; if another game has the same form,
 the lifter should learn it).
+
+## Merges from upstream
+
+Upstream is merged into `macos-arm64`, never rebased onto, so the branch's
+pushed history stays as it is.
+
+- **6226b59**, 24 October 2026 (merge 60cf444): upstream's 37 commits since
+  397c943. One conflict, in `host.cpp`'s `Enter`: upstream's fast path
+  taken (the function in the call cache, the watch list as a flag, call
+  counts only where a run asks), with this fork's tell of calls from jumps
+  kept. None in the VIF, the GIF's decoding, the IOP's threads and
+  semaphores or compiled VU code: upstream's changes there merged as they
+  were. After it (1a8d28e): upstream's `WaitForGuestEvent` waits through
+  `platform::WaitOnU32`, as the idle loops' wait does, not Windows'
+  `WaitOnAddress`; the host test of calls against jumps counts what the
+  fast path counts. Checked: every test on macOS (`ps2gpu_tests`'
+  `PartlyMaskedChannels` the known failure it was), the Windows CI, and
+  Tekken 5 under virtual time with and without a memory card - to the same
+  frames, every frame's CRC and the run's report as before the merge but
+  for the host's own timings.
