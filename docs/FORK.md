@@ -203,16 +203,27 @@ stub dispatch table, every test) checks that it still builds and passes.
   It is looked for where the EE hands VIF1 its words (`Vif1Sent`, by
   `VifCodeScan`, which follows the commands' data lengths as the decoder
   does), so VIF1's worker changes nothing. INTC causes a device posts
-  (`PostIntc`) are delivered as DMA completions are, before them. VIF1 does
-  not stand still at the bit; the transfer still completes at once. Tekken 5
-  lets its texture uploads end only once its VIF1 handler has seen INT.
+  (`PostIntc`) are delivered as DMA completions are, before them. Each such
+  code gets its own interrupt, in turn: the next once STC has acknowledged
+  the last (RST leaves none owed). VIF1 does not stand still at the bit;
+  the transfer still completes at once. Tekken 5 lets its texture uploads
+  end only once its VIF1 handler has seen INT - its opening movie two a
+  frame.
+- The EE kernel runs an INTC or DMAC handler, or an alarm's callback, with
+  the `$gp` its code had when it was registered (AddIntcHandler,
+  AddDmacHandler, SetAlarm), not the interrupted code's - as Play!'s EE
+  kernel does (a behavioural reference) and ps2sdk's alarm patch does for
+  alarms. Tekken 5's MPEG library runs its own callbacks with `$gp` 0, and
+  its vertical blank handler, interrupting one, read through `$gp`.
 - Run entries, off by default (`run_entries` in game.json, a table of
   address, kind and evidence): code a run reached that no function covered
   - by a switch's case, a branch from another such piece, a pointer, a
   `j`, a `jal` the analysis does not see, or an address computed - which
-  the analysis then takes as a sure start (confidence `run`), unless a
-  function covers it, so a pass derives, lifts and verifies it with the
-  rest. A case or a branch's label is a piece of a function, not one:
+  the analysis then takes as a sure start (confidence `run`), so a pass
+  derives, lifts and verifies it with the rest. Inside a function, a start
+  cuts it short; a piece of that function's own (a case of its switch, a
+  label) does not, and waits for its switch's table to be read. A case or a
+  branch's label is a piece of a function, not one:
   `confidence_label` calls it by its kind, progress.py counts the pieces
   apart from the functions and from the guesses, and confirm.py leaves them
   out.
