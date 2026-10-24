@@ -1,0 +1,3 @@
+ELF: a segment's bytes stay under a later one with none
+ELF: the rest of the wide one zeroed
+ELF: the same with the wide one first
