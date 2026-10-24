@@ -2588,6 +2588,11 @@ bool StartGpuRenderer(std::string* error, GpuMode, bool) {
 void GpuSetScale(u32) {}
 void GpuShadowFrame(gs::u64, const std::string&) {}
 std::string GpuShadowSummary() { return ""; }
+// Without the GPU there is nothing to capture, and no GPU time to report.
+bool GpuPrimary() { return false; }
+void GpuCaptureBegin(u64, const std::string&) {}
+std::string GpuCaptureScreen(const std::string&) { return "built without the GPU renderer (PS2HOST_VULKAN)"; }
+u64 GpuBusyMicroseconds() { return 0; }
 
 #endif
 
