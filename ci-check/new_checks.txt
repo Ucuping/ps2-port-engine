@@ -1,0 +1,4 @@
+CreateSema
+ReferSemaStatus: answers the semaphore's id
+ReferSemaStatus: count, max_count, init_count, wait_threads, attr, option
+ReferSemaStatus: no such semaphore

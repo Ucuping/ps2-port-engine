@@ -1,0 +1,59 @@
+# A throwaway check of one PR branch on upstream's own platform: the host's
+# tests built with MSVC as engine/host/CMakeLists.txt builds them, with the
+# branch's fix and without it (ci-check/old.patch takes the fix out and keeps
+# its test). Without the fix the tests must fail, and only in the branch's new
+# checks (ci-check/new_checks.txt). Not part of the branch it checks.
+name: pr-check
+
+on:
+  push:
+    branches: ["ci-check/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    name: host tests, ${{ matrix.variant }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fixed, old]
+    steps:
+      - name: Files as the repository has them (the patch applies to LF)
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
+        with:
+          arch: x64
+      - name: The fix taken out, its test kept
+        if: matrix.variant == 'old'
+        run: git apply --verbose ci-check/old.patch
+      - name: Configure (no GPU renderer, which these tests do not need)
+        run: cmake -S host -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS2HOST_VULKAN=OFF
+      - name: Build the host's tests
+        run: cmake --build build --target ps2host_tests -j 4
+      - name: Host tests
+        shell: bash
+        run: |
+          set +e
+          ./build/ps2host_tests.exe > out.txt 2>&1
+          status=$?
+          tr -d '\r' < out.txt > tests.txt
+          tr -d '\r' < ci-check/new_checks.txt > new_checks.txt
+          cat tests.txt
+          if [ "${{ matrix.variant }}" = fixed ]; then exit $status; fi
+          failed=$(grep '^FAIL: ' tests.txt | sed 's/^FAIL: //' | sort -u)
+          if [ $status -eq 0 ] || [ -z "$failed" ]; then
+            echo "without the fix the tests passed"; exit 1
+          fi
+          unexpected=$(printf '%s\n' "$failed" | grep -vxF -f new_checks.txt)
+          if [ -n "$unexpected" ]; then
+            echo "without the fix, checks beyond the new ones failed:"; echo "$unexpected"; exit 1
+          fi
+          echo "without the fix, only new checks failed:"; printf '%s\n' "$failed"
