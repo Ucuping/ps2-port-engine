@@ -1,0 +1,60 @@
+# A throwaway check of pr/gpu-bridge-fallbacks on upstream's own platform:
+# the host's tests built with MSVC without the GPU renderer
+# (PS2HOST_VULKAN=OFF). With the branch's fallbacks they must link and pass;
+# without them (ci-check/old.patch) the link must fail, and only for the four
+# symbols the branch adds. Not part of the branch it checks.
+name: pr-check-link
+
+on:
+  push:
+    branches: ["ci-check/gpu-bridge-fallbacks"]
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests-without-gpu:
+    name: without the GPU renderer, ${{ matrix.variant }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fixed, old]
+    steps:
+      - name: Files as the repository has them (the patch applies to LF)
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
+        with:
+          arch: x64
+      - name: The fallbacks taken out
+        if: matrix.variant == 'old'
+        run: git apply --verbose ci-check/old.patch
+      - name: Configure without the GPU renderer
+        run: cmake -S host -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS2HOST_VULKAN=OFF
+      - name: Build and run the host's tests
+        shell: bash
+        run: |
+          set +e
+          cmake --build build --target ps2host_tests -j 4 > build.txt 2>&1
+          status=$?
+          tr -d '\r' < build.txt > b.txt
+          grep -E "error|unresolved" b.txt | tail -12
+          if [ "${{ matrix.variant }}" = fixed ]; then
+            [ $status -eq 0 ] || { echo "did not build"; exit 1; }
+            ./build/ps2host_tests.exe > t.txt 2>&1
+            tests=$?
+            tr -d '\r' < t.txt | grep -E "^FAIL|host tests:"
+            exit $tests
+          fi
+          [ $status -ne 0 ] || { echo "without the fallbacks it still linked"; exit 1; }
+          missing=$(grep -o 'unresolved external symbol "[^"]*' b.txt | grep -oE 'Gpu[A-Za-z]+' | sort -u)
+          echo "unresolved:"; printf '%s\n' "$missing"
+          expected=$(printf '%s\n' GpuBusyMicroseconds GpuCaptureBegin GpuCaptureScreen GpuPrimary)
+          others=$(grep -o 'unresolved external symbol "[^"]*' b.txt | grep -vE 'Gpu(BusyMicroseconds|CaptureBegin|CaptureScreen|Primary)' | head -3)
+          [ "$missing" = "$expected" ] && [ -z "$others" ] || { echo "not exactly the four:"; echo "$others"; exit 1; }
+          echo "without the fallbacks, exactly the four symbols are unresolved"
