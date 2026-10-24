@@ -34,8 +34,11 @@ jobs:
       - name: The fix taken out, its test kept
         if: matrix.variant == 'old'
         run: git apply --verbose ci-check/old.patch
-      - name: Configure (no GPU renderer, which these tests do not need)
-        run: cmake -S host -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS2HOST_VULKAN=OFF
+      # With the GPU renderer, as upstream builds it (without it ps2host does
+      # not link: GpuCaptureScreen and three more are left undefined); its
+      # tests skip where there is no Vulkan device.
+      - name: Configure
+        run: cmake -S host -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build the host's tests
         run: cmake --build build --target ps2host_tests -j 4
       - name: Host tests
