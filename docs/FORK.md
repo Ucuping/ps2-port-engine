@@ -75,6 +75,19 @@ ELF loader's one, ReferSemaStatus's five).
   now runs in both float modes, and `MacroFmacIsTheModel` compares the
   inline COP2 with the model; both, and `VuCompiledIsTheInterpreter`, fail
   on a fused multiply-add, a wrong shuffle or wrong flag weights.
+- The GPU bridge's texture blocks reach as far as the format's pages do
+  (`gs::Memory::BlocksEnd`): a texture's blocks were counted by its bytes
+  and a page more, which falls short wherever a level is shorter than its
+  format's page and wider than two of them - it takes the top of every page
+  across. Tekken 5's menu font, a 512 x 64 PSMT4 texture over memory its
+  opening movie had used, spans four pages where the count made three; the
+  GPU decoded the glyphs of the fourth from stale blocks and the menus'
+  small text came out garbled under `--gpu` (right on the software GS).
+  `GsBlocksEndReachesEveryPixel` checks the end against every pixel's
+  address for each format; the old count stops short of the last block in
+  453 of its 1,365 cases. The software GS's own estimates
+  (`gs_draw.cpp`'s texture, frame and depth ends) count the same way and
+  are left as they are for now.
 - The compiled checks build outside Windows: `cppcheck.py`, `liftcheck.py`
   and `equivalence.py` compile their libraries with clang++ (`$CXX`) at
   `-O3 -ffp-contract=off`, as a Release port is compiled; MSVC's path is

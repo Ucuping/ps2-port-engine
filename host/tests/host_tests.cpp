@@ -806,6 +806,34 @@ void GsTakesImagesInBlocks() {
     Check(wrong == 0, "GS image packets taken in blocks store as a word at a time");
 }
 
+// Memory::BlocksEnd: just past the page holding the last block a buffer's
+// pixels lie in - every format, BW odd and even, rows short of a page and
+// past it, a start on a page and off one. (A texture's blocks counted by its
+// bytes and a page more fell short of a 512 x 64 PSMT4 one by a page: the
+// GPU decoded Tekken 5's font from stale blocks there.)
+void GsBlocksEndReachesEveryPixel() {
+    using namespace ps2host::gs;
+    const u32 psms[] = {PSMCT32, PSMCT24, PSMCT16, PSMCT16S, PSMT8, PSMT4, PSMT8H, PSMT4HL, PSMT4HH,
+                        PSMZ32, PSMZ24, PSMZ16, PSMZ16S};
+    u32 wrong = 0, cases = 0;
+    for (u32 psm : psms)
+        for (u32 bw : {1u, 2u, 3u, 8u, 10u})
+            for (u32 rows : {1u, 16u, 32u, 64u, 100u, 128u, 256u})
+                for (u32 bp : {0x0u, 0x33A0u, 0x1235u}) {
+                    u32 last = bp;
+                    for (u32 y = 0; y < rows; ++y)
+                        for (u32 x = 0; x < bw * 64; ++x) {
+                            u32 nibble = 0;
+                            last = std::max(last, Memory::Address(bp, bw, x, y, psm, &nibble) / 256);
+                        }
+                    ++cases;
+                    wrong += Memory::BlocksEnd(bp, bw, psm, rows) != bp + 32 * ((last - bp) / 32 + 1);
+                }
+    char what[96];
+    std::snprintf(what, sizeof what, "GS buffers end past their last page (%u of %u wrong)", wrong, cases);
+    Check(wrong == 0, what);
+}
+
 // cells whose right edge lies on a whole pixel, translucent: drawn on both
 // sides they doubled a column.
 void GsFillsTopLeft() {
@@ -2814,6 +2842,7 @@ int main() {
     GsKeepsAFlatDepthExact();
     GsFillsTopLeft();
     GsTakesImagesInBlocks();
+    GsBlocksEndReachesEveryPixel();
     GsTakesRegisterPacketsInBlocks();
     TexturePackNamesAsPcsx2();
 #if PS2HOST_VULKAN

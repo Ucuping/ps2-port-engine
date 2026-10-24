@@ -230,6 +230,17 @@ u32 Memory::Address(u32 bp, u32 bw, u32 x, u32 y, u32 psm, u32* nibble) {
     return (page * 256 + within) & kMask;
 }
 
+u32 Memory::BlocksEnd(u32 bp, u32 bw, u32 psm, u32 rows) {
+    const PageTable* t = TableFor(psm);
+    const u32 width = t ? t->width : 64, height = t ? t->height : 32;
+    // Address's pages: `per_row` to a row of them, the buffer's width
+    // reaching `across` (one more than per_row for an odd BW of PSMT8/4).
+    const u32 per_row = std::max(1u, t && t->half_width ? bw / 2 : bw);
+    const u32 across = std::max(1u, (std::max(1u, bw) * 64 + width - 1) / width);
+    const u32 down = std::max(1u, (rows + height - 1) / height);
+    return bp + 32 * ((down - 1) * per_row + across);
+}
+
 u32 Memory::Read(u32 bp, u32 bw, u32 x, u32 y, u32 psm) const {
     u32 nibble = 0;
     const u32 a = Address(bp, bw, x, y, psm, &nibble);

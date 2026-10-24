@@ -60,6 +60,11 @@ public:
     /* The same from the manual's block and column tables, step by step:
        Address is it precomputed a page at a time (tests compare the two). */
     static u32 AddressReference(u32 bp, u32 bw, u32 x, u32 y, u32 psm, u32* nibble);
+    /* The first block past every block a buffer of `rows` rows from `bp`
+       takes: whole pages of its format, as Address places them. Rows short
+       of a page still take the top of every page across - a 512 x 64 PSMT4
+       texture four pages, though its bytes would fill two. */
+    static u32 BlocksEnd(u32 bp, u32 bw, u32 psm, u32 rows);
 
 private:
     std::vector<u8> bytes_;

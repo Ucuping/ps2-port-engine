@@ -157,6 +157,16 @@ std::pair<u32, u32> Blocks(u32 fbp, u32 fbw, u32 psm, u32 rows) {
     return {begin, begin + std::max(1u, (rows + page_rows - 1) / page_rows) * std::max(1u, fbw) * 32};
 }
 
+/* The first block past a texture level's: its bytes and a page more, or as
+   far as its format's pages reach (gs::Memory::BlocksEnd) where that is
+   further - a level shorter than a page takes the top of every page across
+   (Tekken 5's 512 x 64 PSMT4 font: four pages, where its bytes and a page
+   made three, and the fourth page's glyphs were decoded from stale blocks). */
+u32 TextureEnd(u32 tbp, u32 tbw, u32 psm, u32 rows) {
+    const u32 bytes = tbp + std::max(1u, std::max(1u, tbw) * 64 * rows * PixelBits(psm) / 8 / 256 + 32);
+    return std::min(16384u, std::max(bytes, gs::Memory::BlocksEnd(tbp, std::max(1u, tbw), psm, rows)));
+}
+
 u32 To16(u32 c) {
     return ((c >> 3) & 31) | (((c >> 11) & 31) << 5) | (((c >> 19) & 31) << 10) | ((c >> 31) << 15);
 }
@@ -999,8 +1009,7 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
         for (u32 n = 0; n < mips.count; ++n) {
             const u32 h = std::max(1u, th >> n);
             t.begin = std::min(t.begin, mips.tbp[n]);
-            t.end = std::max(t.end, std::min(16384u, mips.tbp[n] + std::max(1u, std::max(1u, mips.tbw[n]) * 64 * h *
-                                                                                    PixelBits(psm) / 8 / 256 + 32)));
+            t.end = std::max(t.end, TextureEnd(mips.tbp[n], mips.tbw[n], psm, h));
         }
         b.IndexTexture(&t, true);
     } else {
@@ -1943,7 +1952,7 @@ void OnDraw(const gs::Gs::DrawCall& call) {
                 // is uploaded into, or a draw since went into the texture's blocks.
                 const auto key = std::make_tuple(c.tex0, c.clamp, call.texa, gs::TheGs().uploads());
                 const u32 tbp = Bits(c.tex0, 0, 14);
-                const u32 tex_blocks = std::max(1u, Bits(c.tex0, 14, 6) * 64 * th * PixelBits(tex_psm) / 8 / 256);
+                const u32 tex_blocks = TextureEnd(tbp, Bits(c.tex0, 14, 6), tex_psm, th) - tbp;
                 if (key != s.texture_state || s.drawn_into(tbp, tex_blocks)) {
                     std::vector<u32> pixels;
                     u32 w = 0, h = 0;
@@ -2086,7 +2095,7 @@ void OnDraw(const gs::Gs::DrawCall& call) {
         if (state.texture_target && tex_source == target) may = false;
         if (may && state.textured && !state.texture_target) {
             const u32 tbp = Bits(c.tex0, 0, 14), tbw = Bits(c.tex0, 14, 6), tpsm = Bits(c.tex0, 20, 6);
-            const u32 tend = std::min(16384u, tbp + std::max(1u, tbw * 64 * th * PixelBits(tpsm) / 8 / 256 + 32));
+            const u32 tend = TextureEnd(tbp, tbw, tpsm, th);
             // Over the rows a fast primitive can draw (it reaches no further
             // than this one's rows), not all the target could hold: the
             // race keeps textures past its depth buffer's 448 rows.
