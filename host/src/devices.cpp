@@ -95,15 +95,30 @@ constexpr u32 kGifStatM3P = 1u << 1;
 constexpr u32 kGifStatFqcShift = 24, kGifStatFqc = 0x1Fu << kGifStatFqcShift;
 
 // VIF1's interrupt bit (SetVif1InterruptBit), looked for in the words the EE
-// hands VIF1 (Vif1Sent).
+// hands VIF1 (Vif1Take): VIF1 runs the command with the bit to its end, then
+// stands still - INT and VIS shown, INTC's VIF1 cause raised - until FBRST's
+// STC. Meanwhile nothing more reaches it: the rest of its DMA transfer waits
+// in the channel's registers with STR still set (the transfer ends - CIS1, the
+// DMAC interrupt - once VIF1 has taken all of it), and what the EE stores to
+// its FIFO waits here. Found on the EE's thread as the words go, so VIF1
+// stops at the same place with its worker or without.
 constexpr u32 kVif1Stat = 0x10003C00u, kVif1Fbrst = 0x10003C10u, kVif1Err = 0x10003C20u;
 constexpr u32 kVif1StatVis = 1u << 10, kVif1StatInt = 1u << 11;
 constexpr u32 kIntcVif1 = 5;
 bool g_vif1_interrupt_bit = false;
 VifCodeScan g_vif1_codes;           // where VIF1's commands begin, as the EE hands it words
-// Interrupt bits VIF1 has passed whose interrupt is still to come: on the
-// console VIF1 stops at each until FBRST's STC, so each gets its own, in turn.
-u32 g_vif1_interrupts_owed = 0;
+struct Vif1Stop {
+    bool active = false;            // VIF1 stands at an interrupt bit
+    bool transfer = false;          // its DMA transfer's rest is in the channel's registers
+    bool ended = false;             // ...its chain having ended: only the data owed is left
+    bool owes_end = false;          // the transfer ends (STR, CIS1) once VIF1 has taken all of it
+    std::vector<u32> held;          // brought and not taken: the rest of the quadword it stopped in
+    std::vector<u32> fifo;          // stored to VIF1's FIFO while it stands
+    u64 since = 0;                  // the frame it stopped in
+    bool told = false;              // standing too long: said once
+};
+Vif1Stop g_vif1_stop;
+constexpr u64 kVif1StandingTooLong = 60;    // frames, before the run says VIF1 is still waiting
 
 // PATH3: GIF DMA data to the GS, held while VIF1 has PATH3 masked - it goes
 // after the PATH2 data VIF1 sends meanwhile, as the GIF arbitrates.
@@ -287,6 +302,126 @@ std::shared_ptr<ChainCopy> NewChainCopy() {
 u64 g_chain_words = 0;
 std::function<void(Vif1Chain&)> g_vif1_filter;     // SetVif1ChainFilter
 
+// VIF1 at an interrupt bit: INT and VIS shown, INTC's VIF1 cause raised.
+void Vif1Interrupts() {
+    *Register(kVif1Stat) |= kVif1StatVis | kVif1StatInt;
+    PostIntc(kIntcVif1);
+}
+
+void Vif1Stands() {
+    g_vif1_stop.active = true;
+    g_vif1_stop.since = FrameNumber();
+    g_vif1_stop.told = false;
+    Vif1Interrupts();
+    if (g_path3_masked)
+        Note("vif1 stop masked", "VIF1 stopped at an interrupt bit with PATH3 masked: an upload started "
+                                 "meanwhile waits for VIF1's next MSKPATH3 0 or FLUSHA");
+}
+
+// Words for VIF1 - its DMA transfer's, its FIFO's, what a stop held - handed on
+// up to where an interrupt bit stops it; how many it took. With VIF1's worker
+// they go into `copy`, which goes to it.
+u32 Vif1Take(const u32* words, u32 count, u32 from, ChainCopy* copy) {
+    if (g_vif1_stop.active) return 0;
+    const u32 taken = g_vif1_codes.UntilStop(words, count, !(*Register(kVif1Err) & 1));     // MII masks the bit
+    if (taken) {
+        if (copy) {
+            copy->words.insert(copy->words.end(), words, words + taken);
+            copy->runs.emplace_back(taken, from);
+            g_chain_words += taken;
+        } else {
+            Vif1().Words(words, taken, from);
+        }
+    }
+    if (g_vif1_codes.stopped()) Vif1Stands();
+    return taken;
+}
+
+// A DMA sink that hands VIF1 its words through Vif1Take, and stops the walk
+// where VIF1 stops.
+DmaBlockSink Vif1StoppingSink(DmaStop& stop, ChainCopy* copy) {
+    return [&stop, copy](const u32* words, u32 count, u32 from) {
+        const u32 taken = Vif1Take(words, count, from, copy);
+        if (g_vif1_stop.active) {
+            stop.requested = true;
+            stop.taken = taken;
+        }
+    };
+}
+
+void SendToVif1(const std::shared_ptr<ChainCopy>& copy) {
+    if (!copy || copy->words.empty()) return;
+    Vif1Run([copy] {
+        const u32* at = copy->words.data();
+        for (const auto& [count, from] : copy->runs) {
+            Vif1().Words(at, count, from);
+            at += count;
+        }
+    });
+}
+
+// VIF1 goes on (FBRST's STC; RST): what the stop held, then its DMA transfer's
+// rest, then what its FIFO was given meanwhile - each up to the next interrupt
+// bit. A transfer all taken ends: STR clears, D_STAT's CIS1, the DMAC interrupt.
+void Vif1GoesOn() {
+    g_vif1_stop.active = false;
+    const auto copy = Vif1Async() ? NewChainCopy() : nullptr;
+    const auto take = [&copy](std::vector<u32>& words) {
+        if (words.empty()) return;
+        const u32 taken = Vif1Take(words.data(), u32(words.size()), ~0u, copy.get());
+        words.erase(words.begin(), words.begin() + taken);
+    };
+    take(g_vif1_stop.held);
+    if (!g_vif1_stop.active && g_vif1_stop.transfer) {
+        Memory& m = GuestMemory();
+        constexpr u32 base = 0x10009000u;
+        DmaChannelState state{u32(m.Read(base, 4)), u32(m.Read(base + kMadr, 4)), u32(m.Read(base + kQwc, 4)),
+                              u32(m.Read(base + kTadr, 4)), u32(m.Read(base + kAsr0, 4)), u32(m.Read(base + kAsr1, 4))};
+        const u32 mode = state.chcr & 0xCu;
+        if (g_vif1_stop.ended) state.chcr &= ~0xCu;    // only the data owed, as in normal mode
+        DmaStop stop;
+        SendDmaBlocks(state, Vif1StoppingSink(stop, copy.get()), 1u << 16, true, &stop);
+        state.chcr = (state.chcr & ~0xCu) | mode;
+        *Register(base + kMadr) = state.madr;
+        *Register(base + kQwc) = state.qwc;
+        *Register(base + kTadr) = state.tadr;
+        *Register(base + kAsr0) = state.asr0;
+        *Register(base + kAsr1) = state.asr1;
+        *Register(base) = state.chcr | 0x100u;
+        if (stop.requested) {
+            g_vif1_stop.ended = stop.ended;
+            g_vif1_stop.held = std::move(stop.held);
+        } else {
+            g_vif1_stop.transfer = false;
+            if (g_vif1_codes.TakeOwedStop()) Vif1Stands();     // the bit on the chain's last command
+        }
+    }
+    if (!g_vif1_stop.active) take(g_vif1_stop.fifo);
+    SendToVif1(copy);
+    if (!g_vif1_stop.active && !g_vif1_stop.transfer && g_vif1_stop.owes_end) {
+        g_vif1_stop.owes_end = false;
+        *Register(0x10009000u) &= ~0x100u;
+        DmaChannelEnded(1);
+    }
+}
+
+// FBRST's RST: VIF1 reset - all of VIF1_STAT cleared and the stop with it, as
+// PCSX2's RST leaves them; the command it was in, any stop owed and what its
+// FIFO held go. The DMA channel is not VIF1's: a transfer still under way goes
+// on into the reset VIF1 (PCSX2 leaves STR set; nothing there starts it again).
+void Vif1Resets() {
+    const bool standing = g_vif1_stop.active;
+    *Register(kVif1Stat) = 0;
+    g_vif1_codes.Reset();
+    g_vif1_stop.held.clear();
+    g_vif1_stop.fifo.clear();
+    if (standing)
+        Note("vif1 reset standing", "VIF1 reset while it stood at an interrupt bit: the stop and what its FIFO "
+                                    "held dropped, its transfer's rest goes on");
+    if (standing || g_vif1_stop.transfer || g_vif1_stop.owes_end) Vif1GoesOn();
+}
+
+
 // Walks a started transfer and leaves the registers as it would; returns a
 // note (when `describe`: a transfer is noted only the first time).
 std::string Walk(const Channel& ch, u32 chcr, bool describe) {
@@ -302,10 +437,7 @@ std::string Walk(const Channel& ch, u32 chcr, bool describe) {
     DmaBlockSink sink = [](const u32*, u32, u32) {};
     if (ch.base == 0x10008000u) sink = to_vif(Vif0());
     if (ch.base == 0x10009000u)
-        sink = [](const u32* words, u32 count, u32 from) {
-            Vif1Sent(words, count);
-            Vif1().Words(words, count, from);
-        };
+        sink = [](const u32* words, u32 count, u32 from) { Vif1().Words(words, count, from); };
     if (ch.base == 0x1000A000u) sink = Path3;
     // With VIF1's worker, VIF1's and the GIF's words are copied as the chain
     // is walked and handed to it in a command (the transfer ends here, as on
@@ -318,6 +450,11 @@ std::string Walk(const Channel& ch, u32 chcr, bool describe) {
             copy->runs.emplace_back(count, from);
             g_chain_words += count;
         };
+    // VIF1 stopping at its interrupt bits (SetVif1InterruptBit): the walk stops
+    // where VIF1 does.
+    const bool stops = g_vif1_interrupt_bit && ch.base == 0x10009000u;
+    DmaStop stop;
+    if (stops) sink = Vif1StoppingSink(stop, copy.get());
     // A VIF1 chain a filter takes (SetVif1ChainFilter): walked whole first,
     // filtered, then sent as the filter left it.
     const bool filtered = g_vif1_filter && ch.base == 0x10009000u;
@@ -335,10 +472,26 @@ std::string Walk(const Channel& ch, u32 chcr, bool describe) {
         Timed timed(Section::Dma);      // (VU1 and the GS, which it drives, timed apart)
         // The GIF takes no chain tags (TTE): dma.h.
         const bool tags = ch.base != 0x1000A000u;
-        const DmaOutcome outcome = SendDmaBlocks(state, sink, 1u << 16, tags);
+        const DmaOutcome outcome = SendDmaBlocks(state, sink, 1u << 16, tags, stops && !filtered ? &stop : nullptr);
         if (filtered) {
             g_vif1_filter(chain);
-            if (queued && copy->words.empty()) {
+            if (stops) {
+                // Walked whole already: what VIF1 does not take before it stops
+                // waits with the stop, the transfer ending once it is taken.
+                const u32* at = chain.words.data();
+                for (const auto& [count, from] : chain.runs) {
+                    at += Vif1Take(at, count, from, copy.get());
+                    if (g_vif1_stop.active) break;
+                }
+                if (g_vif1_stop.active) {
+                    const u32* end = chain.words.data() + chain.words.size();
+                    g_vif1_stop.held.assign(at, end);
+                    g_vif1_stop.owes_end = true;
+                } else if (g_vif1_codes.TakeOwedStop()) {      // the bit on the chain's last command
+                    Vif1Stands();
+                    g_vif1_stop.owes_end = true;
+                }
+            } else if (queued && copy->words.empty()) {
                 // The worker's copy is the chain as filtered: taken, not copied.
                 g_chain_words += chain.words.size();
                 copy->words.swap(chain.words);
@@ -351,8 +504,20 @@ std::string Walk(const Channel& ch, u32 chcr, bool describe) {
                 }
             }
         }
-        // For VIF1's worker the words are copied, as they will go: seen here.
-        if (queued && ch.base == 0x10009000u) Vif1Sent(copy->words.data(), u32(copy->words.size()));
+        if (stops && !filtered) {
+            if (outcome.stopped) {
+                g_vif1_stop.transfer = true;
+                g_vif1_stop.ended = stop.ended;
+                g_vif1_stop.held = std::move(stop.held);
+                g_vif1_stop.owes_end = true;
+            } else if (g_vif1_codes.TakeOwedStop()) {
+                // The bit on the chain's last command: VIF1 stands with nothing
+                // after it, and the transfer ends only after STC (PCSX2's VIF1
+                // DMA does not end while VIF1 is stalled).
+                Vif1Stands();
+                g_vif1_stop.owes_end = true;
+            }
+        }
         if (describe)
             std::snprintf(text, sizeof text, "%llu quadwords, %u tags%s",
                       static_cast<unsigned long long>(outcome.quadwords), outcome.tags,
@@ -409,40 +574,43 @@ constexpr u32 kVif1Fifo = 0x10005000u;
 
 void SetVif1ChainFilter(std::function<void(Vif1Chain&)> filter) { g_vif1_filter = std::move(filter); }
 
-namespace {
-// VIF1 at an interrupt bit: INT and VIS shown, INTC's VIF1 cause raised.
-void Vif1Interrupts() {
-    *Register(kVif1Stat) |= kVif1StatVis | kVif1StatInt;
-    PostIntc(kIntcVif1);
-}
-}  // namespace
-
 void SetVif1InterruptBit(bool on) {
     g_vif1_interrupt_bit = on;
-    // FBRST's STC (bit 3) ends a stall and clears what it showed: VSS, VFS,
-    // VIS, INT, ER0 and ER1 - and VIF1 goes on to its next interrupt bit, if
-    // it has passed one. RST (bit 0) resets VIF1: none is owed any more.
+    g_vif1_stop = Vif1Stop();
+    g_vif1_codes.Reset();
+    // FBRST's STC (bit 3) ends a stall and clears what it showed - VSS, VFS,
+    // VIS, INT, ER0 and ER1 - and VIF1 goes on; RST (bit 0) resets VIF1.
     if (on)
         GuestMemory().OnWrite(kVif1Fbrst, [](u32, u64 value) {
-            if (!g_vif1_interrupt_bit || !(value & 9)) return;
+            if (!g_vif1_interrupt_bit) return;
+            if (value & 1) return Vif1Resets();
+            if (!(value & 8)) return;
             *Register(kVif1Stat) &= ~0x3F00u;
-            if (value & 1) g_vif1_interrupts_owed = 0;
-            else if (g_vif1_interrupts_owed) {
-                --g_vif1_interrupts_owed;
-                Vif1Interrupts();
-            }
+            if (g_vif1_stop.active) Vif1GoesOn();
         });
 }
 
-void Vif1Sent(const u32* words, u32 count) {
-    if (!g_vif1_interrupt_bit) return;
-    const u32 bits = g_vif1_codes.Words(words, count);
-    if (!bits || (*Register(kVif1Err) & 1)) return;         // VIF1_ERR's MII masks the bit
-    // Tekken 5's movie needs one each: two per frame, each letting one of the
-    // frame's two texture uploads end.
-    const bool waiting = *Register(kVif1Stat) & kVif1StatInt;
-    g_vif1_interrupts_owed += waiting ? bits : bits - 1;
-    if (!waiting) Vif1Interrupts();
+void Vif1StandingWatch(u64 frame) {
+    if (!g_vif1_stop.active || g_vif1_stop.told || frame < g_vif1_stop.since + kVif1StandingTooLong) return;
+    g_vif1_stop.told = true;
+    const std::string text = Vif1StopState();
+    std::fprintf(stderr, "[vif1] %s\n", text.c_str());
+    Note("vif1 standing", text);
+}
+
+std::string Vif1StopState() {
+    if (!g_vif1_stop.active) return std::string();
+    bool enabled = false;
+    const u32 handlers = IntcHandlers(kIntcVif1, &enabled);
+    char text[320];
+    std::snprintf(text, sizeof text,
+                  "VIF1 standing at an interrupt bit since frame %llu (VIFcode 0x%08X): %s%zu words held, %zu "
+                  "stored to its FIFO; INTC's VIF1 cause %s, %u handler(s) - waiting for FBRST's STC",
+                  static_cast<unsigned long long>(g_vif1_stop.since), unsigned(g_vif1_codes.stop_code()),
+                  g_vif1_stop.transfer ? "its transfer's rest in the channel, " : "",
+                  g_vif1_stop.held.size(), g_vif1_stop.fifo.size(), enabled ? "enabled" : "masked",
+                  unsigned(handlers));
+    return text;
 }
 
 namespace {
@@ -670,6 +838,7 @@ void FrameDone(u64 frame) {
     timeline::Frame(frame);
     SampleFrame(frame);
     Vu::SnapshotFrame(frame);
+    Vif1StandingWatch(frame);
     // Time passes: unmasked, PATH3 sends what it still holds (in turn with
     // VIF1's, whose state PATH3's is).
     Vif1Run([] {
@@ -835,8 +1004,16 @@ void InstallDevices() {
                              unsigned(memory.Read(madr, 4)), unsigned(memory.Read(qwc, 4)), unsigned(value),
                              calls.c_str());
             }
+            if (ch.base == 0x10009000u && g_vif1_stop.owes_end) {
+                // STR set again while VIF1 still has the last transfer's rest to
+                // take: it is that transfer still, nothing new starts.
+                Note("vif1 started standing", "VIF1's DMA started again while VIF1 stood at an interrupt bit "
+                                              "with its transfer's rest to take: left as it was");
+                return;
+            }
             const std::string walked = ch.walked ? Walk(ch, u32(value), describe) : std::string();
             if (describe) Note(key, ch.walked ? std::string(text) + ": " + walked : std::string(text));
+            if (ch.base == 0x10009000u && g_vif1_stop.owes_end) return;     // STR stays set until VIF1 has it all
             *Register(chcr) &= ~0x100u;                         // done
             SetDStat(d_stat | (1u << ch.status_bit));
             PostDmac(ch.status_bit);
@@ -903,7 +1080,17 @@ void InstallDevices() {
                     g_gif_shadow.known = false;
             }
         }
-        Vif1Sent(words.data(), 4);
+        if (g_vif1_interrupt_bit) {
+            if (g_vif1_stop.active) {                       // VIF1 stands: its FIFO keeps them
+                g_vif1_stop.fifo.insert(g_vif1_stop.fifo.end(), words.begin(), words.end());
+                return;
+            }
+            const auto copy = Vif1Async() ? NewChainCopy() : nullptr;
+            const u32 taken = Vif1Take(words.data(), 4, kVif1Fifo, copy.get());
+            g_vif1_stop.fifo.assign(words.begin() + taken, words.end());
+            SendToVif1(copy);
+            return;
+        }
         Vif1Run([words] {
             for (u32 word : words) Vif1().Word(word);
         });

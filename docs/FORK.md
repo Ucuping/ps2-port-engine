@@ -212,17 +212,27 @@ ELF loader's one, ReferSemaStatus's five).
   server registered while one of its id still is, with both: which of the
   two a game reaches is the host's choice.
 - VIF1's interrupt bit, off by default (`SetVif1InterruptBit`; a port turns
-  it on): a VIFcode with bit 31 set raises INTC's VIF1 cause, and VIF1_STAT
-  shows INT and VIS until FBRST's STC, unless VIF1_ERR's MII masks the bit.
-  It is looked for where the EE hands VIF1 its words (`Vif1Sent`, by
-  `VifCodeScan`, which follows the commands' data lengths as the decoder
-  does), so VIF1's worker changes nothing. INTC causes a device posts
-  (`PostIntc`) are delivered as DMA completions are, before them. Each such
-  code gets its own interrupt, in turn: the next once STC has acknowledged
-  the last (RST leaves none owed). VIF1 does not stand still at the bit;
-  the transfer still completes at once. Tekken 5 lets its texture uploads
-  end only once its VIF1 handler has seen INT - its opening movie two a
-  frame.
+  it on): a VIFcode with bit 31 runs to its end, its data and all, and VIF1
+  then stands still - VIF1_STAT shows INT and VIS, INTC's VIF1 cause is
+  raised - until FBRST's STC; a MARK right after the code runs first
+  (ps2tek), and VIF1_ERR's MII masks the bit. The stop is found on the EE's
+  thread as the words are handed over (`VifCodeScan::UntilStop`, which
+  follows each command's data), so it falls in the same place with VIF1's
+  worker or without, and the walk of the DMA chain stops there (`DmaStop`):
+  the transfer's rest waits in the channel's registers with STR set, the
+  rest of the quadword it stopped in held, and the transfer ends - D_STAT's
+  CIS1, the DMAC interrupt - once VIF1 has taken all of it; with the bit on
+  the chain's last command, after STC (as PCSX2's VIF1 DMA does not end
+  while VIF1 is stalled). Stores to VIF1's FIFO wait while it stands; PATH3
+  does not stop, so what a handler uploads reaches the GS before the draws
+  after the bit. RST clears VIF1_STAT and the stop, and drops a stop owed and
+  what the FIFO held; the transfer's rest goes on (the DMA channel is not
+  reset). A VIF1 left standing 60 frames is said once (a line and a note)
+  and in the run's report, never resumed by itself. Tekken 5 lets each
+  texture upload go when its VIF1 handler sees INT and draws from it after
+  STC: without the stop its title and its fight's HUD were drawn from
+  textures not yet uploaded. INTC causes a device posts (`PostIntc`) are
+  delivered as DMA completions are, before them.
 - The EE kernel runs an INTC or DMAC handler, or an alarm's callback, with
   the `$gp` its code had when it was registered (AddIntcHandler,
   AddDmacHandler, SetAlarm), not the interrupted code's - as Play!'s EE

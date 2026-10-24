@@ -79,6 +79,41 @@ std::uint32_t VifCodeScan::Words(const std::uint32_t* words, std::uint32_t count
     return interrupts;
 }
 
+std::uint32_t VifCodeScan::UntilStop(const std::uint32_t* words, std::uint32_t count, bool bits) {
+    stopped_ = false;
+    for (std::uint32_t i = 0; i < count;) {
+        if (pending_) {                                         // a command's data, skipped whole
+            const std::uint32_t run = std::min(pending_, count - i);
+            pending_ -= run;
+            i += run;
+            if (!pending_ && armed_) {                          // the command with the bit is done
+                armed_ = false;
+                owed_ = true;
+            }
+            continue;
+        }
+        const std::uint32_t code = words[i];
+        if (owed_) {
+            owed_ = false;
+            stopped_ = true;
+            if (((code >> 24) & 0x7F) == 0x07) ++i;            // MARK runs first (it has no data)
+            return i;
+        }
+        ++i;
+        if (((code >> 24) & 0x7F) == 0x01) {                    // STCYCL
+            cycle_length_ = code & 0xFF;
+            write_length_ = (code >> 8) & 0xFF;
+        }
+        pending_ = VifDataWords(code, cycle_length_, write_length_);
+        if (bits && (code >> 31)) {
+            code_ = code;
+            if (pending_) armed_ = true;
+            else owed_ = true;
+        }
+    }
+    return count;
+}
+
 void VifStream::WriteElement(const std::uint32_t value[4], bool from_data) {
     Unpack& u = unpack_;
     if (u.written >= u.num) return;

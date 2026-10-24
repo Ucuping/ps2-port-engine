@@ -252,20 +252,25 @@ void SetPresentAtBlankEnd(bool on);
 void StartVif1Worker();
 /* Whether real time runs VIF1 on its worker (default yes; --vif1-sync: no). */
 void SetVif1Worker(bool on);
-/* VIF1's interrupt bit: a VIFcode with bit 31 set raises INTC's VIF1 cause,
-   and VIF1_STAT shows INT and VIS until FBRST's STC, as on the console -
-   unless VIF1_ERR's MII masks the bit. Each such code raises it in turn: the
-   next once FBRST's STC has acknowledged the last (RST leaves none owed).
-   VIF1 does not stand still there: the transfer still completes at once,
-   its data drawn before what the game lets go meanwhile. Off by default; a
-   game that waits for it has its port turn it on (Tekken 5 lets each
-   frame's PATH3 texture uploads end only once its VIF1 handler has seen
-   INT). */
+/* VIF1's interrupt bit: a VIFcode with bit 31 set runs to its end, data and
+   all, and VIF1 then stands still - VIF1_STAT shows INT and VIS, INTC's VIF1
+   cause is raised - until FBRST's STC, as on the console; a MARK right after
+   the code runs first. Unless VIF1_ERR's MII masks the bit. While VIF1 stands
+   nothing more reaches it: its DMA transfer's rest waits in the channel's
+   registers with STR set (the transfer ends, D_STAT's CIS1 and the DMAC
+   interrupt, once VIF1 has taken all of it - after STC when the bit was on the
+   chain's last command), stores to its FIFO wait, PATH3 goes on. RST resets
+   VIF1: the stop goes, the transfer's rest goes on. Off by default; a game that
+   waits for it has its port turn it on (Tekken 5 lets each of its texture
+   uploads go when its VIF1 handler sees INT, and draws from it after STC). */
 void SetVif1InterruptBit(bool on);
-/* Words the EE hands VIF1 - a DMA transfer's, the FIFO's - in order, as they
-   go: where VIF1's interrupt bit is looked for (devices.cpp), on the EE's
-   thread, so a run with VIF1's worker sees what one without it sees. */
-void Vif1Sent(const u32* words, u32 count);
+/* VIF1 standing at an interrupt bit, for a diagnostic: since when, at which
+   VIFcode, what waits, whether anything can answer it (INTC's VIF1 cause, its
+   handlers) - empty while it is not standing. */
+std::string Vif1StopState();
+/* Each frame (FrameDone): VIF1 standing 60 frames and more, the run says so
+   once - a line and a note, Vif1StopState's. */
+void Vif1StandingWatch(u64 frame);
 /* A VIF1 DMA chain as it is sent: its words, in runs (each: how many, and
    the address they were read from) - the chain walked, its tags followed. */
 struct Vif1Chain {
@@ -671,6 +676,9 @@ void SetGpuScaleRule(u32 fbp_begin, u32 fbp_end, u32 max_fbw);
 void AdvanceClock(u64 ns);
 /* Run the INTC handlers for `cause`, if it is enabled (threads.cpp). */
 void RaiseIntc(u32 cause);
+/* For a diagnostic: how many INTC handlers `cause` has, and whether it is
+   enabled (_EnableIntc). */
+u32 IntcHandlers(u32 cause, bool* enabled);
 /* INTC_STAT: the causes raised (a frame's vertical blanks, RaiseIntc's), and
    clearing those written as 1 (threads.cpp). */
 u32 IntcStat();

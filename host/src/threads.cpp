@@ -711,6 +711,13 @@ void RaiseIntc(u32 cause) {
 }
 
 u32 IntcStat() { return g_intc_stat.load(std::memory_order_relaxed); }
+u32 IntcHandlers(u32 cause, bool* enabled) {
+    Scheduler& s = S();
+    if (enabled) *enabled = (s.intc_mask >> cause) & 1;
+    u32 count = 0;
+    for (const auto& [id, handler] : s.handlers) count += handler.cause == cause;
+    return count;
+}
 void ClearIntcStat(u32 bits) { g_intc_stat.fetch_and(~bits, std::memory_order_relaxed); }
 
 void PostDmac(u32 channel) {

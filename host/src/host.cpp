@@ -585,6 +585,7 @@ void Report(const Options& options, const std::string& outcome) {
             std::printf("  %s\n", Describe(thread[i]).c_str());
     }
     std::printf("threads:\n%s%s", ThreadReport().c_str(), iop::Report().c_str());
+    if (const std::string vif1 = Vif1StopState(); !vif1.empty()) std::printf("%s\n", vif1.c_str());
     if (!options.dump_ram.empty()) {
         if (std::FILE* f = std::fopen(options.dump_ram.c_str(), "wb")) {
             std::fwrite(GuestMemory().rdram(), 1, 32u << 20, f);

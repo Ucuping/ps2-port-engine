@@ -240,50 +240,209 @@ void VifCodesAreFoundWithoutDecoding() {
           "a command's data split between two runs");
 }
 
-// VIF1's interrupt bit, where a port turns it on (Tekken 5's texture uploads
-// wait for it): VIF1_STAT's INT and VIS and INTC's VIF1 cause, until FBRST's
-// STC.
-void Vif1InterruptBitRaisesItsInterrupt() {
+// Where VIF1 stops at an interrupt bit, found as the EE hands it words: after
+// the command with the bit, its data and all, before the next command - after
+// it, if that is MARK (ps2tek) - unless VIF1_ERR's MII masks the bit.
+void Vif1StopsAfterTheCommandWithTheBit() {
+    const u32 i = 0x80000000u, nop = 0, mark = 0x07000000u;
+    auto until = [](ps2host::VifCodeScan& scan, std::initializer_list<u32> words, bool bits = true) {
+        const std::vector<u32> v(words);
+        return scan.UntilStop(v.data(), u32(v.size()), bits);
+    };
+    ps2host::VifCodeScan a, b, c, d, e, f;
+    Check(until(a, {i | nop, nop, nop}) == 1 && a.stopped(), "stop: after a NOP with the bit, before the next command");
+    Check(until(b, {i | nop, mark, nop}) == 2 && b.stopped(), "stop: a MARK after the bit runs first");
+    Check(until(c, {i | 0x50000001u, 1, 2, 3, 4, nop}) == 5 && c.stopped(), "stop: the command's data runs first");
+    Check(until(d, {i | nop, nop}, false) == 2 && !d.stopped(), "stop: none while MII masks the bit");
+    Check(until(e, {nop, i | nop}) == 2 && !e.stopped() && e.stop_owed(), "stop: owed when the words end with its command");
+    Check(until(e, {nop, nop}) == 0 && e.stopped(), "stop: before the next words' first command");
+    Check(until(f, {nop, i | nop}) == 2 && f.TakeOwedStop() && f.stopped(),
+          "stop: the bit on a chain's last command stops VIF1 with nothing after it");
+    until(f, {i | nop});
+    f.Reset();
+    Check(!f.stop_owed(), "stop: RST drops a stop owed");
+}
+
+// VIF1 standing at its interrupt bit until FBRST's STC, as Tekken 5 needs it:
+// its VIF1 handler lets a texture upload go over PATH3, and the draws after
+// the bit use the texture. Here the draw is a GS copy (TRXDIR 2) out of the
+// texture, and the handler uploads colour B over colour A, then writes STC.
+constexpr u32 kStallTexture = 0x3000, kStallCopy = 0x3100;             // GS blocks
+constexpr u32 kStallVif1 = 0x00380000u, kStallGif = 0x00381000u;        // guest memory
+constexpr u32 kStallA = 0xFF0000AAu, kStallB = 0xFF00BB00u;
+u32 g_stall_handler_runs = 0;
+
+void PutQuad(u32 at, u64 low, u64 high) {
+    ps2host::GuestMemory().Write(at, low, 8);
+    ps2host::GuestMemory().Write(at + 8, high, 8);
+}
+
+u64 TestGifTag(u32 nloop, bool eop, u32 flg, u32 nreg) {
+    return u64(nloop) | (u64(eop) << 15) | (u64(flg) << 58) | (u64(nreg) << 60);
+}
+
+void HandlerUploadsAndGoesOn(lifted::Context&) {
+    ++g_stall_handler_runs;
     ps2host::Memory& m = ps2host::GuestMemory();
-    const u32 stat = 0x10003C00u, fbrst = 0x10003C10u, err = 0x10003C20u;
-    const u32 shown = 0xC00u, cause = 1u << 5;
-    const u32 nop = 0x80000000u, direct[] = {0x50000001u, nop, nop, nop, nop};
-    auto raised = [&] { return (m.Read(stat, 4) & shown) == shown && (ps2host::IntcStat() & cause); };
-    auto quiet = [&] { return (m.Read(stat, 4) & shown) == 0 && !(ps2host::IntcStat() & cause); };
+    m.Write(0x1000A010u, kStallGif, 4);              // GIF: MADR, QWC, CHCR (from memory, normal, STR)
+    m.Write(0x1000A020u, 8, 4);
+    m.Write(0x1000A000u, 0x101, 4);
+    m.Write(0x10003C10u, 8, 4);                      // FBRST: STC
+}
+
+void Vif1StandsUntilStc() {
+    using namespace ps2host::gs;
+    ps2host::Memory& m = ps2host::GuestMemory();
+    Gs& gs = TheGs();
+    const u32 stat = 0x10003C00u, fbrst = 0x10003C10u, err = 0x10003C20u, chcr = 0x10009000u, dstat = 0x1000E010u;
+    const u32 i = 0x80000000u, cause = 1u << 5;
+    // The handler's upload: colour B, 8x1, into the texture.
+    PutQuad(kStallGif, TestGifTag(4, false, 0, 1), 0xE);
+    PutQuad(kStallGif + 0x10, u64(kStallTexture) << 32 | u64(1) << 48, 0x50);       // BITBLTBUF
+    PutQuad(kStallGif + 0x20, 0, 0x51);                                              // TRXPOS
+    PutQuad(kStallGif + 0x30, 8 | u64(1) << 32, 0x52);                               // TRXREG 8x1
+    PutQuad(kStallGif + 0x40, 0, 0x53);                                              // TRXDIR: in
+    PutQuad(kStallGif + 0x50, TestGifTag(2, true, 2, 0), 0);                         // IMAGE, 2 quadwords
+    for (u32 k = 0; k < 8; ++k) m.Write(kStallGif + 0x60 + 4 * k, kStallB, 4);
+    // VIF1's transfer: a NOP with the bit, then a DIRECT copying the texture.
+    const u32 head[4] = {i, 0, 0, 0x50000005u};
+    for (u32 k = 0; k < 4; ++k) m.Write(kStallVif1 + 4 * k, head[k], 4);
+    PutQuad(kStallVif1 + 0x10, TestGifTag(4, true, 0, 1), 0xE);
+    PutQuad(kStallVif1 + 0x20, u64(kStallTexture) | u64(1) << 16 | u64(kStallCopy) << 32 | u64(1) << 48, 0x50);
+    PutQuad(kStallVif1 + 0x30, 0, 0x51);
+    PutQuad(kStallVif1 + 0x40, 8 | u64(1) << 32, 0x52);
+    PutQuad(kStallVif1 + 0x50, 2, 0x53);                                             // TRXDIR: local to local
+    // Transfers of NOPs only: one bit, two bits, the bit on the last command.
+    auto nops = [&m](u32 at, std::initializer_list<u32> words) {
+        u32 k = 0;
+        for (u32 w : words) m.Write(at + 4 * k++, w, 4);
+    };
+    const u32 one = kStallVif1 + 0x100, two = kStallVif1 + 0x200, last = kStallVif1 + 0x300;
+    nops(one, {i, 0, 0, 0, 0, 0, 0, 0});
+    nops(two, {i, 0, 0, 0, i, 0, 0, 0});
+    nops(last, {0, 0, 0, i});
+    auto kick = [&](u32 madr, u32 qwc) {
+        m.Write(dstat, 2, 4);                       // CIS1 cleared
+        m.Write(0x10009010u, madr, 4);
+        m.Write(0x10009020u, qwc, 4);
+        m.Write(chcr, 0x101, 4);
+    };
+    auto start = [&] {
+        for (u32 x = 0; x < 8; ++x) {
+            gs.memory.Write(kStallTexture, 1, x, 0, PSMCT32, kStallA);
+            gs.memory.Write(kStallCopy, 1, x, 0, PSMCT32, 0);
+        }
+        kick(kStallVif1, 6);
+    };
+    auto copied = [&](u32 colour) {
+        gs.Finish();
+        for (u32 x = 0; x < 8; ++x)
+            if (gs.memory.Read(kStallCopy, 1, x, 0, PSMCT32) != colour) return false;
+        return true;
+    };
+    auto running = [&] { return (m.Read(chcr, 4) & 0x100) != 0; };
+    auto ended = [&] { return !running() && (m.Read(dstat, 4) & 2) != 0; };
+    auto shown = [&] { return (m.Read(stat, 4) & 0xC00) == 0xC00; };
+    auto raised = [&] { return (ps2host::IntcStat() & cause) != 0; };
+    auto acknowledge = [&] { ps2host::ClearIntcStat(cause); };
+    static const ps2host::FunctionEntry table[] = {{0x00611000u, HandlerUploadsAndGoesOn, "vif1 handler", 8u}};
+    ps2host::RegisterFunctions(table, 1);
+    lifted::Context c{};
+    u64 id = 0, ok = 0;
+    c.r[4] = 5, c.r[5] = 0x00611000u, c.r[6] = 0, c.r[7] = 0;
+    ps2host::ThreadSyscall(c, 0x10, id);            // AddIntcHandler(VIF1)
+    c.r[4] = 5;
+    ps2host::ThreadSyscall(c, 0x14, ok);            // _EnableIntc(VIF1)
     m.Write(stat, 0, 4);
     m.Write(err, 0, 4);
-    ps2host::ClearIntcStat(cause);
-    ps2host::Vif1Sent(&nop, 1);
-    Check(quiet(), "VIF1's interrupt bit is off by default");
+    acknowledge();
+
+    start();
+    Check(ended() && !raised() && copied(kStallA), "VIF1 stall: off by default - the copy reads the texture at once");
     ps2host::SetVif1InterruptBit(true);
-    ps2host::Vif1Sent(direct, 5);
-    Check(quiet(), "the bit in a command's data raises nothing");
-    ps2host::Vif1Sent(&nop, 1);
-    Check(raised(), "a VIFcode's interrupt bit: INT, VIS and INTC's VIF1 cause");
-    m.Write(fbrst, 8, 4);
-    ps2host::ClearIntcStat(cause);
-    Check(quiet(), "FBRST's STC clears INT and VIS");
+    g_stall_handler_runs = 0;
+    start();
+    Check(running() && !ended(), "VIF1 stall: STR stays set, no CIS1, while VIF1 stands");
+    Check(shown() && raised(), "VIF1 stall: INT and VIS shown, INTC's VIF1 cause raised");
+    Check(copied(0), "VIF1 stall: nothing after the bit has run");
+    ps2host::RaiseIntc(5);                          // its handler: the upload, then STC
+    acknowledge();
+    Check(g_stall_handler_runs == 1, "VIF1 stall: the handler ran");
+    Check(copied(kStallB), "VIF1 stall: the draw after the bit reads what the handler uploaded over PATH3");
+    Check(ended() && !shown(), "VIF1 stall: after STC VIF1 takes the rest, the transfer ends");
+
     m.Write(err, 1, 4);
-    ps2host::Vif1Sent(&nop, 1);
-    Check(quiet(), "VIF1_ERR's MII masks the bit");
+    start();
+    Check(ended() && !raised() && copied(kStallA), "VIF1 stall: none while VIF1_ERR's MII masks the bit");
     m.Write(err, 0, 4);
-    // Two in one transfer (Tekken 5's movie, each frame): one each, the
-    // second once STC has acknowledged the first.
-    const u32 two[] = {nop, 0, nop};
-    ps2host::Vif1Sent(two, 3);
-    Check(raised(), "two interrupt bits: the first raises the cause");
-    ps2host::ClearIntcStat(cause);
+
+    kick(two, 2);
+    Check(running() && raised(), "VIF1 stall: two bits - the first stops VIF1");
+    acknowledge();
     m.Write(fbrst, 8, 4);
-    Check(raised(), "two interrupt bits: STC raises the second");
-    ps2host::ClearIntcStat(cause);
+    Check(running() && raised() && shown(), "VIF1 stall: two bits - STC, then the second");
+    acknowledge();
     m.Write(fbrst, 8, 4);
-    Check(quiet(), "two interrupt bits: none after the second STC");
-    ps2host::Vif1Sent(two, 3);
-    ps2host::ClearIntcStat(cause);
+    Check(ended() && !raised() && !shown(), "VIF1 stall: two bits - the transfer ends after the second STC");
+
+    // The bit on the chain's last command: VIF1 stands with nothing after it,
+    // and the transfer ends only after STC, as PCSX2's VIF1 DMA does.
+    kick(last, 1);
+    Check(running() && !ended() && raised() && shown(), "VIF1 stall: the bit on the last command - STR set, no CIS1");
+    acknowledge();
+    m.Write(fbrst, 8, 4);
+    Check(ended() && !shown(), "VIF1 stall: the bit on the last command - the transfer ends at STC");
+
+    // RST while VIF1 stands: VIF1_STAT cleared and the stop with it; the DMA
+    // channel is not reset, its transfer's rest goes on.
+    kick(one, 2);
+    Check(running() && raised(), "VIF1 stall: standing before RST");
+    acknowledge();
     m.Write(fbrst, 1, 4);
-    m.Write(fbrst, 8, 4);
-    Check(quiet(), "FBRST's RST leaves no interrupt owed");
+    Check(m.Read(stat, 4) == 0 && ended() && !raised(), "VIF1 stall: RST clears VIF1_STAT and the stop, the transfer goes on");
+
+    m.Write(stat, 0, 4);
+    c.r[4] = 5, c.r[5] = u32(id);
+    ps2host::ThreadSyscall(c, 0x11, ok);            // RemoveIntcHandler
+    c.r[4] = 5;
+    ps2host::ThreadSyscall(c, 0x15, ok);            // _DisableIntc
+    ps2host::RegisterFunctions(nullptr, 0);
     ps2host::SetVif1InterruptBit(false);
+    acknowledge();
+}
+
+// What waits while VIF1 stands, and a stop no STC ever ends: said once VIF1
+// has stood 60 frames, never resumed by itself. RST drops a stop owed by words
+// stored to the FIFO.
+void Vif1StandingIsReported() {
+    ps2host::Memory& m = ps2host::GuestMemory();
+    const u32 fifo = 0x10005000u, fbrst = 0x10003C10u, i = 0x80000000u;
+    auto store = [&m, fifo](u32 a, u32 b, u32 c, u32 d) {
+        m.Write(fifo, a, 4), m.Write(fifo + 4, b, 4), m.Write(fifo + 8, c, 4), m.Write(fifo + 12, d, 4);
+    };
+    auto noted = [] {
+        for (const std::string& note : ps2host::RunStats().notes)
+            if (note.find("VIF1 standing at an interrupt bit") != std::string::npos) return true;
+        return false;
+    };
+    ps2host::SetVif1InterruptBit(true);
+    store(0, 0, 0, i);
+    Check(ps2host::Vif1StopState().empty(), "VIF1 standing: a stop owed, not yet stood");
+    m.Write(fbrst, 1, 4);
+    store(0, 0, 0, 0);
+    Check(ps2host::Vif1StopState().empty(), "VIF1 standing: RST drops a stop owed");
+    store(0, 0, 0, i);
+    store(0, 0, 0, 0);
+    Check(!ps2host::Vif1StopState().empty(), "VIF1 standing: the FIFO's next command waits");
+    const u64 since = ps2host::FrameNumber();
+    ps2host::Vif1StandingWatch(since + 59);
+    Check(!noted(), "VIF1 standing: nothing said before 60 frames");
+    ps2host::Vif1StandingWatch(since + 60);
+    Check(noted() && !ps2host::Vif1StopState().empty(), "VIF1 standing: said at 60 frames, still standing");
+    m.Write(fbrst, 8, 4);
+    Check(ps2host::Vif1StopState().empty(), "VIF1 standing: STC ends it");
+    ps2host::SetVif1InterruptBit(false);
+    ps2host::ClearIntcStat(1u << 5);
 }
 
 void PutTag(u32 at, u32 qwc, u32 id, u32 address, u32 upper0, u32 upper1) {
@@ -2579,7 +2738,7 @@ int main() {
     WideWritesReachEveryWordsHook();
     VifSkipsDataAndAppliesMaskPath3();
     VifCodesAreFoundWithoutDecoding();
-    Vif1InterruptBitRaisesItsInterrupt();
+    Vif1StopsAfterTheCommandWithTheBit();
     DmaChainsAreWalked();
     GsLayoutsArePermutations();
     GsDrawsASprite();
@@ -2629,6 +2788,11 @@ int main() {
     SpuReverbHasNoImage();
     SpuInterpolatesAsTheHardware();
     SpuRoutesCore0ThroughCore1();
+    // Last: these install the devices (the DMA channels' and VIF1's FIFO's
+    // hooks), which the tests before them do not expect.
+    ps2host::InstallDevices();
+    Vif1StandsUntilStc();
+    Vif1StandingIsReported();
     std::printf(g_failures ? "host tests: %d failed\n" : "host tests: all passed\n", g_failures);
     return g_failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

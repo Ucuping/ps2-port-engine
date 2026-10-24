@@ -97,9 +97,37 @@ public:
        with the interrupt bit (bit 31) set. */
     std::uint32_t Words(const std::uint32_t* words, std::uint32_t count);
 
+    /* The next `count` words, up to where VIF1 stops at an interrupt bit: the
+       command with the bit runs to its end, its data and all, and VIF1 stops
+       before the command after it - after that one, if it is MARK (ps2tek:
+       "the VIF stalls on the following command except for the MARK
+       command"). `bits` is false while VIF1_ERR's MII masks the bit. Returns
+       how many of the words go before the stop: `count` when it is not among
+       them. stopped() says whether it is; stop_owed(), that a command with the
+       bit ended with the words, its stop falling before whatever comes next. */
+    std::uint32_t UntilStop(const std::uint32_t* words, std::uint32_t count, bool bits);
+    bool stopped() const { return stopped_; }
+    bool stop_owed() const { return owed_; }
+    /* The words ended with a stop owed - the bit on the last command a chain
+       had: VIF1 stops there with nothing after it. Whether it did. */
+    bool TakeOwedStop() {
+        if (!owed_) return false;
+        owed_ = false;
+        stopped_ = true;
+        return true;
+    }
+    /* The VIFcode whose bit stopped it last. */
+    std::uint32_t stop_code() const { return code_; }
+    /* VIF1 reset (FBRST's RST): the command it was in and any stop owed go. */
+    void Reset() { *this = VifCodeScan(); }
+
 private:
     std::uint32_t pending_ = 0;     /* data words still owed to the last command */
     std::uint32_t cycle_length_ = 0, write_length_ = 0;     /* STCYCL's CL and WL */
+    bool armed_ = false;            /* the command whose data is being skipped has the bit */
+    bool owed_ = false;             /* a command with the bit has ended: the next one stops */
+    bool stopped_ = false;
+    std::uint32_t code_ = 0;
 };
 
 /* The VIF1 stream fed by stores to its FIFO, 0x10005000. */

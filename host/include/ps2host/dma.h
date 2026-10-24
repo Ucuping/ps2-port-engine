@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 namespace ps2host {
 
@@ -33,6 +34,21 @@ struct DmaOutcome {
     std::uint64_t quadwords = 0;    /* data quadwords sent, tags excluded */
     std::uint32_t tags = 0;
     bool ended = false;             /* reached an end tag (or IRQ with TIE, or normal mode) */
+    bool stopped = false;           /* the receiver stopped it (DmaStop) */
+};
+
+/* A stop the receiver asks for (SendDmaBlocks' `stop`): it sets `requested`
+   and `taken`, how many words of the run it was just given it took. The walk
+   ends there: the rest of the quadword it stopped in goes to `held` (as a
+   FIFO holds what DMA brought it), MADR, QWC and TADR are left where the next
+   quadword comes from, and `ended` says whether the chain had ended - only
+   the data it still owes is left. Sent again, the channel goes on from there
+   (QWC owed first, then the tags). */
+struct DmaStop {
+    bool requested = false;
+    std::uint32_t taken = 0;
+    std::vector<std::uint32_t> held;
+    bool ended = false;
 };
 
 /* Sends the channel's data to `word`, one 32-bit word at a time, reading guest
@@ -51,7 +67,7 @@ DmaOutcome SendDma(DmaChannelState& channel, const std::function<void(std::uint3
    run rather than one a word: VIF1 takes most of a frame's data. */
 using DmaBlockSink = std::function<void(const std::uint32_t* words, std::uint32_t count, std::uint32_t from)>;
 DmaOutcome SendDmaBlocks(DmaChannelState& channel, const DmaBlockSink& words,
-                         std::uint32_t max_tags = 1u << 16, bool tags = true);
+                         std::uint32_t max_tags = 1u << 16, bool tags = true, DmaStop* stop = nullptr);
 
 }  // namespace ps2host
 
