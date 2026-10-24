@@ -30,7 +30,7 @@ from ps2decomp.symbols import SymbolRecovery
 
 
 def build_database(elf_path: str, verbose: bool = True, keep=(), bounds=(), call_ranges=None,
-                   end_at_returns: bool = False, run_entries=None) -> dict:
+                   end_at_returns: bool = False, run_entries=None, tables_anywhere: bool = False) -> dict:
     started = time.time()
     elf = ElfFile.load(elf_path)
     exec_sections = elf.exec_sections
@@ -48,7 +48,13 @@ def build_database(elf_path: str, verbose: bool = True, keep=(), bounds=(), call
     log("entry      : 0x%08x" % elf.e_entry)
 
     log("discovering functions...")
-    analyzer = ImageAnalyzer(data, section.addr, elf.e_entry, call_ranges, end_at_returns, run_entries)
+    # The program's other loaded sections, where a switch's table may be
+    # (game.json "jump_tables_anywhere"): Tekken 5's executable keeps its in
+    # .rodata, out of the code section's sight.
+    others = [(elf.section_data(s), s.addr) for s in elf.sections
+              if s.is_alloc and s.size and s.occupies_file and s is not section] if tables_anywhere else []
+    analyzer = ImageAnalyzer(data, section.addr, elf.e_entry, call_ranges, end_at_returns, run_entries,
+                             others, tables_anywhere)
     analyzer.run()
     log("  %s functions, %.1f%% of the image proven to be code"
         % (format(len(analyzer.functions), ","), analyzer.coverage()))
@@ -204,6 +210,15 @@ def build_database(elf_path: str, verbose: bool = True, keep=(), bounds=(), call
         if f["confidence"] in sources:
             reached = analyzer.closure(f["addr"], entries) or set()
             labels |= (reached & candidates) - {f["addr"]}
+    if tables_anywhere:
+        # A "function" the gaps' recovery made at a case of a table read, that
+        # nothing calls, is a label of the switch's function: the table's word
+        # was its only evidence. The pointer pass's go in analysis.py already.
+        cases = {f["addr"] for f in functions if f["addr"] in analyzer.case_targets and not f["callers"]
+                 and f["confidence"].startswith("recovered")}
+        if cases:
+            log("  %d cases of switches the gaps' recovery took for functions; dropped" % len(cases))
+        labels |= cases
     if labels:
         functions = [f for f in functions if f["addr"] not in labels]
         log("  %d labels of other functions were taken for functions; dropped" % len(labels))
@@ -289,6 +304,22 @@ def build_database(elf_path: str, verbose: bool = True, keep=(), bounds=(), call
                               "changed": [list(c) for c in bounded["changed"]],
                               "dropped": bounded["dropped"], "kept_inner": bounded["kept_inner"],
                               "added": bounded["added"]}
+    if tables_anywhere:
+        # The switches' tables read, those no bound sized flagged for an
+        # audit, and the jumps through a register no table explains - in a
+        # player's build, where a jump may land on code nothing translated.
+        mine = (lambda a: overlay.in_code(keep, a)) if keep else (lambda a: True)
+        database["jump_tables"] = [{"jr": jr, "table": table, "cases": count, "bounded": bounded_read}
+                                   for jr, (table, count, bounded_read) in sorted(analyzer.tables.items())
+                                   if mine(jr)]
+        # (A jump some traversal - a function's, or a candidate's from inside
+        # it - read the table of is explained.)
+        database["unexplained_jumps"] = sorted(a for a in analyzer.unexplained
+                                               if a not in analyzer.tables and mine(a))
+        unbounded = sum(1 for t in database["jump_tables"] if not t["bounded"])
+        log("  %d jump tables read, %d of them sized by their words alone (flagged); %d jumps through "
+            "a register no table explains" % (len(database["jump_tables"]), unbounded,
+                                              len(database["unexplained_jumps"])))
     if keep:
         # The overlay's own numbers, not the combined image's.
         database["meta"]["image_size"] = sum(high - low for low, high in keep)
@@ -323,7 +354,8 @@ def main(argv=None) -> int:
         call_ranges = list(game.code_ranges) + [(executable.addr, executable.addr + executable.size)]
     database = build_database(game.elf_path, verbose=not args.quiet,
                               keep=game.code_ranges, bounds=bounds, call_ranges=call_ranges,
-                              end_at_returns=game.end_at_returns, run_entries=game.run_entries)
+                              end_at_returns=game.end_at_returns, run_entries=game.run_entries,
+                              tables_anywhere=game.jump_tables_anywhere)
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     with open(output, "w", encoding="utf-8") as handle:
         json.dump(database, handle, indent=1)

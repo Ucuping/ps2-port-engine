@@ -33,6 +33,14 @@ import dataclasses
 import struct
 
 from .r5900 import DISASM, Flags, GPR
+from .signatures import written_register
+
+# The registers a call keeps (s0-s7, $gp, $sp, $fp): a value in one of them
+# outlives the calls between where it is set and where it is used.
+CALLEE_SAVED = frozenset(range(16, 24)) | {28, 29, 30}
+# The loads and stores whose offset a `lui` on their base register completes
+# into an address (lb ... sd, lq/sq, the COP1 and COP2 ones).
+_BASED_ACCESSES = frozenset(range(0x20, 0x30)) | {0x1A, 0x1B, 0x1E, 0x1F, 0x31, 0x36, 0x37, 0x39, 0x3E, 0x3F}
 
 # Confidence levels attached to each discovered function.
 CONF_ENTRY = "entry"          # the ELF entry point
@@ -88,7 +96,8 @@ class ImageAnalyzer:
     """Recovers functions and code/data boundaries from a flat loaded image."""
 
     def __init__(self, data: bytes, base_addr: int, entry_point: int = 0, call_ranges=None,
-                 end_at_returns: bool = False, run_entries=None) -> None:
+                 end_at_returns: bool = False, run_entries=None, data_sections=None,
+                 tables_anywhere: bool = False) -> None:
         self.data = data
         self.base = base_addr
         self.end = base_addr + len(data)
@@ -103,6 +112,17 @@ class ImageAnalyzer:
         # Code a run reached that no function covered, {address: kind}
         # (game.json "run_entries"): sure starts. None: none.
         self.run_entries = dict(run_entries) if run_entries else {}
+        # A switch's table read wherever the program has bytes, and when the
+        # near reading misses it, its base and bound followed further back, or
+        # its length taken from its words (game.json "jump_tables_anywhere",
+        # _jump_table_far): the program's other loaded sections, [(bytes,
+        # address)]. Off: the code section's tables alone, as before.
+        self.tables_anywhere = tables_anywhere
+        self.data_sections = [(bytes(blob), address) for blob, address in (data_sections or ())]
+        self.tables: dict = {}            # jr -> (table, cases, bounded) of each table read
+        self.unexplained: set = set()     # jr's through a register no table explains
+        self._references = None           # what the code builds as data addresses
+        self._sure_starts = None
         self.words = struct.unpack("<%dI" % (len(data) // 4), data[: (len(data) // 4) * 4])
         self.functions: dict = {}
         self.code_bytes = bytearray(len(data))  # 1 where traversal proved code
@@ -244,11 +264,13 @@ class ImageAnalyzer:
 
                 if ins.mnemonic == "jr" and ins.rs != 31:
                     # A switch: its cases are this function's own code.
-                    targets = self.jump_table(addr, ins.rs)
+                    targets = self.jump_table(addr, ins.rs, func.start)
                     if targets:
                         queue.extend(targets)
                         self.case_targets.update(targets)
                         self.stats["jump_tables"] += 1
+                    else:
+                        self.unexplained.add(addr)
 
                 if ins.is_return:
                     func.has_return = True
@@ -263,8 +285,28 @@ class ImageAnalyzer:
     JUMP_TABLE_WINDOW = 32
     MAX_CASES = 1024
 
-    def jump_table(self, jr_addr: int, register: int):
-        """The targets of the switch that ends in `jr register`, or None.
+    def jump_table(self, jr_addr: int, register: int, func_start: int = None):
+        """The targets of the switch that ends in `jr register`, or None: as
+        _jump_table_near reads it, then, with jump_tables_anywhere, as
+        _jump_table_far does. Each table read is kept in `tables`."""
+        near = self._jump_table_near(jr_addr, register)
+        if near is not None:
+            targets, table = near
+            self.tables[jr_addr] = (table, len(targets), True)
+            return targets
+        if not self.tables_anywhere:
+            return None
+        far = self._jump_table_far(jr_addr, register, self.base if func_start is None else func_start)
+        if far is None:
+            return None
+        targets, table, bounded = far
+        self.tables[jr_addr] = (table, len(targets), bounded)
+        if not bounded:
+            self.stats["jump_tables_unbounded"] += 1
+        return targets
+
+    def _jump_table_near(self, jr_addr: int, register: int):
+        """(targets, table) of the switch that ends in `jr register`, or None.
 
         GCC's switch on the R5900 bounds the index, then loads the case's
         address from a table and jumps to it:
@@ -311,9 +353,195 @@ class ImageAnalyzer:
             return None
         targets = []
         for i in range(bound):
-            target = self.word_at(table + 4 * i)
-            if not self.contains(target) or target % 4:
+            target = self._table_word(table + 4 * i)
+            if target is None or not self.contains(target) or target % 4:
                 return None             # not a table of code addresses after all
+            targets.append(target)
+        return targets, table
+
+    # -- tables anywhere (game.json "jump_tables_anywhere") ----------------
+
+    # How far back a switch's pieces are followed, and how many entries a
+    # table no bound sizes may have.
+    FAR_WINDOW = 256
+    MAX_UNBOUNDED_CASES = 256
+
+    def _table_word(self, addr: int):
+        """The word at `addr` in the image - or, with jump_tables_anywhere, in
+        any of the program's sections - or None where it has none. Off, as
+        word_at: 0 outside the image."""
+        if not self.tables_anywhere:
+            return self.word_at(addr)
+        if addr % 4:
+            return None
+        if self.contains(addr):
+            return self.word_at(addr)
+        for blob, base in self.data_sections:
+            if base <= addr and addr + 4 <= base + len(blob):
+                return struct.unpack_from("<I", blob, addr - base)[0]
+        return None
+
+    def _section_of(self, addr: int):
+        """(start, end) of the image or section holding `addr`, or None."""
+        if self.contains(addr):
+            return self.base, self.end
+        for blob, base in self.data_sections:
+            if base <= addr < base + len(blob):
+                return base, base + len(blob)
+        return None
+
+    def _setter(self, register: int, before: int, start: int):
+        """The instruction that last set `register` before `before`, walking
+        back to `start` in address order; None past a call for a register a
+        call does not keep, or if nothing sets it within FAR_WINDOW."""
+        addr = before - 4
+        for _ in range(self.FAR_WINDOW):
+            if addr < start or not self.contains(addr):
+                return None
+            word = self.word_at(addr)
+            ins = DISASM.decode(word, addr)
+            if not ins.is_valid:
+                return None
+            if register not in CALLEE_SAVED:
+                previous = DISASM.decode(self.word_at(addr - 4), addr - 4) if addr - 4 >= start else None
+                if ins.is_call or (previous is not None and previous.is_call):
+                    return None         # the call (or its delay slot) is where it was last set
+            if not ins.is_call and written_register(word) == register:
+                return ins
+            addr -= 4
+        return None
+
+    def _constant(self, register: int, before: int, start: int, depth: int = 0):
+        """The address `register` holds before `before`, built by `lui` and
+        `addiu`/`daddiu`/`ori` or moved from another register; None if it is
+        not such a constant."""
+        if register == 0:
+            return 0
+        setter = self._setter(register, before, start)
+        if setter is None or depth > 4:
+            return None
+        m = setter.mnemonic
+        if m == "lui":
+            return (setter.imm << 16) & 0xFFFFFFFF
+        if m in ("addiu", "daddiu", "ori"):
+            up = self._constant(setter.rs, setter.addr, start, depth + 1)
+            if up is None:
+                return None
+            return (up | (setter.imm & 0xFFFF)) if m == "ori" else (up + setter.imm) & 0xFFFFFFFF
+        if m in ("addu", "daddu", "or") and 0 in (setter.rs, setter.rt):
+            return self._constant(setter.rt or setter.rs, setter.addr, start, depth + 1)
+        return None
+
+    def _bound(self, index: int, before: int, start: int):
+        """N of the `sltiu $x, index, N` that bounds a switch on `index`,
+        looked for back from `before` until `index` is set; None if none."""
+        addr = before - 4
+        for _ in range(self.FAR_WINDOW):
+            if addr < start or not self.contains(addr):
+                return None
+            word = self.word_at(addr)
+            ins = DISASM.decode(word, addr)
+            if not ins.is_valid:
+                return None
+            if ins.mnemonic == "sltiu" and ins.rs == index:
+                return ins.imm
+            if (ins.is_call and index not in CALLEE_SAVED) or written_register(word) == index:
+                return None
+            addr -= 4
+        return None
+
+    def _data_references(self) -> set:
+        """The addresses the code builds as data - a `lui` completed by an
+        `addiu`, `daddiu`, `ori`, or a load's or store's offset on the same
+        register a few instructions on - each the start of something: a
+        table, a string, a symbol."""
+        if self._references is None:
+            found, upper = set(), {}
+            for i, word in enumerate(self.words):
+                op, rs, rt = word >> 26, (word >> 21) & 31, (word >> 16) & 31
+                if op == 0x0F:
+                    upper[rt] = ((word & 0xFFFF) << 16, i)
+                    continue
+                if rs in upper and i - upper[rs][1] <= 8:
+                    imm = word & 0xFFFF
+                    signed = imm - 0x10000 if imm & 0x8000 else imm
+                    if op in (0x09, 0x19) or op in _BASED_ACCESSES:
+                        found.add((upper[rs][0] + signed) & 0xFFFFFFFF)
+                    elif op == 0x0D:
+                        found.add(upper[rs][0] | imm)
+            self._references = found
+        return self._references
+
+    def _next_sure_start(self, address: int) -> int:
+        """The first function start after `address` the analysis is sure of:
+        a call's target, the entry, a run entry that is no piece."""
+        if self._sure_starts is None:
+            starts = set(self.call_sites)
+            starts.update(a for a, kind in self.run_entries.items() if kind not in PIECE_KINDS)
+            if self.contains(self.entry_point):
+                starts.add(self.entry_point)
+            self._sure_starts = sorted(starts)
+        i = bisect.bisect_right(self._sure_starts, address)
+        return self._sure_starts[i] if i < len(self._sure_starts) else self.end
+
+    def _jump_table_far(self, jr_addr: int, register: int, func_start: int):
+        """(targets, table, bounded) of a switch the near reading misses, or
+        None. Each piece is followed back to the instruction that sets it -
+        past calls for a register a call keeps: the load into the `jr`'s
+        register, the sum of the table's address and the scaled index, the
+        address itself (Tekken 5's game program keeps one in $s3 across
+        calls), and the bound: the `sltiu` on the index before it is scaled.
+        With a bound, every target must lie in the switch's own region (from
+        its function's start to the next start the analysis is sure of);
+        without one, the table is read under _unbounded's safeguards."""
+        load = self._setter(register, jr_addr, func_start)
+        if load is None or load.mnemonic != "lw":
+            return None
+        total = self._setter(load.rs, load.addr, func_start)
+        if total is None or total.mnemonic not in ("addu", "daddu"):
+            return None
+        base = index = None
+        for first, second in ((total.rs, total.rt), (total.rt, total.rs)):
+            value = self._constant(first, total.addr, func_start)
+            if value is not None and value:
+                base, index = value, second
+                break
+        if base is None:
+            return None
+        table = (base + load.imm) & 0xFFFFFFFF
+        if self._section_of(table) is None:
+            return None
+        low, high = func_start, self._next_sure_start(jr_addr)
+        scale = self._setter(index, total.addr, func_start)
+        bound = None
+        if scale is not None and scale.mnemonic == "sll" and scale.imm == 2:
+            bound = self._bound(scale.rt, scale.addr, func_start)
+        if bound is not None and bound > 0:
+            if bound > self.MAX_CASES:
+                return None
+            targets = [self._table_word(table + 4 * i) for i in range(bound)]
+            if any(t is None or t % 4 or not low <= t < high for t in targets):
+                return None
+            return targets, table, True
+        targets = self._unbounded(table, low, high)
+        return (targets, table, False) if targets else None
+
+    def _unbounded(self, table: int, low: int, high: int):
+        """A table no bound sizes, read entry by entry while each is
+        word-aligned and names code of the switch's own region [low, high);
+        it ends at the first that does not, at its section's end, where the
+        code builds another address (another table, a symbol), or at
+        MAX_UNBOUNDED_CASES entries."""
+        start, end = self._section_of(table)
+        stops = self._data_references() | {t for t, _n, _b in self.tables.values()}
+        targets = []
+        for i in range(self.MAX_UNBOUNDED_CASES):
+            at = table + 4 * i
+            if at + 4 > end or (i and at in stops):
+                break
+            target = self._table_word(at)
+            if target is None or target % 4 or not low <= target < high:
+                break
             targets.append(target)
         return targets
 
@@ -635,31 +863,7 @@ class ImageAnalyzer:
                 1 for a in visited if func.start <= a < func.end
             )
 
-        # Code a run reached that no translation started at (game.json
-        # "run_entries"): sure starts. One inside a function found since is
-        # a start the analysis took for part of it - a `j`'s target, a
-        # pointer's - and cuts it short (_tighten_bounds); a piece inside one
-        # is that function's own - a case of its switch, a label - and a start
-        # there would cut it short wrongly: its run-time translation stays
-        # until the switch's table is read.
-        for addr in sorted(self.run_entries):
-            if not self.contains(addr):
-                self.stats["run_entries_outside"] += 1
-                continue
-            inside = any(f.start < addr < f.end for f in self.functions.values())
-            if addr in self.functions or (inside and self.run_entries[addr] in PIECE_KINDS):
-                self.stats["run_entries_covered"] += 1
-                continue
-            func = Function(start=addr, confidence=CONF_RUN, run_kind=self.run_entries[addr])
-            self.functions[addr] = func
-            visited = self.traverse(addr, func)
-            func.end = self.extent_from(addr, visited)
-            if self.end_at_returns:
-                func.end = self._cut_after_return(addr, func.end)
-            func.instruction_count = sum(
-                1 for a in visited if func.start <= a < func.end
-            )
-            self.stats["run_entries"] += 1
+        self._seed_run_entries(pieces=False)
 
         # Functions reached only through pointer tables emit no jal at all, so
         # harvest plausible pointer targets before falling back to a blind scan.
@@ -713,8 +917,42 @@ class ImageAnalyzer:
                 del self.functions[addr]
                 self.stats["switch_cases_not_functions"] += 1
 
+        self._seed_run_entries(pieces=True)
         self._tighten_bounds()
         self._compute_stats()
+
+    def _seed_run_entries(self, pieces: bool) -> None:
+        """Start a function at each run entry of one sort (game.json
+        "run_entries"): the starts right after the calls' targets, the pieces
+        last, once every function is found. A start inside a function is one
+        the analysis took for part of it - a `j`'s target, a pointer's - and
+        cuts it short (_tighten_bounds). A piece a function covers - inside
+        its extent, or code its traversal reached: a case of its switch, a
+        label - is that function's own, and a start there would cut it
+        wrongly; one none covers keeps its own translation, verified."""
+        for addr in sorted(self.run_entries):
+            kind = self.run_entries[addr]
+            if (kind in PIECE_KINDS) != pieces:
+                continue
+            if not self.contains(addr):
+                self.stats["run_entries_outside"] += 1
+                continue
+            covered = addr in self.functions or (pieces and (
+                self.code_bytes[self._index(addr)]
+                or any(f.start < addr < f.end for f in self.functions.values())))
+            if covered:
+                self.stats["run_entries_covered"] += 1
+                continue
+            func = Function(start=addr, confidence=CONF_RUN, run_kind=kind)
+            self.functions[addr] = func
+            visited = self.traverse(addr, func)
+            func.end = self.extent_from(addr, visited)
+            if self.end_at_returns:
+                func.end = self._cut_after_return(addr, func.end)
+            func.instruction_count = sum(
+                1 for a in visited if func.start <= a < func.end
+            )
+            self.stats["run_entries"] += 1
 
     def _tighten_bounds(self) -> None:
         """Clamp each function to end no later than the next function start."""

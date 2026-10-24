@@ -144,6 +144,12 @@ DEFAULTS = {
     # switch's case, a label - is counted apart, never as a function
     # (confidence_label).
     "run_entries": None,
+    # A switch's table read wherever the program has bytes - its other
+    # sections too - and when the code nearby does not show its base or
+    # bound, followed further back, or sized by its words under safeguards
+    # (analysis.py, _jump_table_far); each table read and each jump through
+    # a register no table explains is reported (analyze.py).
+    "jump_tables_anywhere": False,
 }
 
 
@@ -180,6 +186,8 @@ class Game:
     # table it is read from, None for a game without one.
     run_entries: dict = dataclasses.field(default_factory=dict)
     run_entries_path: "str | None" = None
+    # game.json's "jump_tables_anywhere".
+    jump_tables_anywhere: bool = False
 
     def path(self, relative: str) -> str:
         return os.path.normpath(os.path.join(self.directory, relative))
@@ -239,7 +247,8 @@ def load(directory: str) -> Game:
                 eh_frame_boundaries=bool(values["eh_frame_boundaries"]),
                 calls_from_code_only=bool(values["calls_from_code_only"]),
                 end_at_returns=bool(values["end_at_returns"]),
-                cop0_status=bool(values["cop0_status"]))
+                cop0_status=bool(values["cop0_status"]),
+                jump_tables_anywhere=bool(values["jump_tables_anywhere"]))
     if values["confirmed"]:
         game.confirmed_path = game.path(values["confirmed"])
         game.confirmed = read_confirmed(game.confirmed_path)

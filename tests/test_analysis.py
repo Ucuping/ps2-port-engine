@@ -148,6 +148,101 @@ class TestScheduledEntry(unittest.TestCase):
         self.assertNotIn(BASE + 8, self.run_on(words))
 
 
+class TestTablesAnywhere(unittest.TestCase):
+    """A switch's table read wherever the program has bytes (game.json
+    "jump_tables_anywhere"): in another section, with its base kept in a
+    callee-saved register across a call, and - with no bound in sight - read
+    entry by entry under safeguards, flagged as such."""
+
+    TABLE = 0x00200000                  # in a section of its own, past the code
+    SLTIU_V0_V1_2 = 0x2C620002
+    BEQ_V0_DEFAULT = 0x1040000A         # beq $v0, $zero, 0x38 (from 0x10)
+
+    def switch(self, bound=True):
+        """lui $s3, 0x20; jal; [sltiu $v0, $v1, 2]; beq $v0, $zero, default;
+        sll $v0, $v1, 2; addiu $v1, $s3, 0; addu $v0, $v0, $v1; lw $a0, 0($v0);
+        jr $a0 - Tekken 5's game program at 0x004881C4 - cases at 0x30, 0x38."""
+        return [0x3C130020, 0x0C000000 | ((BASE + 0x100) >> 2), NOP,
+                self.SLTIU_V0_V1_2 if bound else NOP, self.BEQ_V0_DEFAULT, NOP,
+                0x00031080, 0x26630000, 0x00431021, 0x8C440000, 0x00800008, NOP,
+                JR_RA, NOP, JR_RA, NOP] + [NOP] * 48
+
+    def analyzer(self, words, table, anywhere=True, run_entries=None, cls=ImageAnalyzer):
+        blob = struct.pack("<%dI" % len(table), *table)
+        return cls(struct.pack("<%dI" % len(words), *words), BASE, BASE, run_entries=run_entries,
+                   data_sections=[(blob, self.TABLE)], tables_anywhere=anywhere)
+
+    def test_a_table_in_another_section(self):
+        # The near form (TestSwitches), its table moved out of the code.
+        words = list(TestSwitches.CODE) + [NOP] * (0x40 - len(TestSwitches.CODE))
+        words[3], words[5] = 0x3C030020, 0x24630000         # lui $v1, 0x20; addiu $v1, $v1, 0
+        cases = [BASE + 0x28, BASE + 0x34]
+        self.assertIsNone(self.analyzer(words, cases, anywhere=False).jump_table(BASE + 0x20, 2))
+        a = self.analyzer(words, cases)
+        self.assertEqual(a.jump_table(BASE + 0x20, 2, BASE), cases)
+        self.assertEqual(a.tables[BASE + 0x20], (self.TABLE, 2, True))
+
+    def test_a_base_kept_across_a_call(self):
+        a = self.analyzer(self.switch(), [BASE + 0x30, BASE + 0x38])
+        self.assertEqual(a.jump_table(BASE + 0x28, 4, BASE), [BASE + 0x30, BASE + 0x38])
+        self.assertEqual(a.tables[BASE + 0x28], (self.TABLE, 2, True))
+
+    def test_without_a_bound_read_while_the_entries_name_the_switch(self):
+        cases = [BASE + 0x30, BASE + 0x38]
+        a = self.analyzer(self.switch(bound=False), cases + [0x00300000, BASE + 0x30])
+        self.assertEqual(a.jump_table(BASE + 0x28, 4, BASE), cases)
+        self.assertEqual(a.tables[BASE + 0x28], (self.TABLE, 2, False))    # flagged: no bound
+
+    def test_the_safeguards_end_an_unbounded_table(self):
+        switch = self.switch(bound=False)
+        one = [BASE + 0x30]
+        # An entry not word-aligned.
+        self.assertEqual(self.analyzer(switch, one + [BASE + 0x3A]).jump_table(BASE + 0x28, 4, BASE), one)
+        # The section's end.
+        self.assertEqual(self.analyzer(switch, one).jump_table(BASE + 0x28, 4, BASE), one)
+        # Where the code builds another address: lui $t0, 0x20; addiu $t0, $t0, 4.
+        other = switch[:0x30] + [0x3C080020, 0x25080004] + switch[0x32:]
+        self.assertEqual(self.analyzer(other, one + [BASE + 0x38]).jump_table(BASE + 0x28, 4, BASE), one)
+        # The next start the analysis is sure of ends the switch's region.
+        self.assertEqual(self.analyzer(switch, one + [BASE + 0x38], run_entries={BASE + 0x38: "pointer"})
+                         .jump_table(BASE + 0x28, 4, BASE), one)
+
+        class Small(ImageAnalyzer):
+            MAX_UNBOUNDED_CASES = 1
+        self.assertEqual(self.analyzer(switch, one + [BASE + 0x38], cls=Small).jump_table(BASE + 0x28, 4, BASE),
+                         one)
+
+
+class TestTableReport(unittest.TestCase):
+    """analyze.py reports the tables read and the jumps through a register no
+    table explains (a player's build's risky sites) - with jump_tables_anywhere."""
+
+    def test_the_tables_and_the_unexplained_jumps(self):
+        import tempfile
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from test_port import tiny_elf, SHF_ALLOC, SHF_EXECINSTR, SHT_PROGBITS
+        import analyze
+        code = [0x2C810002, 0x1020000A, NOP, 0x3C030011, 0x00042080, 0x24630000, 0x00832021, 0x8C820000,
+                0x00400008, NOP,
+                0x0C040010, NOP,            # case 0: jal 0x00100040
+                JR_RA, NOP,                 # default
+                JR_RA, NOP,                 # case 1
+                0x24420001, 0x03200008, NOP]    # 0x00100040: addiu $v0, $v0, 1; jr $t9, a tail call
+        image = tiny_elf([
+            (".text", BASE, struct.pack("<%dI" % len(code), *code), SHF_ALLOC | SHF_EXECINSTR, SHT_PROGBITS),
+            (".rodata", 0x00110000, struct.pack("<2I", BASE + 0x28, BASE + 0x38), SHF_ALLOC, SHT_PROGBITS)])
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "TEST.ELF")
+            with open(path, "wb") as handle:
+                handle.write(image)
+            plain = analyze.build_database(path, verbose=False)
+            wide = analyze.build_database(path, verbose=False, tables_anywhere=True)
+        self.assertNotIn("jump_tables", plain)
+        self.assertEqual(wide["jump_tables"], [{"jr": BASE + 0x20, "table": 0x00110000, "cases": 2,
+                                                "bounded": True}])
+        self.assertEqual(wide["unexplained_jumps"], [BASE + 0x44])
+
+
 class TestRunEntries(unittest.TestCase):
     """Code a run reached that no function covered (game.json "run_entries"):
     a sure start, with how the run reached it - unless a function covers it."""
