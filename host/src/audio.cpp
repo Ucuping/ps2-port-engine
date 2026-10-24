@@ -24,10 +24,12 @@
  * PS2HOST_AUDIO_LATENCY_MS=n: the ring's target, 20 to 250 ms.
  * PS2HOST_AUDIO_WAVEOUT=1: the wave device even where WASAPI would open.
  *
- * Outside Windows there is no device yet: OpenAudio says none opened and the
- * run is silent, as one without --audio is. The SPU2 keeps the engine's clock
- * whether anything plays it (spu2.cpp), so the game's timing is the same;
- * --audio-wav records it here too.
+ * Outside Windows the device is SDL 3's (Core Audio on macOS): SDL's audio
+ * thread asks for what the device needs and Render answers from the same ring,
+ * at the same controlled rate. Where SDL is not built in (no PS2HOST_VULKAN)
+ * OpenAudio says none opened and the run is silent, as one without --audio is.
+ * The SPU2 keeps the engine's clock whether anything plays it (spu2.cpp), so
+ * the game's timing is the same; --audio-wav records it either way.
  */
 
 #ifdef _WIN32
@@ -55,6 +57,10 @@
 #include "ps2host/music.h"
 #include "ps2host/run.h"
 #include "ps2host/timeline.h"
+
+#if !defined(_WIN32) && PS2HOST_VULKAN
+#include <SDL3/SDL.h>
+#endif
 
 #ifdef _WIN32
 #pragma comment(lib, "winmm.lib")
@@ -107,10 +113,14 @@ struct Device {
     float last[2] = {0, 0};             // the last frame played: faded out from
     unsigned fade = 0;                  // frames left of a fade in
 
+    void (*close_backend)() = nullptr;  // a device without a thread of ours (SDL's)
+
     ~Device() { Close(); }
     void Close() {
         stop = true;
         if (thread.joinable()) thread.join();
+        if (close_backend) close_backend();
+        close_backend = nullptr;
         open = false;
         if (!wav) return;
         WriteHeader(unsigned(wav_frames * 4));
@@ -389,11 +399,60 @@ void RunWaveOut(Device& d) {
     waveOutClose(out);
     CloseHandle(event);
 }
+#elif PS2HOST_VULKAN
+
+// ---------------------------------------------------------------- SDL 3
+
+SDL_AudioStream* g_sdl_stream = nullptr;
+
+// SDL's audio thread, when the device wants `additional` more bytes: that much
+// from the ring, as float stereo at 48 kHz (SDL converts to the device's).
+void SDLCALL SdlWants(void* user, SDL_AudioStream* stream, int additional, int /*total*/) {
+    Device& d = *static_cast<Device*>(user);
+    const unsigned frames = additional > 0 ? unsigned(additional) / 8 : 0;
+    if (!frames) return;
+    static thread_local std::vector<float> buffer;
+    buffer.resize(2 * std::size_t(frames));
+    d.Render(buffer.data(), frames);
+    SDL_PutAudioStreamData(stream, buffer.data(), int(frames * 8));
+}
+
+void CloseSdl() {
+    SDL_DestroyAudioStream(g_sdl_stream);
+    g_sdl_stream = nullptr;
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+}
+
+bool RunSdl(Device& d) {
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        std::fprintf(stderr, "[audio] no sound device (SDL: %s)\n", SDL_GetError());
+        return false;
+    }
+    const SDL_AudioSpec spec{SDL_AUDIO_F32, 2, kRate};
+    g_sdl_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, SdlWants, &d);
+    if (!g_sdl_stream) {
+        std::fprintf(stderr, "[audio] no sound device (SDL: %s)\n", SDL_GetError());
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+        return false;
+    }
+    SDL_AudioSpec device{};
+    int device_frames = 0;
+    SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(g_sdl_stream), &device, &device_frames);
+    std::fprintf(stderr, "[audio] playing (SDL, %s: %d Hz, %d channel(s), %.0f ms buffer, %u ms target)\n",
+                 SDL_GetCurrentAudioDriver(), device.freq, device.channels,
+                 device.freq ? 1000.0 * device_frames / device.freq : 0.0, d.target_frames * 1000 / kRate);
+    d.close_backend = CloseSdl;
+    SDL_ResumeAudioStreamDevice(g_sdl_stream);
+    return true;
+}
+
 #endif  // _WIN32
 
 }  // namespace
 
 void CloseAudio() { D().Close(); }
+
+unsigned long long AudioFramesTaken() { return D().ring.read.load(std::memory_order_acquire); }
 
 bool OpenAudio() {
     Device& d = D();
@@ -408,9 +467,12 @@ bool OpenAudio() {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         if (wave_only || !RunWasapi(d)) RunWaveOut(d);
     });
+#elif PS2HOST_VULKAN
+    (void)wave_only;
+    d.opened = RunSdl(d) ? 1 : -1;
 #else
     (void)wave_only;
-    d.opened = -1;                      // no device here yet: silent
+    d.opened = -1;                      // no device without SDL: silent
 #endif
     // Until the thread says whether a device opened.
     while (d.opened.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));

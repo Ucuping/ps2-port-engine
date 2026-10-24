@@ -233,6 +233,11 @@ ELF loader's one, ReferSemaStatus's five).
   STC: without the stop its title and its fight's HUD were drawn from
   textures not yet uploaded. INTC causes a device posts (`PostIntc`) are
   delivered as DMA completions are, before them.
+- Sound outside Windows through SDL 3 (Core Audio on macOS): SDL's audio
+  thread asks for what the device needs and the same ring answers, at the
+  same controlled rate, as WASAPI's event does; Windows keeps WASAPI and
+  waveOut. Without SDL built in (no PS2HOST_VULKAN) a run is silent as
+  before. Tested on SDL's dummy audio driver (`ps2host_sdl_tests`).
 - The EE kernel runs an INTC or DMAC handler, or an alarm's callback, with
   the `$gp` its code had when it was registered (AddIntcHandler,
   AddDmacHandler, SetAlarm), not the interrupted code's - as Play!'s EE

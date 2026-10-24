@@ -4,7 +4,8 @@
  * window that is a surface in memory - the offscreen one asks macOS for EGL)
  * and its software renderer, so they need no screen: the picture's colours as
  * the GS gives them (BGRA words), its aspect in the window, the window's
- * close, and a gamepad - SDL's virtual one - read as a DualShock 2.
+ * close, and a gamepad - SDL's virtual one - read as a DualShock 2. And the
+ * sound device (audio.cpp), on SDL's dummy audio driver.
  */
 
 #include <SDL3/SDL.h>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "platform/sdl_display.h"
+#include "ps2host/run.h"
 
 namespace {
 
@@ -128,6 +130,22 @@ void ClosingTheWindowEndsIt(ps2gpu::Display& display) {
 
 }  // namespace
 
+// The sound device outside Windows is SDL's: on its dummy driver, which takes
+// samples at a device's pace with nothing to hear, the SPU2's frames go from
+// the ring to the device, and closing it stops it.
+void TheSoundGoesToTheDevice() {
+    SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
+    Check(ps2host::OpenAudio(), "sound: the device opens");
+    std::vector<short> tone(2 * 4800, 1000);        // 100 ms of something quiet
+    const unsigned long long before = ps2host::AudioFramesTaken();
+    for (int k = 0; k < 4; ++k) ps2host::AudioFrames(tone.data(), 4800);
+    SDL_Delay(400);
+    const unsigned long long taken = ps2host::AudioFramesTaken() - before;
+    Check(taken > 0 && taken <= 4 * 4800, "sound: the device takes the SPU2's frames, no more than it was given");
+    ps2host::CloseAudio();
+    Check(!ps2host::AudioActive(), "sound: closed");
+}
+
 int main() {
     SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
@@ -143,6 +161,7 @@ int main() {
     ThePictureIsShownAtItsAspect(*display);
     AGamepadReadsAsADualShock(*display);
     ClosingTheWindowEndsIt(*display);
+    TheSoundGoesToTheDevice();
     display.reset();
     SDL_Quit();
     if (g_failures) {

@@ -689,6 +689,8 @@ bool OpenAudio();
 /* Stops the sound and finishes the WAV recording (--audio-wav), before the
    process ends. */
 void CloseAudio();
+/* The frames the sound device has taken from the SPU2's ring so far. */
+unsigned long long AudioFramesTaken();
 /* The pad's report held as it last was (true), the presses made meanwhile
    shown at the next report not held: for a game whose menus run only in
    some of the frames that read the pad (a high frame rate's frames between
