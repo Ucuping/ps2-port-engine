@@ -1551,6 +1551,41 @@ void EeSemaphoresReportTheirState() {
     ps2host::ThreadSyscall(c, 0x41, result);                         // DeleteSema
 }
 
+// An interrupt handler runs with the $gp its code had when it was registered,
+// not the interrupted code's: Tekken 5's MPEG library runs its callbacks with
+// $gp 0, and its vertical blank handler read its data through $gp.
+u32 g_handler_gp = 0;
+void HandlerSeesGp(lifted::Context& c) { g_handler_gp = u32(c.r[28]); }
+
+void InterruptHandlersRunWithTheirGp() {
+    static const ps2host::FunctionEntry table[] = {{0x00610000u, HandlerSeesGp, "handler", 8u}};
+    ps2host::RegisterFunctions(table, 1);
+    lifted::Context c{};
+    u64 id = 0, ok = 0;
+    const u32 cause = 30, channel = 15;             // neither a real one: no other handler
+    c.r[28] = 0x00158870u;                          // the registering code's $gp
+    c.r[4] = cause, c.r[5] = 0x00610000u, c.r[6] = 0, c.r[7] = 0;
+    ps2host::ThreadSyscall(c, 0x10, id);            // AddIntcHandler
+    ps2host::ThreadSyscall(c, 0x14, ok);            // _EnableIntc
+    ps2host::RaiseIntc(cause);
+    Check(g_handler_gp == 0x00158870u, "an INTC handler runs with its registrant's $gp");
+    c.r[4] = cause, c.r[5] = u32(id);
+    ps2host::ThreadSyscall(c, 0x11, ok);            // RemoveIntcHandler
+    ps2host::ThreadSyscall(c, 0x15, ok);            // _DisableIntc
+    ps2host::ClearIntcStat(1u << cause);
+    g_handler_gp = 0;
+    c.r[28] = 0x00234560u;
+    c.r[4] = channel, c.r[5] = 0x00610000u;
+    ps2host::ThreadSyscall(c, 0x12, id);            // AddDmacHandler
+    ps2host::ThreadSyscall(c, 0x16, ok);            // _EnableDmac
+    ps2host::RaiseDmac(channel);
+    Check(g_handler_gp == 0x00234560u, "a DMAC handler runs with its registrant's $gp");
+    c.r[4] = channel, c.r[5] = u32(id);
+    ps2host::ThreadSyscall(c, 0x13, ok);            // RemoveDmacHandler
+    ps2host::ThreadSyscall(c, 0x17, ok);            // _DisableDmac
+    ps2host::RegisterFunctions(nullptr, 0);
+}
+
 // The heap refuses what no free block holds, as sysmem does: 0xFFFFFFFF too
 // (Tekken 5 asks the EE's IOP heap for it), which rounded up to 16 bytes once
 // wrapped to a block of none, and was given.
@@ -2570,6 +2605,7 @@ int main() {
     IopPoolsLendAndTakeBack();
     IopHeapRefusesWhatItCannotHold();
     EeSemaphoresReportTheirState();
+    InterruptHandlersRunWithTheirGp();
     IopThreadsAreReportedAsThbaseDoes();
     IopSetjmpReturnsTwice();
     IopReadsTheDiscAsCdvdmanAndIomanDo();

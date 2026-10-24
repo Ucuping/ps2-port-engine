@@ -108,6 +108,7 @@ struct Semaphore {
 
 struct Handler {
     u32 cause, function, argument;      // cause: the INTC cause, or the DMA channel
+    u32 gp;                             // the $gp its code had when it was registered
 };
 
 // INTC causes the frame delivers: vertical blank start and end.
@@ -149,7 +150,7 @@ struct Scheduler {
     // SetAlarm: a callback after a number of horizontal blanks (15,734 a
     // second, NTSC), run in interrupt context when the host clock passes it.
     // The timer thread wakes for the next one, as for a timer interrupt.
-    struct Alarm { u32 callback, common, time; u64 due_ns; };
+    struct Alarm { u32 callback, common, time; u64 due_ns; u32 gp; };
     std::map<s32, Alarm> alarms;
     s32 next_alarm = 1;
     std::mutex alarms_lock;                 // the timer thread reads the next due time
@@ -218,9 +219,12 @@ bool RunHandlers(const std::map<u32, Handler>& handlers, u32 cause) {
         c.r[5] = h.argument;
         c.r[29] = 0x01F80000u;                  // an interrupt stack clear of the threads'
         c.r[31] = 0;
-        // The kernel leaves $gp as the interrupted code had it: the program's.
-        if (s.current) c.r[28] = s.current->context.r[28];
-        else if (!s.threads.empty()) c.r[28] = s.threads.begin()->second->context.r[28];
+        // The kernel gives a handler the $gp its code had when it was
+        // registered, not the interrupted code's (Play!'s EE kernel; ps2sdk's
+        // alarm patch for alarms): Tekken 5's MPEG library runs its own
+        // callbacks with $gp 0, and a vertical blank among them read its
+        // data through it.
+        c.r[28] = h.gp;
         c.budget = StopRequested() ? -1 : s.loop_budget;     // a handler stops too
         const bool nested = s.in_interrupt;
         s.in_interrupt = true;
@@ -257,8 +261,7 @@ bool DeliverAlarms() {
         c.r[6] = alarm.common;
         c.r[29] = 0x01F80000u;
         c.r[31] = 0;
-        if (s.current) c.r[28] = s.current->context.r[28];
-        else if (!s.threads.empty()) c.r[28] = s.threads.begin()->second->context.r[28];
+        c.r[28] = alarm.gp;                     // SetAlarm's caller's, as for a handler
         c.budget = StopRequested() ? -1 : s.loop_budget;
         const bool nested = s.in_interrupt;
         s.in_interrupt = true;
@@ -1010,7 +1013,7 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
             const u32 time = a0 & 0xFFFF;
             std::lock_guard<std::mutex> hold(s.alarms_lock);
             const s32 id = s.next_alarm++;
-            s.alarms[id] = {a1, u32(c.r[6]), time, NowNs() + u64(double(time) * 1e9 / 15734.25)};
+            s.alarms[id] = {a1, u32(c.r[6]), time, NowNs() + u64(double(time) * 1e9 / 15734.25), u32(c.r[28])};
             result = u64(s64(id));
             if (!s.in_interrupt) RequestDelivery();   // one already due runs at once
             return true;
@@ -1231,7 +1234,7 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
         }
         case 0x10: case -0x10: {                     // AddIntcHandler(cause, handler, next, arg)
             const u32 id = s.next_handler++;
-            s.handlers[id] = Handler{a0, a1, u32(c.r[7])};
+            s.handlers[id] = Handler{a0, a1, u32(c.r[7]), u32(c.r[28])};
             result = id;
             return true;
         }
@@ -1241,7 +1244,7 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
             return true;
         case 0x12: case -0x12: {                     // AddDmacHandler(channel, handler, next, arg)
             const u32 id = s.next_handler++;
-            s.dmac_handlers[id] = Handler{a0, a1, u32(c.r[7])};
+            s.dmac_handlers[id] = Handler{a0, a1, u32(c.r[7]), u32(c.r[28])};
             result = id;
             return true;
         }
