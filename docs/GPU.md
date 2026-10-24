@@ -262,3 +262,55 @@ for one; none is made in the middle of a race. Scripted runs keep no cache
 and make every pipeline at once, so their pictures test the specialised
 shaders. `PS2HOST_PIPELINE_LOG=1` logs each pipeline made and how long it
 took; `PS2HOST_GPU_UBERSHADER=1` draws everything with the whole shader.
+
+## A game's own effects (2026-10-21)
+
+A port can add effects of the PC's to the game's frame: ambient occlusion,
+a motion blur, a glow, a grade. They run on the scene's target and depth
+buffer, at the internal resolution, at the point of the frame where they
+belong, so that they apply before the game's HUD.
+
+**Markers in the GS stream.** The game's port writes A+D register writes to
+GS addresses 0x70-0x7E into the game's own packets (from an override of the
+game function where the effect belongs):
+
+- 0x70-0x7D are the parameters: FRAME, ZBUF, the view's rectangle, and 22
+  floats of the effect's own.
+- 0x7E runs the effect.
+
+No GS has those addresses: the console, PCSX2 and the software GS ignore
+them. `Gs::on_effect` hands them to the bridge (`OnEffect`). It finds the
+target and its depth buffer as a draw would, then calls
+`GsRenderer::RunEffect` in turn with the draws. Because the markers are in
+the stream, a capture's `replay.bin` has them too, so an effect can be tuned
+on a replay in seconds:
+
+- `PS2HOST_EFFECT_SET=id.n=value,...` sets a parameter;
+- `PS2HOST_EFFECT_LOG=1` logs each effect run;
+- `PS2HOST_EFFECT_SKIP=ids` skips effects (to time each one);
+- `PS2HOST_GPU_NO_EFFECTS=1` turns them all off.
+
+**The passes.** `gpu/src/effects.cpp` runs `shaders/effects.comp` (one
+`PASS` each) with scratch images of its own:
+
+| Effect | Passes |
+| --- | --- |
+| `kOcclusion` | Scalable AO at half resolution with a bilateral blur and a depth-aware upsample; optional sun shadows by ray-marching the depth buffer |
+| `kMotionBlur` | Reprojection with the previous view (a 3x4 matrix) and a sphere around the player's vehicle kept sharp |
+| `kBloom` | A 6-level soft-knee chain, then the grade |
+| `kGrade` | The grade alone |
+
+**Out of the stream** (game settings; they reach a replay only through the
+environment):
+
+- `SetGpuScaleRule(fbp_begin, fbp_end, max_fbw)`: small targets in that
+  range are drawn at the internal resolution (a game's reflection maps).
+- `SetGpuDrawTag(tbp, tag)`: draws sampling that texture are tagged. Bit 0
+  scales the colour by a Fresnel term from the texel's sphere-map radius.
+- `SetGpuModernTextures(on)`: mipmapped textures take their level from the
+  screen, trilinear and anisotropic (tag bit 1;
+  `PS2HOST_MODERN_TEXTURES=1` for a replay).
+- `GpuName()` lets a game weigh its defaults by the GPU.
+
+Burnout 3's use of all this: games/burnout3/port/graphics.cpp, FINDINGS
+"Modern graphics".

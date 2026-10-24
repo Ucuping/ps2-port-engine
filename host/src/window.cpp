@@ -314,6 +314,7 @@ void HostTriggerEffects(const HostTriggerEffect& left, const HostTriggerEffect& 
             t.start = e.start;
             t.force = e.force;
             t.frequency = e.frequency;
+            for (int i = 0; i < 10; ++i) t.zones[i] = e.zones[i];
             return t;
         };
         g_display->SetTriggerEffects(effect(left), effect(right));

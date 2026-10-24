@@ -43,6 +43,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <cmath>
 #include <cstdio>
@@ -81,6 +82,48 @@ std::vector<u32> g_pipeline_hints;      // SetGpuPipelineHints
 }  // namespace
 
 void SetGpuPipelineHints(const u32* keys, std::size_t count) { g_pipeline_hints.assign(keys, keys + count); }
+
+namespace {
+// SetGpuDrawTag's: the textures (TBP) whose draws a game tags, and the tags.
+std::atomic<u32> g_tag_tbp{~0u}, g_tag_bits{0};
+// SetGpuScaleRule's, as asked and as the renderer has it.
+std::atomic<u32> g_rule_begin{0}, g_rule_end{0}, g_rule_fbw{0};
+}  // namespace
+
+// (PS2HOST_MODERN_TEXTURES=1: on from the start - a capture's replay)
+std::atomic<bool> g_modern_textures{std::getenv("PS2HOST_MODERN_TEXTURES") != nullptr};
+void SetGpuModernTextures(bool on) { g_modern_textures = on; }
+// SetGpuTextureFilter's: the filter (0 the game's) and the anisotropic taps'
+// log2 (GsDrawState::tag bits 8-10).
+std::atomic<int> g_texture_filter{0}, g_texture_taps{3};
+void SetGpuTextureFilter(int filter, int taps) {
+    int log2 = 0;
+    while (log2 < 4 && (2 << log2) <= taps) ++log2;
+    g_texture_filter = filter;
+    g_texture_taps = filter == 4 ? log2 : 0;
+}
+
+std::string g_gpu_name;         // GpuName
+std::string GpuName() { return g_gpu_name; }
+
+// SetGpuSoftParticles' textures (up to four TBPs; 0 none), and whether the
+// frame's view has had its effects (the soft particles' depth saved).
+std::atomic<u32> g_soft_tbp[4] = {};
+bool g_after_effects = false;
+void SetGpuSoftParticles(const u32* tbps, std::size_t count) {
+    for (std::size_t i = 0; i < 4; ++i) g_soft_tbp[i] = i < count ? tbps[i] : 0u;
+}
+
+void SetGpuDrawTag(u32 tbp, u32 tag) {
+    g_tag_bits = tag;
+    g_tag_tbp = tag ? tbp : ~0u;
+}
+
+void SetGpuScaleRule(u32 fbp_begin, u32 fbp_end, u32 max_fbw) {
+    g_rule_begin = fbp_begin;
+    g_rule_end = fbp_end;
+    g_rule_fbw = max_fbw;
+}
 
 #if PS2HOST_VULKAN
 
@@ -916,10 +959,12 @@ bool Replace(Bridge& b, Cached& t) {
     t.pack_pending = pending;
     if (!image) return false;
     // One image on the GPU for every texture it replaces.
-    if (!b.renderer->HasReplacement(image->id) &&
-        !b.renderer->UploadReplacement(image->id, image->format, image->width, image->height, image->levels,
-                                       image->data.data(), image->data.size()))
-        return false;
+    if (!b.renderer->HasReplacement(image->id)) {
+        const TimelineStep step("pack: a replacement uploaded");
+        if (!b.renderer->UploadReplacement(image->id, image->format, image->width, image->height, image->levels,
+                                           image->data.data(), image->data.size()))
+            return false;
+    }
     ++g_mutations;
     b.renderer->UseReplacement(t.renderer_key, image->id);
     t.replaced = true;
@@ -1519,6 +1564,116 @@ bool Shuffle(Bridge& s, const gs::Gs::DrawCall& call, const gs::Context& c, u32 
     return true;
 }
 
+/* A PC effect (gs.h's on_effect): the run register's value - the effect in
+   bits 0-7, its flags in 8-31 - and the 14 parameters: 0 FRAME, 1 ZBUF (the
+   target and depth buffer it works on, as the game draws the view; a ZBUF
+   of 0 none), 2 the view's rectangle (x0, y0, x1, y1: 16 bits each, ends
+   exclusive), 3-13 the effect's own 22 floats (two a parameter, the low
+   word first). Each image found as a draw finds its own - player 2's
+   target rows into player 1's - brought up to date, the effect run on the
+   GPU in turn with the draws, and the target then newer than memory. */
+void OnEffect(u64 run, const u64* p) {
+    Bridge& s = *g_bridge;
+    static const bool log = std::getenv("PS2HOST_EFFECT_LOG") != nullptr;
+    const u32 fbp = Bits(p[0], 0, 9), fbw = std::max(1u, Bits(p[0], 16, 6)), psm = Bits(p[0], 24, 6);
+    auto skip = [&](const char* why) {
+        if (log) std::fprintf(stderr, "[effect] %u on %X/%u/%02X skipped: %s\n", unsigned(run & 0xFF), unsigned(fbp),
+                              unsigned(fbw), unsigned(psm), why);
+    };
+    if (!s.primary || !s.renderer->CanRunEffects()) return skip("no effects here");
+    static const bool off = std::getenv("PS2HOST_GPU_NO_EFFECTS") != nullptr;
+    if (off) return;
+    // PS2HOST_EFFECT_SKIP=1,3: those effects not run (what each costs).
+    static const std::string skips = std::getenv("PS2HOST_EFFECT_SKIP") ? std::getenv("PS2HOST_EFFECT_SKIP") : "";
+    if (!skips.empty() && ("," + skips + ",").find("," + std::to_string(run & 0xFF) + ",") != std::string::npos)
+        return;
+    if (psm != gs::PSMCT32 && psm != gs::PSMCT24) return skip("its format");
+    u32 down = 0;
+    Owned* target = nullptr;
+    if (auto at = s.owned.find(std::make_tuple(fbp, fbw, psm, false)); at != s.owned.end() && at->second.width)
+        target = &at->second;
+    if (!target) target = Containing(s, fbp, fbw, psm, &down);
+    if (!target || !target->width) return skip("no target");
+    Owned* depth = nullptr;
+    if (p[1]) {
+        const u32 zbp = Bits(p[1], 0, 9), zpsm = 0x30 | Bits(p[1], 24, 4);
+        // Its depth buffer: at ZBP, or as many pages into one as the
+        // target's rows are into its own (player 2's).
+        const u32 pages = fbp - target->fbp;
+        for (u32 shift : {0u, pages}) {
+            if (shift > zbp) continue;
+            auto at = s.owned.find(std::make_tuple(zbp - shift, fbw, zpsm, true));
+            if (at != s.owned.end() && at->second.width) {
+                depth = &at->second;
+                break;
+            }
+        }
+    }
+    ps2gpu::GsEffect e;
+    e.id = ps2gpu::GsEffectId(u32(run & 0xFF));
+    e.flags = u32(run >> 8) & 0xFFFFFF;
+    e.fbp = target->fbp;
+    e.fbw = target->fbw;
+    e.psm = target->psm;
+    const u32 x0 = Bits(p[2], 0, 16), y0 = Bits(p[2], 16, 16), x1 = Bits(p[2], 32, 16), y1 = Bits(p[2], 48, 16);
+    e.x0 = int(std::min(x0, target->width));
+    e.x1 = int(std::min(x1, target->width));
+    e.y0 = int(std::min(y0 + down, target->height));
+    e.y1 = int(std::min(y1 + down, target->height));
+    if (e.x1 <= e.x0 || e.y1 <= e.y0) {
+        if (log) std::fprintf(stderr, "[effect] %u: an empty view (%u,%u)-(%u,%u) in %ux%u\n", unsigned(run & 0xFF),
+                              unsigned(x0), unsigned(y0), unsigned(x1), unsigned(y1), unsigned(target->width),
+                              unsigned(target->height));
+        return;
+    }
+    for (int i = 0; i < 11; ++i) {
+        const u32 lo = u32(p[3 + i]), hi = u32(p[3 + i] >> 32);
+        std::memcpy(&e.params[2 * i], &lo, 4);
+        std::memcpy(&e.params[2 * i + 1], &hi, 4);
+    }
+    // PS2HOST_EFFECT_SET=id.n=value,...: parameter n of effect id set (to
+    // tune an effect on a capture's replay); PS2HOST_EFFECT_LOG=1 tells
+    // each effect run.
+    static const std::vector<std::tuple<u32, u32, float>> sets = [] {
+        std::vector<std::tuple<u32, u32, float>> list;
+        const char* env = std::getenv("PS2HOST_EFFECT_SET");
+        for (const char* at = env; at && *at;) {
+            unsigned id = 0, n = 0;
+            float value = 0;
+            if (std::sscanf(at, "%u.%u=%f", &id, &n, &value) == 3 && n < 22) list.emplace_back(id, n, value);
+            at = std::strchr(at, ',');
+            if (at) ++at;
+        }
+        return list;
+    }();
+    for (const auto& [id, n, value] : sets)
+        if (id == u32(e.id)) e.params[n] = value;
+    if (log) {
+        std::fprintf(stderr, "[effect] %u on %X/%u/%02X rows %u down, (%d,%d)-(%d,%d), depth %s:", unsigned(e.id),
+                     unsigned(fbp), unsigned(fbw), unsigned(psm), unsigned(down), int(x0), int(y0), int(x1), int(y1),
+                     depth ? "yes" : "no");
+        for (float v : e.params) std::fprintf(stderr, " %g", v);
+        std::fprintf(stderr, "\n");
+    }
+    Use(s, target->fbp, target->fbw, target->psm, false, target->width, target->height, 1);   // (growing neither)
+    if (depth) {
+        Use(s, depth->fbp, depth->fbw, depth->psm, true, depth->width, depth->height, 1);
+        e.depth = true;
+        e.zbp = depth->fbp;
+        e.zwidth = depth->width;
+        e.zheight = depth->height;
+    }
+    ++g_draws;
+    s.renderer->RunEffect(e);
+    // The view's scene depth saved (and AO before the fog): what follows its
+    // glow, grade or blur may be a soft particle.
+    if (e.id == ps2gpu::GsEffectId::kSceneDepth || e.id == ps2gpu::GsEffectId::kOcclusion) g_after_effects = false;
+    if (e.id == ps2gpu::GsEffectId::kBloom || e.id == ps2gpu::GsEffectId::kGrade ||
+        e.id == ps2gpu::GsEffectId::kMotionBlur)
+        g_after_effects = true;
+    Drew(s, *target, u32(e.x0), u32(e.x1), u32(e.y1), u32(e.y0));
+}
+
 void OnDraw(const gs::Gs::DrawCall& call) {
     // Timed only past the fast path below: two clock reads a primitive were
     // a twentieth of the GS thread.
@@ -1651,6 +1806,15 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     state.scissor_y1 = scissor_y1;
     state.gouraud = gouraud;
     state.textured = (call.prim >> 4) & 1;
+    if (state.textured && Bits(c.tex0, 0, 14) == g_tag_tbp.load(std::memory_order_relaxed)) state.tag = g_tag_bits;
+    if (state.textured && g_modern_textures.load(std::memory_order_relaxed)) state.tag |= 2u | 3u << 8;  // (8 taps)
+    // A soft particle: a game's particle texture, blended and depth tested,
+    // drawn after its view's effects (the scene's depth saved then).
+    if (g_after_effects && state.textured && ((call.prim >> 6) & 1) && Bits(c.test, 16, 1)) {
+        const u32 tbp = Bits(c.tex0, 0, 14);
+        for (const auto& soft : g_soft_tbp)
+            if (tbp && soft.load(std::memory_order_relaxed) == tbp) state.tag |= 4u;
+    }
     state.sprite = type == 6 && s.renderer->Scale() > 1;     // (at 1x it would only split batches)
     state.sprite_prim = type == 6;
     if (s.primary && s.Dumping()) {
@@ -1802,6 +1966,27 @@ void OnDraw(const gs::Gs::DrawCall& call) {
         // Mipmapped, per pixel (gs.frag's Sample): the levels decoded with it
         // (CachedTexture). A texture of K alone that never minifies, as before.
         state.mip = s.primary && !state.texture_target ? gs::MipMode(c) : 0;
+        // The player's filtering (SetGpuTextureFilter), on the 3D draws.
+        const int filter = g_texture_filter.load(std::memory_order_relaxed);
+        if (filter && type != 6 && !state.texture_target) {
+            u32 m = state.mip;
+            constexpr u32 kMmin = 7u << 5, kMmag = 1u << 8;
+            state.tag &= ~(2u | 7u << 8 | 3u << 11);
+            // (bits 11-12 the filter, 1 nearest, 2 bilinear, 3 trilinear or
+            // anisotropic - for a texture pack's replacement, which has
+            // levels of its own whether or not the game's texture has)
+            state.tag |= u32(std::min(filter, 3)) << 11;
+            if (filter == 1) {                  // nearest: the nearest level's nearest texel
+                state.bilinear = false;
+                if (m) m = (m & ~(kMmin | kMmag)) | 2u << 5;
+            } else {                            // bilinear in a level; trilinear and anisotropic as modern
+                state.bilinear = true;
+                if (m) m = (m & ~kMmin) | kMmag | (filter == 2 ? 4u : 5u) << 5;
+                if (filter >= 3) state.tag |= u32(g_texture_taps.load(std::memory_order_relaxed)) << 8;
+                if (m && filter >= 3) state.tag |= 2u;
+            }
+            state.mip = m;
+        }
         state.wms = Bits(c.clamp, 0, 2);
         state.wmt = Bits(c.clamp, 2, 2);
         state.minu = Bits(c.clamp, 4, 10);
@@ -2043,6 +2228,33 @@ void Rescale(Bridge& b, u32 scale) {
     std::fprintf(stderr, "[gpu] internal resolution: %ux\n", unsigned(scale));
 }
 
+/* The game's scale rule changed: as Rescale, the images dropped and back
+   from memory. */
+void RescaleRule(Bridge& b, u32 fbp_begin, u32 fbp_end, u32 max_fbw) {
+    const u32 scale = b.renderer->Scale();
+    for (auto& [key, o] : b.owned)
+        if (o.gpu_newer) WriteBack(b, o);
+    b.renderer->SetScaleRule(fbp_begin, fbp_end, max_fbw);
+    b.renderer->SetScale(scale);
+    for (auto& [key, o] : b.owned) {
+        o.stale = true;
+        o.stale_beyond = false;
+        o.why = 0;
+        o.by16 = false;
+        o.stale_row0 = 0;
+        o.stale_row1 = ~0u;
+        o.stale_pages.set();
+        o.gpu_newer = false;
+        o.dirty_begin = ~0u;
+        o.dirty_end = 0;
+        o.dirty_pages.reset();
+        o.rect_dirty = false;
+        o.checked = 0;
+    }
+    ++b.newer_epoch;
+    ++g_mutations;
+}
+
 void PresentGpuPicture(ps2gpu::Display& display, u64 due_ns) {
     u32 fbp = 0, fbw = 0, psm = 0;
     if (g_bridge && gs::TheGs().Displayed(&fbp, &fbw, &psm)) {
@@ -2120,6 +2332,7 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     bridge.targets_as_textures = mode == GpuMode::ShadowRtt;
     gs::Gs& g = gs::TheGs();
     g.on_draw = OnDraw;
+    g.on_effect = OnEffect;
     if (bridge.primary) {
         g.rasterize = false;
         g.on_memory = [](u32 begin, u32 end, bool write) {
@@ -2168,13 +2381,22 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
             PresentWaiting();               // the last frame's, nothing having moved it on
             GpuShadowFrame(frame, std::string());
             // The internal resolution, between frames (the GS thread's).
+            g_after_effects = false;
             const u32 scale = WantedScale(WindowDisplay());
             if (scale != g_bridge->renderer->Scale()) Rescale(*g_bridge, scale);
+            // The game's scale rule (SetGpuScaleRule), between frames too.
+            static u32 rule[3] = {};
+            const u32 wanted[3] = {g_rule_begin, g_rule_end, g_rule_fbw};
+            if (std::memcmp(rule, wanted, sizeof rule) != 0) {
+                std::memcpy(rule, wanted, sizeof rule);
+                RescaleRule(*g_bridge, rule[0], rule[1], rule[2]);
+            }
             g_present_frame = frame;
             g_present_waits = true;
             if (!g_present_at_blank_end || VirtualClock()) PresentWaiting();
         });
     }
+    g_gpu_name = device->Describe();
     std::fprintf(stderr, "gpu: drawing on %s %s\n", device->Describe().c_str(),
                  bridge.primary ? "instead of the software GS" : "beside the software GS");
     return true;

@@ -289,6 +289,8 @@ bool IopReplyPending() {
     return !iop.replies.empty() && iop.receive_buffer && iop.replies.front().due_ns <= ClockNs();
 }
 
+size_t IopRepliesQueued() { return I().replies.size(); }
+
 bool DeliverIopReply() {
     Iop& iop = I();
     if (!IopReplyPending()) return false;

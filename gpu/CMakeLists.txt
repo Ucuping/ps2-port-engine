@@ -112,12 +112,23 @@ add_custom_command(OUTPUT ${out}
     DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag glslang-standalone
     COMMENT "glslang gs.frag (blending in the shader)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
+# The PC's effects (effects.cpp): effects.comp once for each pass.
+foreach(pass RANGE 0 12)
+    set(out ${PS2GPU_SHADER_DIR}/effects_${pass}.h)
+    add_custom_command(OUTPUT ${out}
+        COMMAND glslang-standalone -V --target-env vulkan1.3 -DPASS=${pass} --vn spirv_effects_${pass}
+                -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/effects.comp
+        DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/effects.comp glslang-standalone
+        COMMENT "glslang effects.comp (pass ${pass})")
+    list(APPEND PS2GPU_SHADER_HEADERS ${out})
+endforeach()
 add_custom_target(ps2gpu_shaders DEPENDS ${PS2GPU_SHADER_HEADERS})
 
 add_library(ps2gpu STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/vulkan_display.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gpu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gs_renderer.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/effects.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/threaded_renderer.cpp)
 add_dependencies(ps2gpu ps2gpu_shaders)
 target_include_directories(ps2gpu PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include PRIVATE ${PS2GPU_SHADER_DIR}

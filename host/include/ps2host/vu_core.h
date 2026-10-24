@@ -88,6 +88,9 @@ struct VuRunState {
     bool stopping = false;          // the pair before had E: this one is the last
     std::uint64_t count = 0;        // pairs run
     bool done = false;              // the program has ended
+    bool jumped = false;            // pc is a jump's to a register's address (or one not known)
+    bool interpret = false;         // the interpreter goes on from pc (such a jump into a block that
+                                    // knows fields clean from its known ways in: VuCompiled::knows)
 };
 
 /* A block of a compiled program: pairs run in a line from its first, the
@@ -127,6 +130,8 @@ struct VuCompiled {
     const VuBlock* blocks;
     std::uint32_t block_count;
     const VuBlock* fast_blocks = nullptr;   // the same without MAC and STATUS (--vu-fast), or none
+    const std::uint8_t* knows = nullptr;    // each block: 1 if it starts knowing fields clean from the
+                                            // ways into it the generator knows (vurecomp's entry_clean), or none
 };
 /* Adds one to those Vu::Run looks for (the generated file does, as it starts). */
 void RegisterVuProgram(const VuCompiled* program);
@@ -566,10 +571,23 @@ struct VuCore {
     /* ITOF0/4/12/15 (Shift 0-3), FTOI the same, ABS: into ft (VF0 stays). */
     template <u32 Dest, int Shift>
     static PS2HOST_VU_INLINE void Itof(Vu& v, int ft, int fs) {
+#if PS2RT_VU_SSE
+        // Four lanes at once, as the scalar's rounding has it: cvtdq2ps
+        // rounds as the run's control word says (toward zero, VuRounding) as
+        // the double's narrowing did, and scaling by a power of two is exact
+        // and commutes with it; an integer is never a NaN, an infinity or a
+        // denormal (Result's cases). The scalar way was a double division a
+        // lane - a third of a hot block's time.
+        static constexpr float kInverse[4] = {1.0f, 1.0f / 16.0f, 1.0f / 4096.0f, 1.0f / 32768.0f};
+        const __m128 x = _mm_cvtepi32_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs])));
+        alignas(16) u32 out[4];
+        _mm_store_si128(reinterpret_cast<__m128i*>(out), _mm_castps_si128(_mm_mul_ps(x, _mm_set1_ps(kInverse[Shift]))));
+#else
         static constexpr double kScale[4] = {1.0, 16.0, 4096.0, 32768.0};
         const u32* a = v.regs.vf[fs];
         u32 out[4];
         for (int lane = 0; lane < 4; ++lane) out[lane] = lifted::Result(double(std::int32_t(a[lane])) / kScale[Shift]);
+#endif
         WriteVf<Dest>(v, ft, out);
         Wrote<Dest>(v, ft, true);
     }
@@ -602,9 +620,16 @@ struct VuCore {
     }
     template <u32 Dest>
     static PS2HOST_VU_INLINE void Abs(Vu& v, int ft, int fs) {
+#if PS2RT_VU_SSE
+        alignas(16) u32 out[4];
+        _mm_store_si128(reinterpret_cast<__m128i*>(out),
+                        _mm_and_si128(lifted::CleanLanes(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs]))),
+                                      _mm_set1_epi32(0x7FFFFFFF)));
+#else
         const u32* a = v.regs.vf[fs];
         u32 out[4];
         for (int lane = 0; lane < 4; ++lane) out[lane] = lifted::Clean(a[lane]) & ~lifted::kSign;
+#endif
         WriteVf<Dest>(v, ft, out);
         Wrote<Dest>(v, ft, true);
     }
@@ -745,8 +770,12 @@ struct VuCore {
     // ------------------------------------------------------------ the pair's end
     /* As Run after the two halves: the lower's held writes (giving way to the
        upper's fields), when the fields land, the flags on their way, Q and P. */
+    /* `times_lower` / `times_upper` false: the lower's / the upper's write
+       lands with no time noted (vurecomp's untimed_writes: nothing can read
+       it before it has landed). */
     static PS2HOST_VU_INLINE void Finish(Vu& v, u64& cycle, Vu::Pending& pending, int written, u32 lanes,
-                                         bool set_flags, bool sets_mac, bool sets_clip, bool vi0 = true) {
+                                         bool set_flags, bool sets_mac, bool sets_clip, bool vi0 = true,
+                                         bool times_lower = true, bool times_upper = true) {
         const u64 ready = cycle + kFmacLatency;
         if (pending.vf > 0) {
             const u32 landing = pending.lanes & ~(written == pending.vf ? lanes : 0u);
@@ -761,11 +790,11 @@ struct VuCore {
 #if !PS2RT_VU_SSE
                     v.regs.vf[pending.vf][lane] = pending.value[lane];
 #endif
-                    v.vf_ready_[pending.vf][lane] = ready;
+                    if (times_lower) v.vf_ready_[pending.vf][lane] = ready;
                 }
             }
         }
-        FinishUpper(v, cycle, written, lanes, set_flags, sets_mac, sets_clip);
+        FinishUpper(v, cycle, written, lanes, set_flags, sets_mac, sets_clip, times_upper);
         if (pending.q_latency) {
             v.q_next_ = pending.q_set ? pending.q_value
                       : pending.vc    ? pending.vc_after[lifted::kRegQ] : v.regs.vc[lifted::kRegQ];
@@ -786,8 +815,9 @@ struct VuCore {
     }
     /* The same for a pair whose lower left nothing (FinishUpper, then End). */
     static PS2HOST_VU_INLINE void FinishUpper(Vu& v, u64 cycle, int written, u32 lanes, bool set_flags,
-                                              bool sets_mac, bool sets_clip) {
+                                              bool sets_mac, bool sets_clip, bool times = true) {
         const u64 ready = cycle + kFmacLatency;
+        if (!times) written = 0;                // (untimed: Finish's times_upper)
 #if defined(__AVX2__)
         if (written > 0 && lanes == 15)         // all four in a store
             _mm256_storeu_si256(reinterpret_cast<__m256i*>(v.vf_ready_[written]), _mm256_set1_epi64x(static_cast<long long>(ready)));

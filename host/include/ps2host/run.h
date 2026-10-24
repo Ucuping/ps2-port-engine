@@ -117,15 +117,18 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result);
    one queued answer to the EE (false when none waits). */
 void SifDma(u32 transfers, u32 count);
 bool DeliverIopReply();
+/* The answers queued for the EE, delivered or not yet due. */
+size_t IopRepliesQueued();
 /* Whether an answer from the IOP waits to be delivered. */
 bool IopReplyPending();
 /* A packet from the IOP to the EE (a module's sceSifSendCmd): queued, and
    delivered as the SIF0 interrupt at the next safe point. */
 void QueueIopPacket(std::vector<u8> packet);
 /* A module's command sent from an IOP interrupt handler (sceSifSendCmd in
-   one): delivered now, with the answers due before it, unless the EE is in
-   an interrupt itself - so the EE's handler for it runs before the IOP goes
-   on, as on the console, where it takes microseconds. */
+   one): delivered now when nothing waits before it, unless the EE is in an
+   interrupt itself - so the EE's handler for it runs before the IOP goes
+   on, as on the console, where it takes microseconds. Behind other answers
+   it waits its turn (at the next loop head, the EE's threads let run). */
 void DeliverIopPacketNow();
 /* A host RPC server's: its answer (the RPC end) reaches the EE `ns` later, on
    the host clock (virtual under --virtual-time) - a device's time, such as a
@@ -200,6 +203,9 @@ bool GpuPrimary();
 void GpuSetScale(u32 scale);
 /* F12 or L3+R3 (the window's): capture the next frame. */
 void RequestCapture();
+/* A port's own at each capture, given its folder (Burnout 3: the threads,
+   its sound's last words and both memories - a hang looked into). */
+void SetCaptureHook(void (*hook)(const std::string& dir));
 std::string GpuShadowSummary();
 /* --until-frame: stop the run when frame N is done (with --virtual-time, the
    same point every time). */
@@ -220,6 +226,11 @@ void GsQword(int path, u64 low, u64 high);
 void GsWord(int path, u32 word);
 void GsWords(int path, const u32* words, u32 count, u32 from = ~0u);
 void GsPrivileged(u32 address, u64 value);
+/* A GS register write, as A+D would (the replay's recorded registers). */
+void GsRegister(u32 address, u64 value);
+/* PS2HOST_GS_SPLIT=1: the GIF's decoding on a thread of its own in front of
+   the GS thread (gs_thread.cpp). */
+bool GsSplit();
 /* The end of frame N, in the GS's stream: the handler (the GPU bridge's, when
    the GPU draws: hand the frame to the GPU, show its picture) runs on the GS
    thread once the frame's packets are taken, so the EE need not wait for
@@ -509,10 +520,15 @@ void ShowHostCursor(bool on);
 void HostRumble(u8 large, u8 small);
 /* A controller's adaptive triggers (a DualSense's), left and right: off, a
    resistance from `start` (0-255 of the travel) of `force` (0-255), or a
-   vibration from `start` of `force` at `frequency` Hz - until set again. */
+   vibration from `start` of `force` at `frequency` Hz; or by zones, the
+   travel in ten (zone 0 the first tenth of the pull): each zone's resistance
+   (kZones), or each zone's vibration at `frequency` Hz (kZoneVibration),
+   from 0 (none) to 8 - until set again. A shape: a spring that firms up, a
+   step where a stop is - what a constant resistance cannot be. */
 struct HostTriggerEffect {
-    enum Kind : u8 { kOff, kResistance, kVibration } kind = kOff;
+    enum Kind : u8 { kOff, kResistance, kVibration, kZones, kZoneVibration } kind = kOff;
     u8 start = 0, force = 0, frequency = 0;
+    u8 zones[10] = {};
 };
 void HostTriggerEffects(const HostTriggerEffect& left, const HostTriggerEffect& right);
 /* The controller left as it was found (the game ending): motors stopped,
@@ -618,6 +634,40 @@ bool FramePacingDefault();
    the background - none made in the middle of a player's first race
    (ps2gpu::SetPipelineHints). Called as the game's overrides register. */
 void SetGpuPipelineHints(const u32* keys, std::size_t count);
+/* A game's tag on the GPU's draws that sample the texture at TBP
+   (ps2gpu::GsDrawState::tag; 0 none): bit 0 a car's paint reflecting a
+   sphere map, its blend's share by a Fresnel term. One texture at a time. */
+void SetGpuDrawTag(u32 tbp, u32 tag);
+/* Mipmapped textures filtered as a modern GPU filters them - the level from
+   the footprint on screen (finer at an internal resolution), trilinear,
+   anisotropic - not by the GS's depth-based level (GsDrawState::tag bit 1). */
+void SetGpuModernTextures(bool on);
+/* The texture filtering a player chose, over the game's own (TEX1) on its
+   3D draws - not on sprites (the HUD, text, a picture's copies and effects,
+   drawn texel for texel) or a draw that samples a target (render to
+   texture), which the game's filtering keeps exact. 0 the game's (with
+   SetGpuModernTextures as it says); 1 nearest; 2 bilinear (the nearest
+   mipmap level); 3 trilinear (the level from the footprint on screen, two
+   mixed); 4 anisotropic, `taps` (2-16) along the footprint's long axis -
+   both of those as SetGpuModernTextures filters, on mipmapped textures. */
+void SetGpuTextureFilter(int filter, int taps = 8);
+/* In real time, the EE asleep until something it waits on may have come - a
+   blank, a timer, an interrupt to deliver, an IOP reply - for a game's wait
+   loop whose turns call a function (Burnout 3's packet wait): its turns
+   then one an event, not thousands. At once in virtual time. */
+void WaitForGuestEvent();
+/* A game's particle textures (TBPs, up to four; none to stop): their draws
+   blended and depth tested after a view's effects are soft particles, faded
+   near the scene's depth the game's kSceneDepth effect saved (tag bit 2). */
+void SetGpuSoftParticles(const u32* tbps, std::size_t count);
+/* The GPU drawing the game ("" before it is started, or with none): its
+   name as the driver gives it - a game's defaults may weigh it (an
+   integrated GPU's). */
+std::string GpuName();
+/* Small targets at FBP [fbp_begin, fbp_end), at most max_fbw pages wide,
+   drawn at the internal resolution (GsRenderer::SetScaleRule): a game's
+   reflection maps. Applied between frames; an empty range none. */
+void SetGpuScaleRule(u32 fbp_begin, u32 fbp_end, u32 max_fbw);
 void AdvanceClock(u64 ns);
 /* Run the INTC handlers for `cause`, if it is enabled (threads.cpp). */
 void RaiseIntc(u32 cause);

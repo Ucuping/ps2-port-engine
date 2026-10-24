@@ -282,13 +282,37 @@ void Vu::RecordPrograms(const std::string& path) {
 }
 
 bool Vu::SameState(const Vu& o, bool flags) const {
+    // PS2HOST_VU_SAY_DIFF: what differs, on stderr (the host tests' failures).
+    static const bool say = std::getenv("PS2HOST_VU_SAY_DIFF") != nullptr;
+    if (say) {
+        for (int r = 0; r < 32; ++r)
+            for (int lane = 0; lane < 4; ++lane) {
+                if (regs.vf[r][lane] != o.regs.vf[r][lane]) std::fprintf(stderr, "  vf%d.%d %08X %08X\n", r, lane, regs.vf[r][lane], o.regs.vf[r][lane]);
+                if (std::max(vf_ready_[r][lane], cycle_) != std::max(o.vf_ready_[r][lane], o.cycle_))
+                    std::fprintf(stderr, "  ready vf%d.%d %llu %llu (cycles %llu %llu)\n", r, lane,
+                                 (unsigned long long)vf_ready_[r][lane], (unsigned long long)o.vf_ready_[r][lane],
+                                 (unsigned long long)cycle_, (unsigned long long)o.cycle_);
+            }
+        for (int r = 0; r < 32; ++r)
+            if (regs.vc[r] != o.regs.vc[r]) std::fprintf(stderr, "  vc%d %X %X\n", r, regs.vc[r], o.regs.vc[r]);
+        if (cycle_ != o.cycle_) std::fprintf(stderr, "  cycle %llu %llu\n", (unsigned long long)cycle_, (unsigned long long)o.cycle_);
+        if (mac != o.mac || status != o.status || clip != o.clip) std::fprintf(stderr, "  flags\n");
+        if (std::memcmp(data.data(), o.data.data(), data.size())) std::fprintf(stderr, "  data\n");
+        if (resume != o.resume) std::fprintf(stderr, "  resume %X %X\n", resume, o.resume);
+    }
     auto same = [](const void* a, const void* b, std::size_t n) { return std::memcmp(a, b, n) == 0; };
     if (!same(regs.vf, o.regs.vf, sizeof regs.vf) || !same(regs.vc, o.regs.vc, sizeof regs.vc) ||
         !same(regs.vacc, o.regs.vacc, sizeof regs.vacc))
         return false;
     if ((flags && (mac != o.mac || status != o.status)) || clip != o.clip || p != o.p || resume != o.resume)
         return false;
-    if (cycle_ != o.cycle_ || !same(vf_ready_, o.vf_ready_, sizeof vf_ready_) || q_next_ != o.q_next_ ||
+    // Landing times as far as they can still stall: past ones are all alike
+    // (compiled code leaves out the times nothing reads - vurecomp's
+    // untimed_writes - and a time left out stays an earlier, past one).
+    for (int r = 0; r < 32; ++r)
+        for (int lane = 0; lane < 4; ++lane)
+            if (std::max(vf_ready_[r][lane], cycle_) != std::max(o.vf_ready_[r][lane], o.cycle_)) return false;
+    if (cycle_ != o.cycle_ || q_next_ != o.q_next_ ||
         p_next_ != o.p_next_ || q_ready_ != o.q_ready_ || p_ready_ != o.p_ready_ || q_busy_ != o.q_busy_ ||
         p_busy_ != o.p_busy_)
         return false;
@@ -918,10 +942,23 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     unclean_ = ~1u;                     // nothing known about the registers yet
     acc_unclean_ = true;
     RunCompiled(state, limit);
+    const u64 compiled = state.count;
     if (!state.done) Interpret(state, limit);
     LandAll();
     resume = state.pc;
     pairs_ += state.count;
+    // A run far longer than a program's usual (a frame's whole VU1 work is a
+    // few million pairs): said, with how much of it the interpreter ran.
+    if (state.count >= (u64(1) << 21)) {
+        static int said = 0;
+        if (said < 20) {
+            ++said;
+            std::fprintf(stderr, "[vu] VU%d run from 0x%X: %llu pairs (%llu interpreted), ended at 0x%X%s\n", unit,
+                         unsigned(pc), (unsigned long long)state.count,
+                         (unsigned long long)(state.count - compiled), unsigned(state.pc),
+                         state.count >= limit ? " - its limit" : "");
+        }
+    }
     return state.count;
 }
 
@@ -931,7 +968,7 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
     bool ran = false;
     // From program to program (a jump to a register's address may go to
     // another), as long as one starts here and its code is in memory.
-    while (!state.done && state.count < limit && state.delayed == kNone && !state.stopping) {
+    while (!state.done && !state.interpret && state.count < limit && state.delayed == kNone && !state.stopping) {
         Entered* entered = state.pc < micro.size() ? &entered_[state.pc / 8] : nullptr;
         const VuCompiled* program = nullptr;
         const std::vector<VuBlock>* blocks = nullptr;
@@ -965,7 +1002,22 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
         const std::vector<VuBlock>& table = *blocks;
         const u64 before = state.count;
         const u32 started = state.pc;
-        while (!state.done && state.count < limit) {
+        while (!state.done && !state.interpret && state.count < limit) {
+            // A jump to a register's address: into a block that knows fields
+            // clean from the ways into it the generator knew, the interpreter
+            // goes on (that block's clamps were left out for them).
+            if (state.jumped) {
+                state.jumped = false;
+                if (program->knows) {
+                    const u32 pc = state.pc & u32(micro.size() - 1);
+                    const u32* end = program->starts + program->block_count;
+                    const u32* at = std::lower_bound(program->starts, end, pc);     // (in order of address)
+                    if (at != end && *at == pc && program->knows[at - program->starts]) {
+                        state.interpret = true;
+                        break;
+                    }
+                }
+            }
             const VuBlock block = table[(state.pc & u32(micro.size() - 1)) / 8];
             if (!block) break;
             const u64 at = state.count;

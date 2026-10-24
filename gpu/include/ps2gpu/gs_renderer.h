@@ -131,6 +131,16 @@ struct GsDrawState {
     bool depth = false;
     std::uint32_t zbp = 0, ztst = 1;
     bool depth_write = true;                             /* !ZBUF.ZMSK */
+
+    /* A game's tag on the draw (the bridge's SetGpuDrawTag, by the texture
+       it samples): bit 0 a car's paint sampling a sphere map, its colour
+       scaled by a Fresnel term from the texel's place in the map (gs.frag);
+       bit 1 mipmapped textures filtered as a modern GPU does (SampleModern,
+       up to 1 << bits 8-10 taps along the footprint: 1 trilinear); bit 2 a
+       soft particle, faded near the scene's depth (kSceneDepth); bits 11-12
+       the player's filter forced (1 nearest, 2 bilinear, 3 trilinear or
+       anisotropic), which a texture pack's replacement follows too. */
+    std::uint32_t tag = 0;
 };
 
 /* A texture in GS local memory, and how its texels expand: TEX0's TBP0 (in
@@ -182,6 +192,29 @@ struct GsShuffle {
     bool aem = false, fba = false;
 };
 
+/* An effect of the PC's run on a target and its depth buffer at a point of
+   the GS stream (gs.h's on_effect: a game's port writes it into its own
+   packets): ambient occlusion, a speed blur, a glow, a grade - drawn at the
+   internal resolution, before what the game draws after it (its HUD). */
+enum class GsEffectId : std::uint32_t {
+    kTint = 0xF0,       /* a test: the rectangle's colour times params[0..2] */
+    kOcclusion = 1,     /* ambient occlusion and sun shadows, from the depth */
+    kMotionBlur = 2,    /* a camera's motion blur, from the depth */
+    kBloom = 3,         /* a glow of the bright parts */
+    kGrade = 4,         /* tone and colour */
+    kSceneDepth = 5,    /* the scene's depth saved, for soft particles drawn after (tag bit 2) */
+    kDepthOfField = 6,  /* a camera's depth of field, focused on the view's middle */
+};
+struct GsEffect {
+    GsEffectId id = GsEffectId::kTint;
+    std::uint32_t flags = 0;                            /* the effect's own */
+    std::uint32_t fbp = 0, fbw = 1, psm = 0;            /* the target as it was made */
+    bool depth = false;                                 /* a depth buffer, as it was made: */
+    std::uint32_t zbp = 0, zwidth = 0, zheight = 0;
+    std::int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;        /* the view in the target (GS pixels, ends exclusive) */
+    float params[22] = {};                              /* the effect's own */
+};
+
 class GsRenderer {
 public:
     virtual ~GsRenderer() = default;
@@ -192,6 +225,13 @@ public:
        it. */
     virtual std::uint32_t Scale() const { return 1; }
     virtual void SetScale(std::uint32_t scale) { (void)scale; }
+    /* Targets and depth buffers at FBP (ZBP) [fbp_begin, fbp_end), at most
+       max_fbw pages wide, drawn at the internal resolution too - small ones
+       otherwise stay at the PS2's (a game's reflection maps, sharper). An
+       empty range none. Changing it drops every image, as SetScale. */
+    virtual void SetScaleRule(std::uint32_t fbp_begin, std::uint32_t fbp_end, std::uint32_t max_fbw) {
+        (void)fbp_begin, (void)fbp_end, (void)max_fbw;
+    }
     /* A texture, RGBA in memory (alpha as the GS has it, 0x80 is 1.0), rows
        top-down. Replaces what the key named. */
     virtual void UploadTexture(std::uint64_t key, const std::uint32_t* pixels, std::uint32_t width,
@@ -285,6 +325,10 @@ public:
        this renderer cannot, the draw then made as it is. */
     virtual bool CanShuffle() const { return false; }
     virtual void ChannelShuffle(const GsShuffle& shuffle) { (void)shuffle; }
+    /* GsEffect, in turn with what is recorded; false when this renderer
+       has none (the picture is then as the game drew it). */
+    virtual bool CanRunEffects() const { return false; }
+    virtual void RunEffect(const GsEffect& effect) { (void)effect; }
     /* A depth buffer's Z (the GS's, unsigned), rows top-down; false if there
        is none of that size. */
     virtual bool ReadDepth(std::uint32_t zbp, std::uint32_t width, std::uint32_t height,

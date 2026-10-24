@@ -149,14 +149,20 @@ public:
     virtual void SetTriggerTargets(std::vector<std::uint32_t> ids) { (void)ids; }
     /* A controller's adaptive triggers (a DualSense's; others have none):
        off, a resistance from `start` (0-255 of the travel) of `force`
-       (0-255), or a vibration from `start` of `force` at `frequency` (Hz),
+       (0-255), or a vibration from `start` of `force` at `frequency` (Hz);
+       or by zones, the travel in ten: each zone's resistance (kZones), or
+       each zone's vibration at `frequency` (kZoneVibration), 0 none to 8 -
        until set again. Taken up by the window's own thread (Pump), and
        again when a controller is plugged in. */
     struct TriggerEffect {
-        enum Kind : std::uint8_t { kOff, kResistance, kVibration } kind = kOff;
+        enum Kind : std::uint8_t { kOff, kResistance, kVibration, kZones, kZoneVibration } kind = kOff;
         std::uint8_t start = 0, force = 0, frequency = 0;
+        std::uint8_t zones[10] = {};
         bool operator==(const TriggerEffect& o) const {
-            return kind == o.kind && start == o.start && force == o.force && frequency == o.frequency;
+            if (kind != o.kind || start != o.start || force != o.force || frequency != o.frequency) return false;
+            for (int i = 0; i < 10; ++i)
+                if (zones[i] != o.zones[i]) return false;
+            return true;
         }
     };
     virtual void SetTriggerEffects(TriggerEffect left, TriggerEffect right) { (void)left, (void)right; }

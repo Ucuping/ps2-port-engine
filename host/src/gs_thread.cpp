@@ -15,6 +15,15 @@
  * One producer (the EE thread, which runs the DMA, VIF and VU1 that feed the
  * GS) and one consumer. An exception on the GS thread is handed to the EE
  * thread at its next call here.
+ *
+ * Split (PS2HOST_GS_SPLIT=1): the GIF's decoding - tags, PACKED data, the
+ * vertices the XYZ registers make (gs_decode.h) - on a thread of its own in
+ * front of the GS thread. It takes the ring as the GS thread did and hands
+ * what it decodes on through a second ring - register writes the GS keeps,
+ * vertices, IMAGE data, privileged registers, frame ends - which the GS
+ * thread takes in order: the same calls on the GS model, the same pictures.
+ * In the crash-breaker's explosion (~98,000 primitives a picture) the
+ * decoding was a quarter of the GS thread's time.
  */
 
 #include <algorithm>
@@ -35,6 +44,7 @@
 #endif
 
 #include "ps2host/gs.h"
+#include "gs_decode.h"
 #include "ps2host/timeline.h"
 #include "ps2host/profile.h"
 #include "ps2host/run.h"
@@ -54,7 +64,14 @@ constexpr u32 kRing = 1u << 22;                 // words (16 MB)
 constexpr u32 kWakeWords = 4096;
 constexpr int kLookMs = 1;
 constexpr u32 kMaxRun = kRing / 8;              // the longest run of words one entry carries
-enum : u32 { kQword = 1, kWord = 2, kWords = 3, kPrivileged = 4, kWrap = 5, kFrame = 6 };
+// The feed's entries, and (split) the second ring's: a register write the
+// decoding takes (kRegister: the replay's), and what it hands on - a
+// register the GS keeps (kApply), a vertex (kVertex, the path bits 1 if it
+// may draw), IMAGE data (kImage, quadwords), a line of the trace (kTrace).
+enum : u32 { kQword = 1, kWord = 2, kWords = 3, kPrivileged = 4, kWrap = 5, kFrame = 6, kRegister = 7, kApply = 8,
+             kVertex = 9, kImage = 10, kTrace = 11 };
+constexpr u32 kVertexWords = sizeof(gs::Vertex) / 4;
+static_assert(sizeof(gs::Vertex) % 4 == 0, "a vertex is whole words");
 
 std::atomic<u64> g_gs_busy_us{0};       // the GS thread at work, not waiting for more (--frame-times)
 
@@ -114,8 +131,9 @@ void Pause() {
 struct Feed {
     std::vector<u32> ring = std::vector<u32>(kRing);
     // Positions in words, counted from the start (the ring index is mod kRing).
-    std::atomic<u64> head{0};                   // written up to, by the EE thread
+    std::atomic<u64> head{0};                   // published up to, by the EE thread
     std::atomic<u64> tail{0};                   // done up to, by the GS thread
+    u64 written = 0;                            // written up to (the producer's own; head trails it)
     std::atomic<bool> stop{false};
     std::atomic<bool> sleeping{false};
     std::mutex mutex;
@@ -146,11 +164,12 @@ struct Feed {
     /* Room for `words` contiguous words: their index in the ring. */
     u32* Reserve(u32 words) {
         Rethrow();
-        u64 at = head.load(std::memory_order_relaxed);
+        u64 at = written;
         if (at % kRing + words > kRing) {       // no room before the end: wrap
             WaitFor(kRing - at % kRing);
             ring[at % kRing] = Header(kWrap, 0, 0);
             at += kRing - at % kRing;
+            written = at;
             head.store(at, std::memory_order_release);
         }
         WaitFor(words);
@@ -158,8 +177,9 @@ struct Feed {
     }
 
     void WaitFor(u32 words) {
-        const u64 at = head.load(std::memory_order_relaxed);
+        const u64 at = written;
         if (at + words - tail.load(std::memory_order_acquire) <= kRing) return;
+        head.store(at, std::memory_order_release);      // all that is written, for the consumer to make room
         Wake();
         Timed timed(Section::GsWait);
         while (at + words - tail.load(std::memory_order_acquire) > kRing) {
@@ -169,8 +189,20 @@ struct Feed {
     }
 
     void Publish(u32 words, bool now = false) {
-        const u64 h = head.load(std::memory_order_relaxed) + words;
-        head.store(h, std::memory_order_release);
+        written += words;
+        Flush(now);
+    }
+
+    /* Written, published later (Flush) - or as soon as there is enough for
+       the consumer to go on with. */
+    void Append(u32 words) {
+        written += words;
+        if (written - head.load(std::memory_order_relaxed) >= kWakeWords) Flush(false);
+    }
+
+    void Flush(bool now) {
+        const u64 h = written;
+        if (h != head.load(std::memory_order_relaxed)) head.store(h, std::memory_order_release);
         if (sleeping.load() && (now || h - tail.load(std::memory_order_acquire) >= kWakeWords)) Wake();
     }
 
@@ -193,8 +225,11 @@ struct Feed {
         Rethrow();
     }
 
-    void Run() {
-        gs::Gs& g = gs::TheGs();
+    /* Takes entries until stopped: `handle(entry, index)` does one and
+       says how many words it was. `busy`: its time is the GS's (--frame-
+       times' share). */
+    template <class Handle>
+    void Run(Handle handle, bool busy_counts) {
         while (true) {
             u64 t = tail.load(std::memory_order_relaxed);
             u64 h = head.load(std::memory_order_acquire);
@@ -225,55 +260,21 @@ struct Feed {
             const auto began = std::chrono::steady_clock::now();
             struct Busy {
                 std::chrono::steady_clock::time_point began;
+                bool counts;
                 ~Busy() {
                     const auto now = std::chrono::steady_clock::now();
-                    g_gs_busy_us.fetch_add(u64(std::chrono::duration_cast<std::chrono::microseconds>(now - began).count()),
-                                           std::memory_order_relaxed);
+                    if (counts)
+                        g_gs_busy_us.fetch_add(u64(std::chrono::duration_cast<std::chrono::microseconds>(now - began).count()),
+                                               std::memory_order_relaxed);
                     if (timeline::On())
                         timeline::Span("busy", u64(std::chrono::duration_cast<std::chrono::nanoseconds>(began.time_since_epoch()).count()),
                                        u64(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count()));
                 }
-            } busy{began};
+            } busy{began, busy_counts};
             try {
                 while (t < h) {
                     const u32 at = u32(t % kRing);
-                    const u32* e = &ring[at];
-                    const u32 type = e[0] >> 28, count = e[0] & 0xFFFFFF;
-                    const int path = int((e[0] >> 24) & 0xF);
-                    u32 size = 1;
-                    switch (type) {
-                        case kQword:
-                            g.Qword(path, u64(e[1]) | u64(e[2]) << 32, u64(e[3]) | u64(e[4]) << 32);
-                            size = 5;
-                            break;
-                        case kWord:
-                            g.Word(path, e[1]);
-                            size = 2;
-                            break;
-                        case kWords:
-                            g.Words(path, e + 2, count, e[1]);
-                            size = 2 + count;
-                            break;
-                        case kPrivileged:
-                            g.SetPrivileged(e[1], u64(e[2]) | u64(e[3]) << 32);
-                            size = 4;
-                            break;
-                        case kFrame:
-                            if (g_frame_handler) {
-                                const u64 frame = u64(e[1]) | u64(e[2]) << 32;
-                                const u64 took = g_hitch ? ClockNs() : 0;
-                                g_frame_handler(frame);
-                                if (g_hitch) HitchFrame(frame, took, ClockNs());
-                            }
-                            size = 3;
-                            break;
-                        case kWrap:
-                            size = kRing - at;
-                            break;
-                        default:
-                            break;
-                    }
-                    t += size;
+                    t += handle(&ring[at], at);
                     tail.store(t, std::memory_order_release);
                 }
             } catch (...) {
@@ -287,28 +288,190 @@ struct Feed {
 };
 
 Feed* g_feed = nullptr;
+Feed* g_back = nullptr;         // split: the decoding's to the GS thread
 
 Feed& TheFeed() {
     static Feed feed;
     return feed;
 }
 
+Feed& TheBack() {
+    static Feed back;
+    return back;
+}
+
+u64 Value(const u32* at) { return u64(at[0]) | u64(at[1]) << 32; }
+
+void FrameEnd(const u32* e) {
+    if (!g_frame_handler) return;
+    const u64 frame = Value(e + 1);
+    const u64 took = g_hitch ? ClockNs() : 0;
+    g_frame_handler(frame);
+    if (g_hitch) HitchFrame(frame, took, ClockNs());
+}
+
+/* The GS thread's entries, unsplit: the calls the EE side made. */
+u32 Whole(const u32* e, u32 at) {
+    gs::Gs& g = gs::TheGs();
+    const u32 type = e[0] >> 28, count = e[0] & 0xFFFFFF;
+    const int path = int((e[0] >> 24) & 0xF);
+    switch (type) {
+        case kQword: g.Qword(path, Value(e + 1), Value(e + 3)); return 5;
+        case kWord: g.Word(path, e[1]); return 2;
+        case kWords: g.Words(path, e + 2, count, e[1]); return 2 + count;
+        case kPrivileged: g.SetPrivileged(e[1], Value(e + 2)); return 4;
+        case kRegister: g.WriteRegister(e[1], Value(e + 2)); return 4;
+        case kFrame: FrameEnd(e); return 3;
+        case kWrap: return kRing - at;
+        default: return 1;
+    }
+}
+
+/* The decoding's sink (split): what it decodes, into the second ring. */
+struct RingSink {
+    Feed& f;
+    void Apply(u32 address, u64 value) {
+        u32* e = f.Reserve(4);
+        e[0] = Header(kApply, 0, 0);
+        e[1] = address;
+        e[2] = u32(value);
+        e[3] = u32(value >> 32);
+        f.Append(4);
+    }
+    void PushVertex(const gs::Vertex& v, bool draw) {
+        u32* e = f.Reserve(1 + kVertexWords);
+        e[0] = Header(kVertex, draw ? 1 : 0, 0);
+        std::memcpy(e + 1, &v, sizeof v);
+        f.Append(1 + kVertexWords);
+    }
+    void Image(const gs::u8* data, u32 qwords) {
+        while (qwords) {
+            const u32 run = std::min(qwords, kMaxRun / 4);
+            u32* e = f.Reserve(1 + 4 * run);
+            e[0] = Header(kImage, 0, run);
+            std::memcpy(e + 1, data, std::size_t(run) * 16);
+            f.Append(1 + 4 * run);
+            data += std::size_t(run) * 16;
+            qwords -= run;
+        }
+    }
+    void ApplyPrivileged(u32 address, u64 value) {
+        u32* e = f.Reserve(4);
+        e[0] = Header(kPrivileged, 0, 0);
+        e[1] = address;
+        e[2] = u32(value);
+        e[3] = u32(value >> 32);
+        f.Append(4);
+    }
+    // The recording's file is the GS model's, written by the decoding alone
+    // while it records (begun and ended with the GS synced).
+    void Record(int path, const u32* words, u32 count) { gs::TheGs().Record(path, words, count); }
+    void RecordPrivileged(u32 address, u64 value) { gs::TheGs().RecordPrivileged(address, value); }
+    bool Tracing() const { return gs::TheGs().trace; }
+    void TraceLine(const char* text) {
+        const u32 bytes = u32(std::strlen(text)) + 1, words = (bytes + 3) / 4;
+        u32* e = f.Reserve(1 + words);
+        e[0] = Header(kTrace, 0, words);
+        e[words] = 0;
+        std::memcpy(e + 1, text, bytes);
+        f.Append(1 + words);
+    }
+};
+
+/* The decoding's thread (split): the EE side's calls decoded, handed on. */
+u32 Decode(const u32* e, u32 at) {
+    gs::Gs& g = gs::TheGs();
+    RingSink sink{*g_back};
+    using D = gs::GifDecode<RingSink>;
+    const u32 type = e[0] >> 28, count = e[0] & 0xFFFFFF;
+    const int path = int((e[0] >> 24) & 0xF);
+    u32 size = 1;
+    bool now = false;
+    switch (type) {
+        case kQword: D::Qword(g.gif, sink, path, Value(e + 1), Value(e + 3)); size = 5; break;
+        case kWord: D::Word(g.gif, sink, path, e[1]); size = 2; break;
+        case kWords: D::Words(g.gif, sink, path, e + 2, count, e[1]); size = 2 + count; break;
+        case kPrivileged: D::Privileged(g.gif, sink, e[1], Value(e + 2)); size = 4; now = true; break;
+        case kRegister: D::Register(g.gif, sink, e[1], Value(e + 2)); size = 4; break;
+        case kFrame: {
+            u32* out = g_back->Reserve(3);
+            std::memcpy(out, e, 12);
+            g_back->Append(3);
+            size = 3;
+            now = true;
+            break;
+        }
+        case kWrap: size = kRing - at; break;
+        default: break;
+    }
+    // All it made for this entry, published before the entry counts as
+    // taken (SyncGs waits for the feed, then for this ring).
+    g_back->Flush(now);
+    return size;
+}
+
+/* The GS thread's entries (split): the decoding's. */
+u32 Back(const u32* e, u32 at) {
+    gs::Gs& g = gs::TheGs();
+    const u32 type = e[0] >> 28, count = e[0] & 0xFFFFFF;
+    switch (type) {
+        case kApply: g.Apply(e[1], Value(e + 2)); return 4;
+        case kVertex: {
+            gs::Vertex v;
+            std::memcpy(&v, e + 1, sizeof v);
+            g.PushVertex(v, ((e[0] >> 24) & 1) != 0);
+            return 1 + kVertexWords;
+        }
+        case kImage: g.Image(reinterpret_cast<const gs::u8*>(e + 1), count); return 1 + 4 * count;
+        case kPrivileged: g.ApplyPrivileged(e[1], Value(e + 2)); return 4;
+        case kFrame: FrameEnd(e); return 3;
+        case kTrace: g.TraceLine(reinterpret_cast<const char*>(e + 1)); return 1 + count;
+        case kWrap: return kRing - at;
+        default: return 1;
+    }
+}
+
 }  // namespace
+
+bool GsSplit() {
+    static const bool on = [] {
+        const char* v = std::getenv("PS2HOST_GS_SPLIT");
+        return v && *v == '1';
+    }();
+    return on;
+}
 
 void StartGsThread() {
     if (g_feed) return;
     g_feed = &TheFeed();
+    if (GsSplit()) {
+        g_back = &TheBack();
+        g_back->thread = std::thread([] {
+            timeline::NameThread("GS");
+            FastThread();
+            if (SampleGsThread()) StartSampler();
+            g_back->Run(Back, true);
+        });
+        g_feed->thread = std::thread([] {
+            timeline::NameThread("GS decode");
+            FastThread();
+            g_feed->Run(Decode, false);
+        });
+        std::fprintf(stderr, "[host] GS split: the GIF's decoding on a thread of its own\n");
+        return;
+    }
     g_feed->thread = std::thread([] {
         timeline::NameThread("GS");
         FastThread();
         if (SampleGsThread()) StartSampler();
-        g_feed->Run();
+        g_feed->Run(Whole, true);
     });
 }
 
 void GsDrain() {
     if (Vif1Async() && !OnVif1Worker()) JoinVif1("drain");
     if (g_feed) g_feed->Sync();
+    if (g_back) g_back->Sync();
 }
 
 void StopGsThread() {
@@ -326,13 +489,29 @@ void StopGsThread() {
         }
     }
     g_feed->Sync();
+    if (g_back) g_back->Sync();
     g_feed->Stop();
     g_feed = nullptr;
+    if (g_back) {
+        g_back->Stop();
+        g_back = nullptr;
+    }
 }
 
 void SyncGs() {
     JoinVif1("syncgs");
     if (g_feed) g_feed->Sync();
+    if (g_back) g_back->Sync();
+}
+
+void GsRegister(u32 address, u64 value) {
+    if (!g_feed) return gs::TheGs().WriteRegister(address, value);
+    u32* e = g_feed->Reserve(4);
+    e[0] = Header(kRegister, 0, 0);
+    e[1] = address;
+    e[2] = u32(value);
+    e[3] = u32(value >> 32);
+    g_feed->Publish(4);
 }
 
 void GsQword(int path, u64 low, u64 high) {

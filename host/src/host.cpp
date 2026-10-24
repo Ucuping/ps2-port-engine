@@ -82,6 +82,13 @@ int GsReplay(const std::string& file, const std::string& out) {
         g.trace_out = trace;
         g.trace = true;
     }
+    // PS2HOST_GS_SPLIT=1: through the GS's threads as a game's run feeds them
+    // (the decoding on its own), synced at each vertical blank.
+    const bool threaded = GsSplit();
+    if (threaded) {
+        if (std::getenv("PS2HOST_REPLAY_SAMPLE")) SetSampleGsThread(true);
+        StartGsThread();
+    }
     std::size_t at = 5 + kMemory;
     auto u32_at = [&](std::size_t o) { u32 v; std::memcpy(&v, data.data() + o, 4); return v; };
     auto u64_at = [&](std::size_t o) { u64 v; std::memcpy(&v, data.data() + o, 8); return v; };
@@ -96,10 +103,12 @@ int GsReplay(const std::string& file, const std::string& out) {
     while (at < data.size()) {
         const char kind = char(data[at++]);
         if (kind == 'R') {
-            g.WriteRegister(u32_at(at), u64_at(at + 4));
+            if (threaded) GsRegister(u32_at(at), u64_at(at + 4));
+            else g.WriteRegister(u32_at(at), u64_at(at + 4));
             at += 12;
         } else if (kind == 'P') {
-            g.SetPrivileged(u32_at(at), u64_at(at + 4));
+            if (threaded) GsPrivileged(u32_at(at), u64_at(at + 4));
+            else g.SetPrivileged(u32_at(at), u64_at(at + 4));
             at += 12;
         } else if (kind == 'W') {
             const int path = data[at];
@@ -112,7 +121,9 @@ int GsReplay(const std::string& file, const std::string& out) {
             // (memory then, to compare two renderers mid-frame).
             static const long long stop = std::getenv("PS2HOST_REPLAY_STOP_PRIM")
                                               ? std::atoll(std::getenv("PS2HOST_REPLAY_STOP_PRIM")) : -1;
-            if (stop < 0) {
+            if (threaded) {
+                GsWords(path, words.data(), u32(words.size()));
+            } else if (stop < 0) {
                 g.Words(path, words.data(), u32(words.size()));
             } else {
                 bool stopped = false;
@@ -126,6 +137,7 @@ int GsReplay(const std::string& file, const std::string& out) {
                 }
             }
         } else if (kind == 'V') {
+            if (threaded) SyncGs();
             g.Finish();
             if (timing) {
                 if (gpu) GpuShadowFrame(u64(pictures), std::string());
@@ -146,6 +158,7 @@ int GsReplay(const std::string& file, const std::string& out) {
         }
     }
     if (pass == 0 && trace) {           // the trace of the first pass alone
+        if (threaded) SyncGs();
         g.trace = false;
         g.trace_out = stderr;
         std::fclose(trace);
@@ -153,7 +166,7 @@ int GsReplay(const std::string& file, const std::string& out) {
     }
     if (pass == 0) {
         if (repeat > 0 && std::getenv("PS2HOST_REPLAY_SAMPLE")) {
-            StartSampler();
+            if (!threaded) StartSampler();      // (split: the GS thread's, started with it)
             SetSampleFrom(0);
             SampleFrame(0);
         }
@@ -163,6 +176,7 @@ int GsReplay(const std::string& file, const std::string& out) {
     timing = true;
     at = stream;
     }
+    if (threaded) StopGsThread();
     g.Finish();
     if (repeat > 0) {
         // To the last drawn: a block read back waits for the GPU (and for a
@@ -197,6 +211,10 @@ std::unordered_map<u32, FunctionEntry> g_overrides;
 bool g_trace = false;
 bool g_all_notes = false;
 std::vector<u32> g_watch;
+bool g_watching = false;        // !g_watch.empty(), for Dispatch's fast path (a vector's load a call)
+// Each call counted (the report's "most called": a scripted run's, or PS2HOST_CALL_COUNTS=1): the count's
+// increment missed the cache a call - at 144 pictures a second a tenth of the EE's time.
+bool g_count_calls = false;
 std::set<std::string> g_noted;
 
 // Calls already made, by address: the function and its call count, so a call
@@ -204,7 +222,7 @@ std::set<std::string> g_noted;
 // of thousands). Cleared when an override replaces a function.
 struct CachedCall {
     u32 address = 0;
-    const FunctionEntry* entry = nullptr;
+    GuestFunction function = nullptr;   // (the entry's own, here: no second load from the table)
     u64* count = nullptr;
     bool called = false;            // in RunStats().called already
 };
@@ -421,12 +439,12 @@ namespace {
 // handler - or, `jump`, a jump out of a function to it (lifted::TailCall).
 void Enter(lifted::Context& c, u32 address, bool jump) {
     CachedCall& line = g_call_cache[(address >> 2) & (kCallCache - 1)];
-    if (line.address == address && line.entry && g_watch.empty() && (jump || line.called)) {
-        ++*line.count;
+    if (line.address == address && line.function && !g_watching && (jump || line.called)) {
+        if (g_count_calls) ++*line.count;
         if (g_trace) std::fprintf(stderr, "[call] %s\n", Describe(address).c_str());
         Frame frame(address);
         try {
-            line.entry->function(c);
+            line.function(c);
         } catch (...) {
             if (RunStats().stopped_in.empty()) {
                 RunStats().stopped_in = CurrentCalls();
@@ -459,8 +477,8 @@ void Enter(lifted::Context& c, u32 address, bool jump) {
     // switch's case, the code after a function cut short; a call starts one.
     const std::pair<u32, std::string> key{address, overlay};
     if (!jump) RunStats().called.insert(key);
-    if (cacheable) line = CachedCall{address, entry, &count, !jump || RunStats().called.count(key) != 0};
-    if (std::find(g_watch.begin(), g_watch.end(), address) != g_watch.end()) {
+    if (cacheable) line = CachedCall{address, entry->function, &count, !jump || RunStats().called.count(key) != 0};
+    if (g_watching && std::find(g_watch.begin(), g_watch.end(), address) != g_watch.end()) {
         std::fprintf(stderr, "[watch] %s a0=%016llX a1=%016llX a2=%016llX a3=%016llX "
                      "f12=%08X f13=%08X ra=%08X s0=%08X s1=%08X sp=%08X gp=%08X t0=%08X\n",
                      Describe(address).c_str(),
@@ -481,7 +499,7 @@ void Enter(lifted::Context& c, u32 address, bool jump) {
         }
         throw;
     }
-    if (std::find(g_watch.begin(), g_watch.end(), address) != g_watch.end())
+    if (g_watching && std::find(g_watch.begin(), g_watch.end(), address) != g_watch.end())
         std::fprintf(stderr, "[watch] %s returned v0=%016llX f0=%08X s0=%08X s1=%08X sp=%08X\n",
                      Describe(address).c_str(), (unsigned long long)c.r[2], c.f[0],
                      unsigned(c.r[16]), unsigned(c.r[17]), unsigned(c.r[29]));
@@ -785,6 +803,8 @@ int Run(const Options& options) {
     if (!options.frames_dir.empty())
         SetFrameDumps(options.frames_dir, options.frames_every, options.frames_limit, u64(options.frames_from));
     g_watch = options.watch;
+    g_watching = !g_watch.empty();
+    g_count_calls = (options.virtual_time && !options.real_time_from) || std::getenv("PS2HOST_CALL_COUNTS") != nullptr;
     InstallDevices();
     InstallIopServers();
     if (!options.gs_inline) StartGsThread();

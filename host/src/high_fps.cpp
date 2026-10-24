@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -59,6 +60,7 @@ float g_picture_time = 1.0f;
 bool g_counted = false;                 // g_step_count holds the game's (since the rate changed)
 u32 g_step_count = 0;
 u32 g_frame_steps = 1;                  // the steps this frame of the game's ran
+unsigned g_frame_blanks = 1;            // the blanks the picture before took (the trace's)
 // Blanks since the game's frame last ran (HighFpsFrameSteps): past `gone`,
 // it has stopped - a loading screen, a movie - and the rate is its own again.
 // (HighFpsPicture, where the rate is chosen, runs only in its frames.)
@@ -69,6 +71,8 @@ struct Matrix {
     float m[16];
 };
 std::unordered_map<u32, Matrix> g_last, g_now;      // the transforms after the last two steps
+std::vector<u32> g_known;           // where the last whole read found them (TakeDown)
+unsigned g_steps = 0;
 // What the in-between placing covered: as the step left it, and as placed.
 struct Placed {
     u32 address;
@@ -95,6 +99,26 @@ constexpr double kStepRate = 1e6 / 16683.0;    // the blanks' own, 59.94 (thread
 // up).
 double g_cap = 0.0;
 int g_sampled = 0;                      // frames since the last look
+
+/* Into a rate above the game's own, the rate rises to it in eighths
+   (PS2HOST_HIGH_FPS_RAMP ms for all eight at the least, 600 by default; 0:
+   at once; Rise): a laptop's GPU
+   idles clocked down through the loading and the 60-a-second screens
+   before a race (an RTX 4070 Laptop at 600-900 MHz, its memory at 810),
+   and at once at 144 it took half a second to clock up, the race's first
+   dozen pictures shown late. Rising, its load rises with the rate and its
+   clocks with it. */
+double g_target = 0.0;                  // the rate risen to (0: not rising)
+std::chrono::steady_clock::time_point g_rise_from;
+bool g_rise_new = false;                // a rise begun: Rise starts its steps
+
+double RiseMs() {
+    static const double ms = [] {
+        const char* e = std::getenv("PS2HOST_HIGH_FPS_RAMP");
+        return e ? std::max(0.0, std::atof(e)) : 600.0;
+    }();
+    return VirtualClock() ? 0.0 : ms;   // (a GPU's clocks are real time's: a scripted run's pictures as ever)
+}
 int g_looks = 0;                        // looks since the rate changed
 u64 g_late_seen = 0;                    // LatePictures at the last look
 
@@ -197,7 +221,14 @@ void CameraTakenDown(const HighFpsCamera& camera, CameraValues& v) {
     const float d[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
     const float step = std::sqrt(Dot3(d, d));
     float turn = 0.0f;
-    if (camera.direction >= 0) {
+    if (camera.direction >= 0 && camera.quaternion) {
+        // The rotation between the two (its sign none of it: q and -q are one).
+        const float* la = v.last.data() + camera.direction;
+        const float* na = v.now.data() + camera.direction;
+        const float dot = Dot3(la, na) + la[3] * na[3];
+        const float lengths = std::sqrt((Dot3(la, la) + la[3] * la[3]) * (Dot3(na, na) + na[3] * na[3]));
+        turn = lengths > 1e-6f ? 2.0f * std::acos(std::min(1.0f, std::fabs(dot) / lengths)) * 57.29578f : 0.0f;
+    } else if (camera.direction >= 0) {
         const float* la = v.last.data() + camera.direction;
         const float* na = v.now.data() + camera.direction;
         // (only where the two are of a length: Burnout 3's +0x20 values
@@ -208,11 +239,100 @@ void CameraTakenDown(const HighFpsCamera& camera, CameraValues& v) {
     }
     const bool reversed = step > 1.0f && Dot3(d, v.way) < 0.0f;
     const bool jumped = step > 1.0f && step > 3.0f * v.step;
-    v.flipped = turn > 170.0f && !jumped && !reversed;
+    v.flipped = !camera.quaternion && turn > 170.0f && !jumped && !reversed;
     v.cut = jumped || reversed || (turn > 60.0f && turn > 2.0f * v.turn && !v.flipped);
     std::memcpy(v.way, d, sizeof v.way);
     v.step = step;
     if (!v.flipped) v.turn = turn;
+}
+
+/* PS2HOST_HIGH_FPS_BLENDS=<file>: each step, the transforms whose step
+   stands out - a blend between the two would show it (CSV): `jump` moved
+   over 4 times its step before and over a unit, `turn` turned over 30
+   degrees, `flip` changed handedness, `far` moved over 10 units (blended
+   unless over the game's cut). With the step's frame, the transform's
+   place and its step before. */
+std::FILE* BlendsFile() {
+    static std::FILE* f = [] {
+        const char* path = std::getenv("PS2HOST_HIGH_FPS_BLENDS");
+        std::FILE* out = path ? std::fopen(path, "w") : nullptr;
+        if (out) std::fprintf(out, "ms,frame,step,address,why,moved,before,turn,x,y,z,cut\n");
+        return out;
+    }();
+    return f;
+}
+
+float Determinant(const float* m) {
+    return m[0] * (m[5] * m[10] - m[6] * m[9]) - m[1] * (m[4] * m[10] - m[6] * m[8]) +
+           m[2] * (m[4] * m[9] - m[5] * m[8]);
+}
+
+/* Each transform's last step and the one before: how far it moved and how
+   far it turned (degrees). */
+struct Stepped {
+    float moved = 0.0f, turn = 0.0f;
+};
+std::unordered_map<u32, Stepped> g_stepped, g_stepped_before;
+
+void Measure() {
+    g_stepped_before.swap(g_stepped);
+    g_stepped.clear();
+    for (const auto& [address, now] : g_now) {
+        const auto last = g_last.find(address);
+        if (last == g_last.end()) continue;
+        const float* a = last->second.m;
+        const float* b = now.m;
+        const float d[3] = {b[12] - a[12], b[13] - a[13], b[14] - a[14]};
+        const float trace = Dot3(a, b) + Dot3(a + 4, b + 4) + Dot3(a + 8, b + 8);
+        g_stepped[address] = {std::sqrt(Dot3(d, d)),
+                              std::acos(std::min(1.0f, std::max(-1.0f, (trace - 1.0f) / 2.0f))) * 57.29578f};
+    }
+}
+
+/* A transform put somewhere else in a step, not moved there: over 2 units
+   and 4 times its step before, or over 60 degrees turned when it was all
+   but still - a wrecked car back on the road a few metres on (under the
+   game's cut), turned round. Blended, it slid there through the scene; it
+   is shown as the step left it. */
+bool Teleported(u32 address) {
+    const auto now = g_stepped.find(address);
+    const auto before = g_stepped_before.find(address);
+    if (now == g_stepped.end() || before == g_stepped_before.end()) return false;
+    const Stepped& n = now->second;
+    const Stepped& b = before->second;
+    return (n.moved > 2.0f && n.moved > 4.0f * b.moved) || (n.turn > 60.0f && n.turn > 4.0f * b.turn + 10.0f);
+}
+
+void LogBlends() {
+    std::FILE* f = BlendsFile();
+    if (!f) return;
+    static std::unordered_map<u32, float> before;           // each transform's step before
+    static const auto start = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    std::unordered_map<u32, float> moved_now;
+    for (const auto& [address, now] : g_now) {
+        const auto last = g_last.find(address);
+        if (last == g_last.end()) continue;
+        const float* a = last->second.m;
+        const float* b = now.m;
+        const float d[3] = {b[12] - a[12], b[13] - a[13], b[14] - a[14]};
+        const float moved = std::sqrt(Dot3(d, d));
+        const float trace = Dot3(a, b) + Dot3(a + 4, b + 4) + Dot3(a + 8, b + 8);
+        const float turn = std::acos(std::min(1.0f, std::max(-1.0f, (trace - 1.0f) / 2.0f))) * 57.29578f;
+        const bool flip = (Determinant(a) < 0.0f) != (Determinant(b) < 0.0f);
+        const auto was = before.find(address);
+        const float prior = was != before.end() ? was->second : -1.0f;
+        moved_now.emplace(address, moved);
+        const char* why = flip ? "flip"
+                          : (prior >= 0.0f && moved > 1.0f && moved > 4.0f * prior) ? "jump"
+                          : moved > 10.0f ? "far"
+                          : turn > 30.0f ? "turn"
+                                         : nullptr;
+        if (!why) continue;
+        std::fprintf(f, "%.1f,%llu,%u,%08X,%s,%.3f,%.3f,%.1f,%.2f,%.2f,%.2f,%d\n", ms, g_frames, g_steps,
+                     unsigned(address), why, moved, prior, turn, b[12], b[13], b[14], moved > g_game.cut ? 1 : 0);
+    }
+    before.swap(moved_now);
 }
 
 /* The transforms and the cameras' values as the step left them. */
@@ -229,14 +349,35 @@ void TakeDown() {
     }
     g_last.swap(g_now);
     g_now.clear();
+    // The regions read whole every kRescan steps; between, only where a
+    // transform was (Burnout 3's ~850 of 2 MB) - a transform made since is
+    // blended from the next look on, a few steps later.
+    constexpr unsigned kRescan = 4;
+    if (++g_steps % kRescan != 0 && !g_known.empty()) {
+        for (u32 address : g_known) {
+            const u8* p = generated::RamPointer(address, 64);
+            Matrix m;
+            if (!p) continue;
+            std::memcpy(m.m, p, sizeof m.m);
+            if (Shaped(m.m)) g_now.emplace(address, m);
+        }
+        return;
+    }
+    g_known.clear();
     for (const HighFpsRegion& region : g_game.transforms) {
         const u8* base = generated::RamPointer(region.begin, region.end - region.begin);
         if (!base) continue;
         for (u32 at = 0; at + 64 <= region.end - region.begin; at += 16) {
+            // The right row's length first, in place: most of 2 MB a step is
+            // no matrix, and the copy of each candidate was most of the scan.
+            float right[3];
+            std::memcpy(right, base + at, sizeof right);
+            if (!(std::fabs(Dot3(right, right) - 1.0f) < 0.01f)) continue;
             Matrix m;
             std::memcpy(m.m, base + at, sizeof m.m);
             if (!Shaped(m.m)) continue;
             g_now.emplace(region.begin + at, m);
+            g_known.push_back(region.begin + at);
             at += 48;                   // (its rows are not another's)
         }
     }
@@ -284,7 +425,7 @@ void Place(u32 address, const Matrix& last, const Matrix& now, float t) {
     const float moved = std::sqrt(Dot3(d, d));
     bool turned = false;
     for (int k = 0; k < 12 && !turned; ++k) turned = now.m[k] != last.m[k];
-    if ((moved == 0.0f && !turned) || moved > g_game.cut) return;
+    if ((moved == 0.0f && !turned) || moved > g_game.cut || Teleported(address)) return;
     u8* p = generated::RamPointer(address, 64);
     if (!p) return;
     Placed placed{address, {}, {}};
@@ -312,16 +453,42 @@ void PlaceBetween(float t) {
         if (!camera || v.cut) continue;
         std::memcpy(v.was.data(), camera, count * sizeof(float));
         std::memcpy(v.placed.data(), camera, count * sizeof(float));
-        const int way = v.flipped ? g_game.cameras[k].direction : -1;
+        const HighFpsCamera& c = g_game.cameras[k];
+        const int way = v.flipped ? c.direction : -1;
+        const int q = c.quaternion ? c.direction : -1;
         for (size_t i = 0; i < count; ++i) {
             const float a = v.last[i], b = v.now[i];
+            if (q >= 0 && int(i) >= q && int(i) < q + 4) continue;           // (the quaternion: below)
             if (a == b || !AValue(a) || !AValue(b) || !(std::fabs(b - a) < g_game.cut)) continue;
             if (way >= 0 && int(i) >= way && int(i) < way + 3) continue;    // (turned round: the step's)
             v.placed[i] = a + t * (b - a);
         }
+        if (q >= 0) {
+            // The rotation between, as one: the step before's turned to the
+            // same side as the last's (q and -q are one rotation), blended,
+            // its length 1 again - at t 1 the last's as it is.
+            const float* a = v.last.data() + q;
+            const float* b = v.now.data() + q;
+            const float side = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3] < 0.0f ? -1.0f : 1.0f;
+            float r[4], length = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                r[i] = side * a[i] + t * (b[i] - side * a[i]);
+                length += r[i] * r[i];
+            }
+            const float lb = b[0] * b[0] + b[1] * b[1] + b[2] * b[2] + b[3] * b[3];
+            if (length > 1e-12f && lb > 1e-12f) {
+                const float scale = std::sqrt(lb / length);     // (the last's length, as the game had it)
+                for (int i = 0; i < 4; ++i) v.placed[size_t(q + i)] = r[i] * scale;
+            }
+        }
         std::memcpy(camera, v.placed.data(), count * sizeof(float));
         v.placing = true;
     }
+    // A camera cut in this step (shown as the step left it): the transforms
+    // too - blended, a car lagged the camera's new place by up to its step
+    // for the step's pictures, then caught up (a twitch at every cut).
+    for (const CameraValues& v : g_cameras)
+        if (v.cut) return;
     for (const auto& [address, now] : g_now) {
         const auto last = g_last.find(address);
         if (last != g_last.end()) Place(address, last->second, now, t);
@@ -359,10 +526,13 @@ std::FILE* TraceFile() {
         const char* path = std::getenv("PS2HOST_HIGH_FPS_TRACE");
         std::FILE* f = path ? std::fopen(path, "w") : nullptr;
         if (f) {
-            std::fprintf(f, "frame,ms,rate,ticks,t,placed");
+            std::fprintf(f, "frame,ms,rate,ticks,t,placed,blanks,known");
             for (size_t k = 0; k < g_game.cameras.size(); ++k)
                 std::fprintf(f, ",c%zu_last_x,c%zu_last_y,c%zu_last_z,c%zu_now_x,c%zu_now_y,c%zu_now_z,"
                              "c%zu_x,c%zu_y,c%zu_z,c%zu_step,c%zu_turn", k, k, k, k, k, k, k, k, k, k, k);
+            for (size_t k = 0; k < g_game.subjects.size(); ++k)
+                std::fprintf(f, ",s%zu_addr,s%zu_off,s%zu_last_x,s%zu_last_y,s%zu_last_z,s%zu_now_x,s%zu_now_y,"
+                             "s%zu_now_z,s%zu_x,s%zu_y,s%zu_z,s%zu_placed", k, k, k, k, k, k, k, k, k, k, k, k);
             std::fprintf(f, "\n");
         }
         return f;
@@ -370,13 +540,60 @@ std::FILE* TraceFile() {
     return file;
 }
 
+/* Each subject's transform: the one nearest the position the game keeps
+   (kept while within 3 units: a car's wheels are near its body), where the
+   last two steps left it and where it was placed (as the last left it: not
+   placed - it did not move, or it was not found since the last look). */
+void TraceSubjects(std::FILE* f) {
+    static std::vector<u32> chosen;
+    chosen.resize(g_game.subjects.size(), 0);
+    for (size_t k = 0; k < g_game.subjects.size(); ++k) {
+        float at[3] = {};
+        if (const u8* p = generated::RamPointer(g_game.subjects[k], 12)) std::memcpy(at, p, sizeof at);
+        auto distance = [&](const Matrix& m) {
+            const float d[3] = {m.m[12] - at[0], m.m[13] - at[1], m.m[14] - at[2]};
+            return std::sqrt(Dot3(d, d));
+        };
+        const auto kept = g_now.find(chosen[k]);
+        if (kept == g_now.end() || distance(kept->second) > 3.0f) {
+            float best = 1e30f;
+            chosen[k] = 0;
+            for (const auto& [address, m] : g_now) {
+                const float d = distance(m);
+                if (d < best) {
+                    best = d;
+                    chosen[k] = address;
+                }
+            }
+        }
+        const auto now = g_now.find(chosen[k]);
+        const auto last = g_last.find(chosen[k]);
+        if (now == g_now.end()) {
+            std::fprintf(f, ",0,0,0,0,0,0,0,0,0,0,0,0");
+            continue;
+        }
+        const Matrix& b = now->second;
+        const Matrix& a = last != g_last.end() ? last->second : b;
+        const float* placed = b.m + 12;
+        bool was_placed = false;
+        for (const Placed& p : g_placed)
+            if (p.address == chosen[k]) {
+                placed = p.placed.m + 12;
+                was_placed = true;
+            }
+        std::fprintf(f, ",%08X,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d", chosen[k], distance(b),
+                     a.m[12], a.m[13], a.m[14], b.m[12], b.m[13], b.m[14], placed[0], placed[1], placed[2],
+                     was_placed ? 1 : 0);
+    }
+}
+
 void Trace(float t) {
     std::FILE* f = TraceFile();
     static unsigned long long traced = 0;
     if (!f || traced == g_frames) return;
     traced = g_frames;
-    std::fprintf(f, "%llu,%.3f,%.0f,%u,%.4f,%zu", g_frames, double(ClockNs()) / 1e6, g_rate, g_frame_steps,
-                 double(t), g_placed.size());
+    std::fprintf(f, "%llu,%.3f,%.0f,%u,%.4f,%zu,%u,%zu", g_frames, double(ClockNs()) / 1e6, g_rate, g_frame_steps,
+                 double(t), g_placed.size(), g_frame_blanks, g_now.size());
     for (size_t k = 0; k < g_game.cameras.size(); ++k) {
         const HighFpsCamera& camera = g_game.cameras[k];
         const CameraValues& v = g_cameras[k];
@@ -389,6 +606,7 @@ void Trace(float t) {
         std::fprintf(f, ",%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.5f", a[0], a[1], a[2], b[0], b[1], b[2],
                      placed[0], placed[1], placed[2], std::sqrt(Dot3(d, d)), dot);
     }
+    TraceSubjects(f);
     std::fprintf(f, "\n");
     if (g_frames % 120 == 0) std::fflush(f);
 }
@@ -419,6 +637,9 @@ bool Blend() {
 void Reset() {
     g_last.clear();
     g_now.clear();
+    g_known.clear();
+    g_stepped.clear();
+    g_stepped_before.clear();
     g_time = 1.0;
     g_behind = 0.0;
     g_counted = false;
@@ -447,6 +668,7 @@ bool HighFpsFrameSteps(u32 steps_so_far, unsigned blanks) {
     ++g_frames;
     if (g_rate > 0.0) KeepUp();
     g_frame_steps = g_counted ? steps_so_far - g_step_count : 1;
+    g_frame_blanks = blanks;
     g_step_count = steps_so_far;
     g_counted = true;
     if (g_rate > 0.0) {
@@ -461,7 +683,45 @@ bool HighFpsFrameSteps(u32 steps_so_far, unsigned blanks) {
 }
 
 void HighFpsStepped() {
-    if (g_rate > 0.0) TakeDown();
+    if (g_rate > 0.0) {
+        TakeDown();
+        Measure();
+        LogBlends();
+    }
+}
+
+/* Rising (g_target): an eighth of the way from the game's own rate at a
+   time, each after RiseMs / 8 - and only when none of the pictures since the
+   last eighth was shown late (LatePictures): a GPU still clocked down holds
+   the rate where it keeps up until its clocks come up (an RTX 4070 Laptop at
+   P5 drew a race's view at about 60 a second, and boosted only after half a
+   second near 100%); never lower. Past 8 RiseMs, the target whatever came. */
+void Rise() {
+    if (g_target <= 0.0 || g_rate <= 0.0) return;
+    static std::chrono::steady_clock::time_point step_from;
+    static u64 late_from = 0;
+    static int part = 1;
+    const auto now = std::chrono::steady_clock::now();
+    if (g_rise_new) {
+        g_rise_new = false;
+        step_from = now;
+        late_from = LatePictures();
+        part = 1;
+    }
+    const double step_ms = std::chrono::duration<double, std::milli>(now - step_from).count();
+    const double all_ms = std::chrono::duration<double, std::milli>(now - g_rise_from).count();
+    if (all_ms >= 8.0 * RiseMs()) part = 8;
+    else if (step_ms >= RiseMs() / 8.0) {
+        if (LatePictures() == late_from) ++part;
+        step_from = now;
+        late_from = LatePictures();
+    }
+    const double rate = part >= 8 ? g_target : Own() + (g_target - Own()) * part / 8.0;
+    if (rate > g_rate + 0.5) {
+        g_rate = rate;
+        g_per_picture = Pace(rate);
+    }
+    if (part >= 8) g_target = 0.0;
 }
 
 void HighFpsPicture() {
@@ -471,7 +731,7 @@ void HighFpsPicture() {
     const bool running = Running();
     if (!running) g_cap = 0.0;          // (the next run tries the setting's rate again)
     const double want = running ? Wanted() : Own();
-    const double now = g_rate > 0.0 ? g_rate : Own();
+    const double now = g_target > 0.0 ? g_target : g_rate > 0.0 ? g_rate : Own();
     differing = std::fabs(want - now) >= 0.5 ? differing + 1 : 0;
     if (differing >= (want > Own() ? 1 : g_game.settle)) {
         differing = 0;
@@ -481,15 +741,22 @@ void HighFpsPicture() {
         g_sampled = 0;
         g_looks = 0;
         if (want > Own()) {
-            g_rate = want;
-            g_per_picture = Pace(want);
+            // From the game's own rate: rising to it (Rise).
+            const bool rising = g_rate <= 0.0 && RiseMs() > 0.0;
+            g_target = rising ? want : 0.0;
+            g_rise_from = std::chrono::steady_clock::now();
+            g_rise_new = rising;
+            g_rate = rising ? Own() + (want - Own()) / 8.0 : want;
+            g_per_picture = Pace(g_rate);
         } else {
+            g_target = 0.0;
             g_rate = 0.0;
             g_per_picture = 1.0;
             SetBlankRate(0.0);
             SetFastForward(1);
         }
     }
+    Rise();
     if (g_rate > 0.0 && Blend()) {
         PutBack();
         PlaceBetween(g_picture_time);
@@ -522,6 +789,7 @@ void HighFpsLeave(const char* why) {
     if (g_rate <= 0.0) return;
     std::fprintf(stderr, "[high fps] %.0f pictures a second (%s)\n", Own(), why);
     g_cap = 0.0;
+    g_target = 0.0;
     g_placed.clear();
     for (CameraValues& v : g_cameras) v.placing = false;
     g_rate = 0.0;

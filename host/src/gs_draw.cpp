@@ -318,7 +318,7 @@ void Gs::Draw() {
                      1u << Bits(c.tex0, 26, 4), 1u << Bits(c.tex0, 30, 4), Bits(c.tex0, 37, 14),
                      Bits(c.tex0, 51, 4), Bits(c.tex0, 55, 1), Bits(c.tex0, 56, 5), Bits(c.tex0, 61, 3),
                      v.x, v.y, w.x, w.y, v.u, v.v, w.u, w.v, v.s, v.t, w.s, w.t, v.q, w.q, w.r, w.g, w.b, w.a, v.z, w.z,
-                     rgba_source_, xyz_source_);
+                     gif.rgba_source, gif.xyz_source);
         if (queued_ == 3)
             std::fprintf(trace_out, "[gs]   middle vertex (%.1f,%.1f) st (%.4f,%.4f) q %.4f\n", queue_[1].x,
                          queue_[1].y, queue_[1].s, queue_[1].t, queue_[1].q);

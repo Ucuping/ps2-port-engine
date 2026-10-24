@@ -33,6 +33,7 @@
 #include <unordered_set>
 
 #include "gpu_internal.h"
+#include "effects.h"
 #include "gs_frag.h"
 #include "gs_frag_single.h"
 #include "gs_frag_blend.h"
@@ -162,7 +163,7 @@ constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
 
 struct Texture {
     Image image;
-    VkDescriptorSet sets[8] = {};       /* by sampler */
+    VkDescriptorSet sets[28] = {};      /* by sampler (samplers_, then replacement_samplers_) */
     /* A texture drawn as a texture pack's replacement (UseReplacement): its
        id, 0 for none. A replacement itself (replacements_): gs.frag's
        tex_format for it - bit 8, levels - 1 in bits 9-11 - when it was last
@@ -397,7 +398,7 @@ bool SameBatch(const GsDrawState& x, const GsDrawState& y) {
     // Most primitives come with the very state of the one before (the
     // bridge's fast path): the same bytes are the same fields, at once.
     if (std::memcmp(&x, &y, sizeof x) == 0) return true;
-    return x.fbp == y.fbp && x.fbw == y.fbw && x.psm == y.psm && x.fbmsk == y.fbmsk && x.scissor_x0 == y.scissor_x0 &&
+    return x.tag == y.tag && x.fbp == y.fbp && x.fbw == y.fbw && x.psm == y.psm && x.fbmsk == y.fbmsk && x.scissor_x0 == y.scissor_x0 &&
            x.scissor_y0 == y.scissor_y0 && x.scissor_x1 == y.scissor_x1 && x.scissor_y1 == y.scissor_y1 &&
            x.textured == y.textured && (!x.textured || (x.texture == y.texture && x.tfx == y.tfx &&
            x.tcc == y.tcc && x.bilinear == y.bilinear && x.mip == y.mip && x.wms == y.wms && x.wmt == y.wmt && x.minu == y.minu &&
@@ -472,6 +473,7 @@ public:
     bool ReadDepth(std::uint32_t zbp, std::uint32_t width, std::uint32_t height, std::vector<std::uint32_t>* z) override;
     std::uint32_t Scale() const override { return scale_; }
     void SetScale(std::uint32_t scale) override;
+    void SetScaleRule(std::uint32_t fbp_begin, std::uint32_t fbp_end, std::uint32_t max_fbw) override;
     void MemoryWrite(std::uint32_t begin, std::uint32_t end, const std::uint8_t* bytes) override;
     void MemoryRead(std::uint32_t begin, std::uint32_t end, std::uint8_t* bytes) override;
     void MemoryPatch(const std::uint32_t* words, std::size_t count) override;
@@ -489,6 +491,8 @@ public:
     void ClutRows(const std::uint32_t* clut, std::uint32_t rows) override;
     bool CanShuffle() const override { return shuffle_pipeline_ != VK_NULL_HANDLE; }
     void ChannelShuffle(const GsShuffle& shuffle) override;
+    bool CanRunEffects() const override { return effects_.ready(); }
+    void RunEffect(const GsEffect& effect) override;
     bool ReadTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::vector<std::uint32_t>* pixels,
                     std::uint32_t* width, std::uint32_t* height) override;
     bool ReadTargetFull(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::vector<std::uint32_t>* pixels,
@@ -613,7 +617,12 @@ private:
        1024x256 over its glow's memory, read as PSMT8H, brought back from
        memory 18 times a splitscreen frame and never drawn into: at 3x its
        reloads were a third of the swizzles. */
-    std::uint32_t ScaleOf(std::uint32_t width) const { return width <= 320 || width >= 1024 ? 1u : scale_; }
+    std::uint32_t ScaleOf(std::uint32_t width, std::uint32_t fbp) const {
+        if (fbp >= rule_begin_ && fbp < rule_end_ && width <= rule_max_fbw_ * 64) return scale_;
+        return width <= 320 || width >= 1024 ? 1u : scale_;
+    }
+    std::uint32_t rule_begin_ = 0, rule_end_ = 0, rule_max_fbw_ = 0;       // SetScaleRule
+    void DropImages();
     Image* open_target_ = nullptr;
     Image* open_depth_ = nullptr;
     void EndPass(VkCommandBuffer cmd, PassEnd why = kEndOther) {
@@ -632,7 +641,18 @@ private:
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     bool keep_colour_ = false;      /* ReloadKeepsColour */
-    VkSampler samplers_[8] = {};    /* bilinear << 2 | clamp_s << 1 | clamp_t */
+    VkSampler samplers_[28] = {};   /* bilinear << 2 | clamp_s << 1 | clamp_t; from 8 a texture pack's
+                                       (ReplacementSampler) */
+    /* A texture pack's replacement, filtered by the GPU (gs.frag's
+       ReplacedSample): linear in and between its levels, CLAMP's REPEAT or
+       CLAMP each way (clamp_s << 1 | clamp_t) and 1, 2, 4, 8 or 16 taps of
+       anisotropy (the player's ANISOTROPIC: GsDrawState::tag bits 8-12) -
+       one of samplers_' from 8. */
+    static int ReplacementSampler(const GsDrawState& s) {
+        const int clamps = int((s.wms & 1u) << 1 | (s.wmt & 1u));
+        const int taps = ((s.tag >> 11) & 3u) == 3u ? int(std::min((s.tag >> 8) & 7u, 4u)) : 0;
+        return 8 + clamps * 5 + taps;
+    }
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     std::map<std::uint32_t, VkPipeline> pipelines_;
     std::uint32_t last_pipeline_key_ = ~0u;
@@ -740,6 +760,7 @@ private:
         std::uint64_t recording = ~0ull;
         VkPipeline pipeline = VK_NULL_HANDLE;
         VkDescriptorSet sets[2] = {};
+        VkDescriptorSet set2 = VK_NULL_HANDLE;     // gs.frag's set 2
         int depth_test = -1, stencil_test = -1, compare = -1, depth_write = -1;
         VkViewport viewport{};
         VkRect2D scissor{};
@@ -809,6 +830,39 @@ private:
     GsShuffle shuffle_wait_;
     std::int32_t shuffle_period_ = 0, shuffle_count_ = 0;
     void RecordShuffle();
+    /* The PC's effects (RunEffect, effects.cpp). */
+    GsEffects effects_{g_};
+    /* The scene's depth GsEffects saved, as gs.frag's set 2 (soft
+       particles): made again when its view changes; null for none. */
+    VkDescriptorSet scene_set_ = VK_NULL_HANDLE;
+    VkImageView scene_view_ = VK_NULL_HANDLE;
+    VkDescriptorSet SceneDepthSet() {
+        const VkImageView view = effects_.SceneDepth();
+        if (!view) return VK_NULL_HANDLE;
+        if (view == scene_view_ && scene_set_) return scene_set_;
+        if (!scene_set_) {
+            VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            ai.descriptorPool = pool_;
+            ai.descriptorSetCount = 1;
+            ai.pSetLayouts = &set_layout_;
+            if (vkAllocateDescriptorSets(g_.device, &ai, &scene_set_) != VK_SUCCESS) return VK_NULL_HANDLE;
+        }
+        // (once the GPU is done with the set as it was: a scale's change, idle)
+        const VkDescriptorImageInfo info[2] = {
+            {samplers_[3], view, VK_IMAGE_LAYOUT_GENERAL},
+            {samplers_[3], blank_.image.words, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+        VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        for (int i = 0; i < 2; ++i) {
+            writes[i].dstSet = scene_set_;
+            writes[i].dstBinding = std::uint32_t(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[i].pImageInfo = &info[i];
+        }
+        vkUpdateDescriptorSets(g_.device, blank_.image.words ? 2 : 1, writes, 0, nullptr);
+        scene_view_ = view;
+        return scene_set_;
+    }
 };
 
 void* VulkanGsRenderer::Vertices(VkDeviceSize bytes, VkBuffer* buffer, VkDeviceSize* offset) {
@@ -979,6 +1033,7 @@ bool VulkanGsRenderer::MakeImage(Image& t, std::uint32_t width, std::uint32_t he
 }
 
 void VulkanGsRenderer::DestroyImage(Image& t) {
+    effects_.ForgetView(t.view);
     if (t.view) vkDestroyImageView(g_.device, t.view, nullptr);
     if (t.words) vkDestroyImageView(g_.device, t.words, nullptr);
     if (t.depth_view) vkDestroyImageView(g_.device, t.depth_view, nullptr);
@@ -1078,6 +1133,21 @@ bool VulkanGsRenderer::Init(std::string* error) {
         sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sci.maxLod = 0.0f;
         vkCreateSampler(g_.device, &sci, nullptr, &samplers_[i]);
+    }
+    for (int i = 0; i < 20; ++i) {              // ReplacementSampler's
+        const int clamps = i / 5, taps = 1 << (i % 5);
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        sci.addressModeU = (clamps & 2) ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sci.addressModeV = (clamps & 1) ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxLod = 16.0f;
+        if (taps > 1 && g_.anisotropy > 1.0f) {
+            sci.anisotropyEnable = VK_TRUE;
+            sci.maxAnisotropy = std::min(float(taps), g_.anisotropy);
+        }
+        vkCreateSampler(g_.device, &sci, nullptr, &samplers_[8 + i]);
     }
     VkPushConstantRange push[2] = {{VK_SHADER_STAGE_VERTEX_BIT, 0, 8},
                                    {VK_SHADER_STAGE_FRAGMENT_BIT, kFragmentOffset, sizeof(FragmentParams)}};
@@ -1261,6 +1331,7 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         return false;
     }
     MakeShufflePipeline();
+    effects_.Init(cache_);
     {
         VkShaderModuleCreateInfo pi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         pi.codeSize = sizeof spirv_patch_comp;
@@ -1764,6 +1835,46 @@ void VulkanGsRenderer::RecordShuffle() {
     });
 }
 
+void VulkanGsRenderer::RunEffect(const GsEffect& e) {
+    if (!effects_.ready()) return;
+    Flush();                                    // the draws before it, recorded
+    auto target = targets_.find(Key{e.fbp, e.fbw, e.psm});
+    if (target == targets_.end() || !target->second.image) return;
+    Image& t = target->second;
+    Image* d = nullptr;
+    if (e.depth) {
+        auto depth = depths_.find(Key{e.zbp, e.zwidth, e.zheight});
+        if (depth != depths_.end() && depth->second.depth_view) d = &depth->second;
+    }
+    GsEffects::Target view;
+    view.view = t.view;
+    view.pw = t.pw();
+    view.ph = t.ph();
+    view.scale = t.scale;
+    g_.Record([&](VkCommandBuffer cmd) {
+        drawn_ = DrawState{};
+        if (d) {
+            Transition(cmd, *d, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            view.depth_view = d->depth_view;
+        }
+        if (t.layout == VK_IMAGE_LAYOUT_GENERAL) {
+            ++g_barriers;
+            VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                                 &b, 0, nullptr, 0, nullptr);
+        }
+        Transition(cmd, t, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        effects_.Record(cmd, e, view);
+        MemoryBarrier(cmd);                     // (what it wrote, to the draws after: the scene's depth)
+        ++g_dispatches;
+        g_.Mark(cmd, kProfEffects);
+    });
+}
+
 void VulkanGsRenderer::TargetRowsFromMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm,
                                             std::uint32_t width, std::uint32_t height, std::uint32_t first_row,
                                             std::uint32_t rows, std::uint32_t first_col, std::uint32_t end_col) {
@@ -1818,9 +1929,22 @@ void VulkanGsRenderer::DepthFromMemory(std::uint32_t zbp, std::uint32_t width, s
     });
 }
 
+void VulkanGsRenderer::SetScaleRule(std::uint32_t fbp_begin, std::uint32_t fbp_end, std::uint32_t max_fbw) {
+    if (fbp_begin == rule_begin_ && fbp_end == rule_end_ && max_fbw == rule_max_fbw_) return;
+    DropImages();
+    rule_begin_ = fbp_begin;
+    rule_end_ = fbp_end;
+    rule_max_fbw_ = max_fbw;
+}
+
 void VulkanGsRenderer::SetScale(std::uint32_t scale) {
     scale = std::min(std::max(1u, scale), kMaxScale);
     if (scale == scale_) return;
+    DropImages();
+    scale_ = scale;
+}
+
+void VulkanGsRenderer::DropImages() {
     // Every target, depth buffer and feedback copy goes (the caller has had
     // what the GPU drew written to its local memory first); they come back
     // at the new size, from memory, as they are next asked for. The linear
@@ -1846,7 +1970,7 @@ void VulkanGsRenderer::SetScale(std::uint32_t scale) {
     targets_.clear();
     depths_.clear();
     feedbacks_.clear();
-    scale_ = scale;
+    effects_.Forget();
 }
 
 namespace {
@@ -2597,7 +2721,7 @@ Image* VulkanGsRenderer::TargetFor(const GsDrawState& state) {
     MakeImage(t, state.width, state.height,
               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                   VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
-              VK_FORMAT_R8G8B8A8_UNORM, ScaleOf(state.width));
+              VK_FORMAT_R8G8B8A8_UNORM, ScaleOf(state.width, state.fbp));
     // Local memory starts as zeros.
     g_.Record([&](VkCommandBuffer cmd) {
         Transition(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -2616,7 +2740,7 @@ Image* VulkanGsRenderer::DepthFor(std::uint32_t key, std::uint32_t width, std::u
     MakeImage(d, width, height,
               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-              kDepthFormat, ScaleOf(width));
+              kDepthFormat, ScaleOf(width, key & 0xFFFFu));
     // Local memory starts as zeros: the farthest Z.
     g_.Record([&](VkCommandBuffer cmd) {
         Transition(cmd, d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -2960,8 +3084,11 @@ void VulkanGsRenderer::Flush() {
             }
         }
     }
-    // The shader addresses and filters texels itself (texelFetch), as the GS does.
-    const int sampler = 3;
+    // The shader addresses and filters texels itself (texelFetch), as the GS
+    // does - but a texture pack's replacement in REPEAT or CLAMP, which the
+    // GPU filters (ReplacementSampler).
+    const int sampler = (texture->replaced & 0x100u) && state_.wms < 2 && state_.wmt < 2
+                            ? ReplacementSampler(state_) : 3;
     VkDescriptorSet set = SetFor(*texture, sampler);
     // Render to texture: the target itself, or a copy when it is also drawn into.
     Image* source = nullptr;
@@ -3065,6 +3192,12 @@ void VulkanGsRenderer::Flush() {
                        std::uint32_t(state_.d) << 6;
     if (state_.textured && t->scale > 1) params.blend_ops |= (t->scale & 0xFFu) << 8;
     if (Is16Bit(state_.psm)) params.blend_ops |= 1u << 16;    // gs.frag: colour cut to five bits a channel
+    if (state_.tag & 1u) params.blend_ops |= 1u << 19;          // gs.frag: the paint's Fresnel term
+    if (state_.tag & 2u) params.blend_ops |= 1u << 20;          // gs.frag: modern texture filtering
+    params.blend_ops |= ((state_.tag >> 8) & 7u) << 22 |       // ...its taps, and the player's filter
+                        ((state_.tag >> 11) & 3u) << 25;
+    if ((state_.tag & 4u) && !ShaderBlend(state_) && SceneDepthSet())
+        params.blend_ops |= 1u << 21;                           // gs.frag: a soft particle
     params.blend_ops |= std::uint32_t(Blender16(state_)) << 17;     // gs.frag: S for the blender
     const std::uint32_t count = std::uint32_t(pending_.size());
     static int complaints = 0;
@@ -3156,9 +3289,14 @@ void VulkanGsRenderer::Flush() {
                 d.sets[1] = clut_set_;
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 2, d.sets, 0, nullptr);
             }
-            if (destination_set)
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 2, 1, &destination_set, 0,
-                                        nullptr);
+            // Set 2: the copy blending in the shader reads, the scene's depth
+            // for a soft particle, or the blank texture (bound all the same).
+            VkDescriptorSet set2 = destination_set;
+            if (!set2) set2 = (state_.tag & 4u) && SceneDepthSet() ? SceneDepthSet() : SampledSet(blank_.image);
+            if (set2 && d.set2 != set2) {
+                d.set2 = set2;
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 2, 1, &set2, 0, nullptr);
+            }
             const VkViewport vp{0, 0, float(t->pw()), float(t->ph()), 0, 1};
             if (std::memcmp(&vp, &d.viewport, sizeof vp) != 0) {
                 d.viewport = vp;
@@ -3462,7 +3600,7 @@ std::uint64_t GpuBusyNanoseconds() { return g_gpu_ns.load(); }
 std::string GpuProfileReport() {
     static const char* const kNames[kProfKinds] = {"other", "draws", "swizzle", "image<->linear", "memory copies",
                                                    "feedback copies", "decodes", "uploads", "clears", "DATE",
-                                                   "read-backs"};
+                                                   "read-backs", "effects"};
     std::uint64_t total = 0, ns[kProfKinds];
     for (int i = 0; i < kProfKinds; ++i) total += ns[i] = g_profile_ns[i].exchange(0);
     if (!total) return "";

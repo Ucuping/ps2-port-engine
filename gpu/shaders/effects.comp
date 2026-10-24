@@ -1,0 +1,453 @@
+#version 450
+// The PC's effects on a game's picture (GsRenderer::RunEffect, effects.cpp):
+// each pass of each effect, chosen by PASS at build time. Every pass sees
+// the same bindings - the target (the game's picture, RGBA8, its alpha the
+// game's and kept), its depth buffer, one image to write and two to read -
+// and the same push constants: the view's rectangle in the image written,
+// that image's size, and the effect's parameters as the game's port sent
+// them (gs_renderer.h's GsEffect).
+//
+// Depth: the depth buffer holds the GS's Z / 2^32; the port gives the
+// camera's mapping, Z = a / w + b (RenderWare's zScale and zShift), so the
+// view-space distance is a / (Z - b). The view window's half extents (at
+// distance 1) place a pixel in view space.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba8) uniform image2D target;
+layout(set = 0, binding = 1, rgba16f) uniform image2D dst;
+layout(set = 0, binding = 2) uniform sampler2D target_tex;   // the target, filtered
+layout(set = 0, binding = 3) uniform sampler2D depth_tex;    // nearest
+layout(set = 0, binding = 4) uniform sampler2D src_a;        // filtered
+layout(set = 0, binding = 5) uniform sampler2D src_b;
+
+layout(push_constant) uniform Params {
+    ivec4 rect;         // the view in the target's image pixels: x0, y0, x1, y1 (exclusive)
+    ivec4 size;         // the image written: width, height; the frame's count; the target's scale
+    float p[22];
+} pc;
+
+#define PASS_TINT 0
+#define PASS_AO 1
+#define PASS_AO_BLUR_X 2
+#define PASS_AO_BLUR_Y 3
+#define PASS_AO_APPLY 4
+#define PASS_BLUR 5
+#define PASS_COPY 6
+#define PASS_BLOOM_DOWN 7
+#define PASS_BLOOM_UP 8
+#define PASS_BLOOM_APPLY 9
+#define PASS_GRADE 10
+#define PASS_SCENE_DEPTH 11
+#define PASS_DOF 12
+
+const float kTwoTo32 = 4294967296.0;
+
+// ---------------------------------------------------------------- depth and place
+
+ivec2 TargetSize() { return textureSize(target_tex, 0); }
+
+// View-space distance of a depth sample (0: the sky - nothing drawn, Z 0).
+float ViewZ(float d) {
+    const float z = d * kTwoTo32;
+    return z > pc.p[1] + 0.5 ? pc.p[0] / (z - pc.p[1]) : 1e9;
+}
+
+// The view-space point at a target pixel (centre), from its distance.
+vec3 ViewPos(vec2 pixel, float z) {
+    const vec2 lo = vec2(pc.rect.xy), hi = vec2(pc.rect.zw);
+    const vec2 ndc = (pixel - lo) / (hi - lo) * 2.0 - 1.0;
+    return vec3(ndc.x * pc.p[2] * z, -ndc.y * pc.p[3] * z, z);
+}
+
+// A view-space point back to target pixels.
+vec2 ToPixel(vec3 v) {
+    const vec2 lo = vec2(pc.rect.xy), hi = vec2(pc.rect.zw);
+    const vec2 ndc = vec2(v.x / (pc.p[2] * v.z), -v.y / (pc.p[3] * v.z));
+    return lo + (ndc * 0.5 + 0.5) * (hi - lo);
+}
+
+float DepthAt(vec2 pixel) {
+    return ViewZ(texelFetch(depth_tex, clamp(ivec2(pixel), pc.rect.xy, pc.rect.zw - 1), 0).r);
+}
+
+// Interleaved gradient noise (Jimenez): a different angle each pixel, no
+// pattern the eye picks up - the same each frame (still): with nothing
+// accumulating frames, a pattern turned each frame is grain that crawls.
+float StillNoise(vec2 pixel) {
+    return fract(52.9829189 * fract(0.06711056 * pixel.x + 0.00583715 * pixel.y));
+}
+// ...and turned each frame (the blur's jitter: the motion hides it).
+float Noise(vec2 pixel) { return StillNoise(pixel + 5.588238 * float(pc.size.z & 63)); }
+
+vec3 Luma3() { return vec3(0.2126, 0.7152, 0.0722); }
+
+// ---------------------------------------------------------------- passes
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+
+#if PASS == PASS_TINT
+    // The test: the view's rectangle times p0-2.
+    const ivec2 q = pc.rect.xy + at;
+    if (any(greaterThanEqual(q, pc.rect.zw))) return;
+    const vec4 c = imageLoad(target, q);
+    imageStore(target, q, vec4(c.rgb * vec3(pc.p[0], pc.p[1], pc.p[2]), c.a));
+
+#elif PASS == PASS_AO
+    // Ambient occlusion at half the resolution (dst: occlusion in r, the
+    // distance in g): McGuire's scalable AO - points on a spiral in a disc of
+    // `radius` world units around the pixel, each occluding as much as it
+    // lies above the pixel's surface and near it. The surface's normal from
+    // the depth around it (the nearer side of each pair: no normal across an
+    // edge). p4 radius, p5 strength, p6 the distance it fades out by.
+    if (any(greaterThanEqual(at, pc.size.xy))) return;
+    const vec2 half_lo = vec2(pc.rect.xy) * 0.5;
+    const vec2 pixel = (vec2(at) + half_lo) * 2.0 + 1.0;   // the target pixel it stands for
+    const float z = DepthAt(pixel);
+    if (z > pc.p[6]) {
+        imageStore(dst, at, vec4(1.0, z, 0.0, 0.0));
+        return;
+    }
+    const vec3 c = ViewPos(pixel, z);
+    const vec3 dx0 = ViewPos(pixel + vec2(2, 0), DepthAt(pixel + vec2(2, 0))) - c;
+    const vec3 dx1 = c - ViewPos(pixel - vec2(2, 0), DepthAt(pixel - vec2(2, 0)));
+    const vec3 dy0 = ViewPos(pixel + vec2(0, 2), DepthAt(pixel + vec2(0, 2))) - c;
+    const vec3 dy1 = c - ViewPos(pixel - vec2(0, 2), DepthAt(pixel - vec2(0, 2)));
+    const vec3 ddx = abs(dx0.z) < abs(dx1.z) ? dx0 : dx1;
+    const vec3 ddy = abs(dy0.z) < abs(dy1.z) ? dy0 : dy1;
+    vec3 n = normalize(cross(ddy, ddx));
+    if (dot(n, c) > 0.0) n = -n;                            // towards the camera
+    const float radius = pc.p[4];
+    // The disc's radius on screen, in target pixels.
+    const float screen_radius = radius / (pc.p[3] * z) * 0.5 * float(pc.rect.w - pc.rect.y);
+    if (screen_radius < 1.0) {
+        imageStore(dst, at, vec4(1.0, z, 0.0, 0.0));
+        return;
+    }
+    const int kSamples = 12;
+    const float spin = StillNoise(vec2(at)) * 6.2831853;
+    float sum = 0.0;
+    for (int i = 0; i < kSamples; ++i) {
+        const float alpha = (float(i) + 0.5) / float(kSamples);
+        const float angle = alpha * 7.0 * 6.2831853 + spin;      // seven turns of the spiral
+        const vec2 offset = vec2(cos(angle), sin(angle)) * alpha * min(screen_radius, 160.0);
+        const vec2 sp = pixel + offset;
+        const vec3 s = ViewPos(sp, DepthAt(sp));
+        const vec3 v = s - c;
+        const float vv = dot(v, v);
+        const float vn = dot(v, n);
+        const float r2 = radius * radius;
+        const float f = max(r2 - vv, 0.0);
+        sum += f * f * f * max((vn - 0.002 * z) / (vv + 0.01 * r2), 0.0);
+    }
+    const float r6 = radius * radius * radius * radius * radius * radius;
+    float ao = max(0.0, 1.0 - sum * pc.p[5] * 5.0 / (r6 * float(kSamples)));
+    // Faded out with distance, and slightly by the slope's own darkening.
+    ao = mix(ao, 1.0, smoothstep(pc.p[6] * 0.6, pc.p[6], z));
+    // Sun shadows (p10 their strength): from the pixel towards the sun (p7-9,
+    // in view space) through the depth buffer, up to p11 metres - anything
+    // on screen nearer than the ray, by less than a thickness, shades it.
+    // Only what faces the sun: the rest is in the game's own shade.
+    // The player's car (p12-14 its centre, p15 its size; 0 none): its own
+    // occlusion at a third, and no sun's shadow.
+    const float on_car = pc.p[15] > 0.0
+        ? 1.0 - smoothstep(0.7 * pc.p[15], pc.p[15], length((c - vec3(pc.p[12], pc.p[13], pc.p[14])) * vec3(1.0, 3.5, 1.0)))
+        : 0.0;
+    ao = mix(ao, 1.0 - (1.0 - ao) * 0.35, on_car);
+    const vec3 sun = vec3(pc.p[7], pc.p[8], pc.p[9]);
+    const float lit = dot(n, sun);
+    if (pc.p[10] > 0.0 && lit > 0.0 && on_car < 0.99) {
+        const int kSteps = 14;
+        const vec3 start = c + n * (0.02 + 0.002 * z);
+        float shade = 0.0;
+        float t = 0.06;
+        const float grow = pow(pc.p[11] / 0.06, 1.0 / float(kSteps));
+        for (int i = 0; i < kSteps; ++i) {
+            const vec3 q = start + sun * t * (1.0 + 0.25 * StillNoise(vec2(at) + float(i)));
+            t *= grow;
+            if (q.z < 0.3) break;
+            const vec2 qp = ToPixel(q);
+            if (any(lessThan(qp, vec2(pc.rect.xy))) || any(greaterThanEqual(qp, vec2(pc.rect.zw)))) break;
+            const float scene = DepthAt(qp);
+            const float thickness = 0.6 + 0.08 * q.z;
+            if (scene < q.z - 0.02 * q.z - 0.02 && scene > q.z - thickness) {
+                shade = 1.0;
+                break;
+            }
+        }
+        ao *= 1.0 - pc.p[10] * shade * smoothstep(0.0, 0.25, lit) * (1.0 - smoothstep(pc.p[6] * 0.5, pc.p[6], z)) *
+                    (1.0 - on_car);
+    }
+    if (pc.p[20] > 3.5) ao = pc.p[20] > 4.5 ? n.y * 0.5 + 0.5 : n.x * 0.5 + 0.5;    // (p20 4, 5: the normal)
+    else if (pc.p[20] > 2.5) ao = pc.p[21] > 0.5 ? z / 200.0 : screen_radius / 100.0;
+    imageStore(dst, at, vec4(ao, z, 0.0, 0.0));
+
+#elif PASS == PASS_AO_BLUR_X || PASS == PASS_AO_BLUR_Y
+    // A bilateral blur of the occlusion (src_a: r, distance g), one way: the
+    // samples weighted by a Gaussian and by how near their distance is.
+    if (any(greaterThanEqual(at, pc.size.xy))) return;
+#if PASS == PASS_AO_BLUR_X
+    const ivec2 step = ivec2(1, 0);
+#else
+    const ivec2 step = ivec2(0, 1);
+#endif
+    const vec2 mid = texelFetch(src_a, at, 0).rg;
+    float sum = mid.r, weight = 1.0;
+    for (int i = -4; i <= 4; ++i) {
+        if (i == 0) continue;
+        const ivec2 q = clamp(at + step * i, ivec2(0), pc.size.xy - 1);
+        const vec2 s = texelFetch(src_a, q, 0).rg;
+        const float w = exp(-float(i * i) / 8.0) * max(0.0, 1.0 - abs(s.g - mid.g) / (0.05 * mid.g + 0.1) );
+        sum += s.r * w;
+        weight += w;
+    }
+    imageStore(dst, at, vec4(sum / weight, mid.g, 0.0, 0.0));
+
+#elif PASS == PASS_AO_APPLY
+    // The occlusion over the picture: from the half-resolution image, the
+    // four around taken by how near their distance is to this pixel's.
+    const ivec2 q = pc.rect.xy + at;
+    if (any(greaterThanEqual(q, pc.rect.zw))) return;
+    const float z = DepthAt(vec2(q) + 0.5);
+    const vec2 h = (vec2(at) + 0.5) * 0.5 - 0.5;
+    const ivec2 h0 = ivec2(floor(h));
+    const vec2 f = h - vec2(h0);
+    const ivec2 hmax = textureSize(src_a, 0) - 1;
+    float sum = 0.0, weight = 0.0;
+    for (int j = 0; j < 2; ++j)
+        for (int i = 0; i < 2; ++i) {
+            const vec2 s = texelFetch(src_a, clamp(h0 + ivec2(i, j), ivec2(0), hmax), 0).rg;
+            const float w = (i == 1 ? f.x : 1.0 - f.x) * (j == 1 ? f.y : 1.0 - f.y) *
+                            (1.0 / (abs(s.g - z) / (0.02 * z + 0.05) + 0.02)) + 1e-5;
+            sum += s.r * w;
+            weight += w;
+        }
+    const float ao = sum / weight;
+    const vec4 c = imageLoad(target, q);
+    // p20: 1 the occlusion alone, 2 the distance (p21 white), 3-5 AO's own (above)
+    const vec3 shown = pc.p[20] > 1.5 && pc.p[20] < 2.5 ? vec3(fract(z / pc.p[21]), min(z / pc.p[21], 1.0), 0.0)
+                     : pc.p[20] > 0.5 ? vec3(ao) * 0.5 : c.rgb * ao;
+    imageStore(target, q, vec4(shown, c.a));
+
+#elif PASS == PASS_BLUR
+    // A camera's motion blur (dst, full resolution): each pixel's point in
+    // the world taken back to where it was on screen a frame before (p4-15:
+    // the view a frame before, from this one's - three rows of a 3x4
+    // matrix), and the picture gathered along that line. Nearer points than
+    // the pixel's own take part only as far as they themselves move (no halo
+    // of the background over them). The player's car moves with the camera:
+    // within a sphere around it (p18-21) it stays sharp.
+    // p16 the shutter (a share of a frame), p17 the most a pixel moves, as a
+    // share of the view's height.
+    const ivec2 q = pc.rect.xy + at;
+    if (any(greaterThanEqual(q, pc.rect.zw))) return;
+    const vec2 pixel = vec2(q) + 0.5;
+    const ivec2 tsize = TargetSize();
+    const vec2 texel = 1.0 / vec2(tsize);
+    const float z = min(DepthAt(pixel), 2000.0);
+    const vec3 v = ViewPos(pixel, z);
+    const vec3 prev = vec3(dot(vec4(v, 1.0), vec4(pc.p[4], pc.p[5], pc.p[6], pc.p[7])),
+                           dot(vec4(v, 1.0), vec4(pc.p[8], pc.p[9], pc.p[10], pc.p[11])),
+                           dot(vec4(v, 1.0), vec4(pc.p[12], pc.p[13], pc.p[14], pc.p[15])));
+    vec2 motion = prev.z > 0.1 ? pixel - ToPixel(prev) : vec2(0.0);
+    const float height = float(pc.rect.w - pc.rect.y);
+    // The car: what lies within p21 metres of its centre (p18-20, view
+    // space; p21 0 none) - an ellipsoid, flat, so the road around it blurs.
+    const float car = pc.p[21] > 0.0
+                    ? 1.0 - smoothstep(0.7 * pc.p[21], pc.p[21], length((v - vec3(pc.p[18], pc.p[19], pc.p[20])) * vec3(1.0, 2.2, 1.0)))
+                    : 0.0;
+    motion *= pc.p[16] * (1.0 - car);
+    const float most = pc.p[17] * height;
+    const float len = length(motion);
+    if (len > most) motion *= most / len;
+    const vec4 here = texture(target_tex, pixel * texel);
+    if (len * pc.p[16] < 0.75) {
+        imageStore(dst, at, vec4(here.rgb, -1.0));        // (unblurred: the copy leaves it)
+        return;
+    }
+    const int kTaps = 12;
+    const float jitter = Noise(pixel) - 0.5;
+    vec3 sum = here.rgb;
+    float weight = 1.0;
+    for (int i = 0; i < kTaps; ++i) {
+        const float t = ((float(i) + 0.5 + jitter) / float(kTaps) - 0.5);
+        const vec2 sp = pixel + motion * t;
+        const vec2 clamped = clamp(sp, vec2(pc.rect.xy) + 0.5, vec2(pc.rect.zw) - 0.5);
+        const float sz = DepthAt(clamped);
+        // A nearer sample (by more than a tenth) belongs to something in
+        // front: it takes part only if it is the car's (it does not move).
+        const float w = sz < z * 0.9 ? 0.0 : 1.0;
+        sum += texture(target_tex, clamped * texel).rgb * w;
+        weight += w;
+    }
+    imageStore(dst, at, vec4(sum / weight, here.a));
+
+#elif PASS == PASS_COPY
+    // dst's colour back into the target (its alpha kept).
+    const ivec2 q = pc.rect.xy + at;
+    if (any(greaterThanEqual(q, pc.rect.zw))) return;
+    const vec4 s = texelFetch(src_a, at, 0);
+    if (s.a < 0.0) return;                                  // the blur left it as it was
+    const vec4 c = imageLoad(target, q);
+    imageStore(target, q, vec4(s.rgb, c.a));
+
+#elif PASS == PASS_BLOOM_DOWN
+    // A level of the glow's chain (dst), half the one above (src_a, or the
+    // target's view for the first, p0 its threshold and p2 the knee: what
+    // is brighter, softly): 13 taps (Jimenez's), the weighted average that
+    // keeps a bright pixel from flickering as it moves.
+    if (any(greaterThanEqual(at, pc.size.xy))) return;
+    const vec2 uv = (vec2(at) + 0.5) / vec2(pc.size.xy);
+#if 1
+    const bool first = pc.p[10] > 0.5;
+    vec2 texel;
+    vec2 base;
+    vec2 span;
+    if (first) {
+        const ivec2 ts = TargetSize();
+        texel = 1.0 / vec2(ts);
+        base = vec2(pc.rect.xy) * texel;
+        span = vec2(pc.rect.zw - pc.rect.xy) * texel;
+    } else {
+        texel = 1.0 / vec2(textureSize(src_a, 0));
+        base = vec2(0.0);
+        span = vec2(1.0);
+    }
+    const vec2 c = base + uv * span;
+    const float white = pc.p[9] > 0.0 ? 1.0 / pc.p[9] : 1.0;       // p9: the picture's white (its 1.0)
+    #define S(o) (first ? texture(target_tex, c + (o) * texel).rgb * white : texture(src_a, c + (o) * texel).rgb)
+    const vec3 a = S(vec2(-2, -2)), b = S(vec2(0, -2)), cc = S(vec2(2, -2));
+    const vec3 d = S(vec2(-1, -1)), e = S(vec2(1, -1));
+    const vec3 f = S(vec2(-2, 0)), g = S(vec2(0, 0)), h = S(vec2(2, 0));
+    const vec3 i = S(vec2(-1, 1)), j = S(vec2(1, 1));
+    const vec3 k = S(vec2(-2, 2)), l = S(vec2(0, 2)), m = S(vec2(2, 2));
+    #undef S
+    vec3 sum;
+    if (first) {
+        // Each group of four by its own brightness (Karis), so one bright
+        // texel cannot glow alone.
+        vec3 g0 = (d + e + i + j) * 0.25, g1 = (a + b + f + g) * 0.25, g2 = (b + cc + g + h) * 0.25;
+        vec3 g3 = (f + g + k + l) * 0.25, g4 = (g + h + l + m) * 0.25;
+        float w0 = 0.5 / (1.0 + dot(g0, Luma3())), w1 = 0.125 / (1.0 + dot(g1, Luma3()));
+        float w2 = 0.125 / (1.0 + dot(g2, Luma3())), w3 = 0.125 / (1.0 + dot(g3, Luma3()));
+        float w4 = 0.125 / (1.0 + dot(g4, Luma3()));
+        sum = (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) / (w0 + w1 + w2 + w3 + w4);
+        // The threshold, with a soft knee.
+        const float bright = max(sum.r, max(sum.g, sum.b));
+        const float t = pc.p[0], knee = max(pc.p[2], 1e-4);
+        float soft = clamp(bright - t + knee, 0.0, 2.0 * knee);
+        soft = soft * soft / (4.0 * knee);
+        const float keep = max(soft, bright - t) / max(bright, 1e-4);
+        sum *= keep;
+    } else {
+        sum = (d + e + i + j) * 0.125 + (a + cc + k + m) * 0.03125 + (b + f + h + l) * 0.0625 + g * 0.125;
+    }
+#endif
+    imageStore(dst, at, vec4(sum, 1.0));
+
+#elif PASS == PASS_BLOOM_UP
+    // Up the chain: this level (src_b) plus the one below it (src_a) through
+    // a 3x3 tent, which is what makes the glow wide and smooth.
+    if (any(greaterThanEqual(at, pc.size.xy))) return;
+    const vec2 uv = (vec2(at) + 0.5) / vec2(pc.size.xy);
+    const vec2 t = 1.0 / vec2(textureSize(src_a, 0));
+    vec3 up = texture(src_a, uv).rgb * 4.0;
+    up += (texture(src_a, uv + vec2(-t.x, 0)).rgb + texture(src_a, uv + vec2(t.x, 0)).rgb +
+           texture(src_a, uv + vec2(0, -t.y)).rgb + texture(src_a, uv + vec2(0, t.y)).rgb) * 2.0;
+    up += texture(src_a, uv + vec2(-t.x, -t.y)).rgb + texture(src_a, uv + vec2(t.x, -t.y)).rgb +
+          texture(src_a, uv + vec2(-t.x, t.y)).rgb + texture(src_a, uv + vec2(t.x, t.y)).rgb;
+    up /= 16.0;
+    imageStore(dst, at, vec4(texelFetch(src_b, at, 0).rgb + up * pc.p[11], 1.0));
+
+#elif PASS == PASS_DOF
+    // Depth of field (dst, then copied back): focused at p6 metres (0: on
+    // what the middle of the view shows), each pixel's circle of confusion
+    // from how far its distance is from the focus's (p4 the aperture, p5 the
+    // largest circle as a share of the height); gathered from a disc of 16
+    // taps, each taking part as far as its own circle reaches this pixel (a
+    // sharp thing in focus keeps out of the blur behind it).
+    const ivec2 q = pc.rect.xy + at;
+    if (any(greaterThanEqual(q, pc.rect.zw))) return;
+    const vec2 pixel = vec2(q) + 0.5;
+    const vec2 texel = 1.0 / vec2(TargetSize());
+    const vec2 mid = (vec2(pc.rect.xy) + vec2(pc.rect.zw)) * 0.5;
+    const float height = float(pc.rect.w - pc.rect.y);
+    float focus = pc.p[6];
+    if (focus <= 0.0) {
+        // The nearest of five points about the middle (the subject is near).
+        focus = 1e9;
+        for (int i = 0; i < 5; ++i) {
+            const vec2 o = i == 0 ? vec2(0.0) : vec2(i == 1 ? -1.0 : i == 2 ? 1.0 : 0.0, i == 3 ? -1.0 : i == 4 ? 1.0 : 0.0);
+            focus = min(focus, DepthAt(mid + o * height * 0.06));
+        }
+        focus = clamp(focus, 1.0, 200.0);
+    }
+    const float most = pc.p[5] * height;
+    #define COC(z) (most * clamp(pc.p[4] * abs(min(z, 1e4) - focus) / max(min(z, 1e4), 0.3), 0.0, 1.0))
+    const float z = DepthAt(pixel);
+    const float coc = COC(z);
+    const vec4 here = texture(target_tex, pixel * texel);
+    if (coc < 0.6) {
+        imageStore(dst, at, vec4(here.rgb, -1.0));
+        return;
+    }
+    vec3 sum = here.rgb;
+    float weight = 1.0;
+    const float spin = StillNoise(pixel) * 6.2831853;
+    for (int i = 0; i < 16; ++i) {
+        const float r = sqrt((float(i) + 0.5) / 16.0);
+        const float a = float(i) * 2.39996323 + spin;          // the golden angle
+        const vec2 o = vec2(cos(a), sin(a)) * r * coc;
+        const vec2 sp = clamp(pixel + o, vec2(pc.rect.xy) + 0.5, vec2(pc.rect.zw) - 0.5);
+        const float sz = DepthAt(sp);
+        const float reach = COC(sz);
+        // A sample nearer than the focus spreads over what is behind it; one
+        // behind it only as far as its own circle.
+        const float w = clamp((max(reach, sz < z ? coc : 0.0) - r * coc) + 1.0, 0.0, 1.0);
+        sum += texture(target_tex, sp * texel).rgb * w;
+        weight += w;
+    }
+    #undef COC
+    imageStore(dst, at, vec4(sum / weight, here.a));
+
+#elif PASS == PASS_SCENE_DEPTH
+    // The scene's depth for what is drawn after (soft particles: gs.frag):
+    // into dst at the target's own pixels, the distance in r, the depth's
+    // mapping in g (a / 1024) and b (b).
+    const ivec2 q = pc.rect.xy + at;
+    if (any(greaterThanEqual(q, pc.rect.zw))) return;
+    imageStore(dst, q, vec4(DepthAt(vec2(q) + 0.5), pc.p[0] / 1024.0, pc.p[1], 1.0));
+
+#elif PASS == PASS_BLOOM_APPLY || PASS == PASS_GRADE
+    // The glow (src_a, the chain's top: p1 its strength) added, then the
+    // grade: a filmic shoulder for the bright end (p12: how much), contrast
+    // around the middle grey (p13), saturation (p14), a vignette (p15),
+    // warmth (p16: red up and blue down, a share).
+    const ivec2 q = pc.rect.xy + at;
+    if (any(greaterThanEqual(q, pc.rect.zw))) return;
+    const vec4 c = imageLoad(target, q);
+    const float white = pc.p[9] > 0.0 ? 1.0 / pc.p[9] : 1.0;       // p9: the picture's white (its 1.0)
+    vec3 col = c.rgb * white;
+    const vec2 uv = (vec2(at) + 0.5) / vec2(pc.rect.zw - pc.rect.xy);
+#if PASS == PASS_BLOOM_APPLY
+    col += texture(src_a, uv).rgb * pc.p[1];
+#endif
+    // Grade.
+    const float shoulder = pc.p[12];
+    if (shoulder > 0.0) {
+        // Above 0.6 compressed towards 1 (an exponential shoulder): lights
+        // and the glow keep their colour instead of clipping to white.
+        const vec3 over = max(col - 0.6, 0.0);
+        const vec3 soft = 0.6 + 0.4 * (1.0 - exp(-over / 0.4));
+        col = mix(col, mix(col, soft, step(0.6, col)), shoulder);
+    }
+    const float luma = dot(col, Luma3());
+    col = mix(vec3(luma), col, pc.p[14]);
+    col = (col - 0.45) * pc.p[13] + 0.45;
+    col *= vec3(1.0 + pc.p[16], 1.0, 1.0 - pc.p[16]);
+    const vec2 d = (uv - 0.5) * vec2(1.0, float(pc.rect.w - pc.rect.y) / float(pc.rect.z - pc.rect.x));
+    col *= 1.0 - pc.p[15] * smoothstep(0.25, 0.75, dot(d, d) * 2.2);
+    imageStore(target, q, vec4(clamp(col / white, 0.0, 1.0), c.a));
+#endif
+}

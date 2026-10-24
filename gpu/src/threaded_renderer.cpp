@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +28,34 @@
 namespace ps2gpu {
 
 namespace {
+
+/* A chunk of the queue: bytes appended, never zeroed first (a vector's
+   resize filled each primitive's bytes before they were copied in - its
+   memset and the copy a tenth of the GS thread in a race's crash). */
+class Chunk {
+public:
+    const std::uint8_t* data() const { return bytes_.get(); }
+    std::size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    void clear() { size_ = 0; }
+    void reserve(std::size_t capacity) {
+        if (capacity <= capacity_) return;
+        std::unique_ptr<std::uint8_t[]> bigger(new std::uint8_t[capacity]);
+        if (size_) std::memcpy(bigger.get(), bytes_.get(), size_);
+        bytes_ = std::move(bigger);
+        capacity_ = capacity;
+    }
+    std::size_t capacity() const { return capacity_; }
+    void append(const void* data, std::size_t size) {
+        if (size_ + size > capacity_) reserve(std::max(capacity_ * 2, size_ + size));
+        std::memcpy(bytes_.get() + size_, data, size);
+        size_ += size;
+    }
+
+private:
+    std::unique_ptr<std::uint8_t[]> bytes_;
+    std::size_t size_ = 0, capacity_ = 0;
+};
 
 class ThreadedGsRenderer final : public GsRenderer {
 public:
@@ -222,6 +251,23 @@ public:
         Put(&shuffle, sizeof shuffle);
         End();
     }
+    bool CanRunEffects() const override { return inner_->CanRunEffects(); }
+    void SetScaleRule(std::uint32_t fbp_begin, std::uint32_t fbp_end, std::uint32_t max_fbw) override {
+        if (fbp_begin == rule_[0] && fbp_end == rule_[1] && max_fbw == rule_[2]) return;
+        rule_[0] = fbp_begin;
+        rule_[1] = fbp_end;
+        rule_[2] = max_fbw;
+        Drain(0);
+        inner_->SetScaleRule(fbp_begin, fbp_end, max_fbw);
+        targets_.clear();                           // (every image dropped)
+        depths_.clear();
+        last_target_ = last_depth_ = ~std::uint64_t(0);
+    }
+    void RunEffect(const GsEffect& effect) override {
+        Op(kRunEffect, sizeof effect);
+        Put(&effect, sizeof effect);
+        End();
+    }
     void ClutRows(const std::uint32_t* clut, std::uint32_t rows) override {
         Op(kClutRows, 4 + 1024);
         Put(&rows, 4);
@@ -265,19 +311,45 @@ public:
         }
         scale_ = inner_->Scale();
     }
+    /* Queued with its data, in its place among the draws - not the queue
+       drained first and the GS thread waiting for the renderer at every new
+       replacement (a view's new textures, one after another). Refused here
+       as the renderer would: a format it cannot take. */
     bool UploadReplacement(std::uint64_t id, std::uint32_t format, std::uint32_t width, std::uint32_t height,
                            std::uint32_t levels, const std::uint8_t* data, std::size_t bytes) override {
-        Drain(1);
-        return inner_->UploadReplacement(id, format, width, height, levels, data, bytes);
+        if (format > 4 || width == 0 || height == 0 || (format != 0 && !BlockCompression())) return false;
+        const std::uint32_t a[4] = {format, width, height, levels};
+        Op(kUploadReplacement, 8 + sizeof a + bytes);
+        Put(&id, 8);
+        Put(a, sizeof a);
+        Put(data, bytes);
+        End();
+        queued_replacements_[id] = std::chrono::steady_clock::now();
+        return true;
     }
     // Asked each draw of a replaced texture: the renderer's own answer, safe
     // from here, not after the queue drains (that was half the GS thread
-    // with a texture pack). One evicted meanwhile is drawn once as the game
-    // has it - as the renderer does for any it no longer holds.
-    bool HasReplacement(std::uint64_t id) const override { return inner_->HasReplacement(id); }
+    // with a texture pack) - or one queued and not yet made (for a few
+    // seconds at most: one the renderer could not make, or made and evicted
+    // unseen, is then asked again). One evicted meanwhile is drawn once as
+    // the game has it - as the renderer does for any it no longer holds.
+    bool HasReplacement(std::uint64_t id) const override {
+        if (inner_->HasReplacement(id)) {
+            if (!queued_replacements_.empty()) queued_replacements_.erase(id);
+            return true;
+        }
+        const auto queued = queued_replacements_.find(id);
+        if (queued == queued_replacements_.end()) return false;
+        if (std::chrono::steady_clock::now() - queued->second < std::chrono::seconds(3)) return true;
+        queued_replacements_.erase(queued);
+        return false;
+    }
     bool BlockCompression() const override {
-        Drain(3);
-        return inner_->BlockCompression();
+        if (block_compression_ < 0) {
+            Drain(3);
+            block_compression_ = inner_->BlockCompression() ? 1 : 0;
+        }
+        return block_compression_ != 0;
     }
     // The device's, fixed as it was made: nothing queued changes it.
     bool ExactPartialMasks() const override { return inner_->ExactPartialMasks(); }
@@ -320,8 +392,12 @@ private:
         kDraw, kDrawSame, kFlush, kKick, kUploadTexture, kUseReplacement, kUploadDepth, kUploadTarget,
         kReleaseTexture, kMemoryWrite, kMemoryPatch, kTargetFromMemory, kDepthFromMemory, kTextureFromMemory,
         kClutFromMemory, kClutRows, kReloadKeepsColour, kTargetRowsFromMemory, kDepthRowsFromMemory,
-        kTargetToMemory, kDepthToMemory, kChannelShuffle,
+        kTargetToMemory, kDepthToMemory, kChannelShuffle, kRunEffect, kUploadReplacement,
     };
+    // UploadReplacement's queued and not yet seen made, by id (the GS
+    // thread's alone); the device's block compression, asked once.
+    mutable std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> queued_replacements_;
+    mutable int block_compression_ = -1;
     // The images the queue has made by its end, as VulkanGsRenderer makes
     // them: a target by (FBP, FBW, PSM) at the size first asked for, a depth
     // buffer by (ZBP, width, height); all dropped by a new scale.
@@ -347,10 +423,7 @@ private:
         Put(head, sizeof head);
     }
     void Put(const void* data, std::size_t size) {
-        if (!size) return;
-        const std::size_t at = open_.size();
-        open_.resize(at + size);
-        std::memcpy(open_.data() + at, data, size);
+        if (size) open_.append(data, size);
     }
     void End() {
         if (open_.size() >= kChunk) Submit();
@@ -371,7 +444,7 @@ private:
                 open_ = std::move(spare_.back());
                 spare_.pop_back();
             } else {
-                open_ = std::vector<std::uint8_t>();
+                open_ = Chunk();
             }
         }
         open_.clear();
@@ -391,7 +464,7 @@ private:
         for (;;) {
             wake_.wait(hold, [this] { return stop_ || !full_.empty(); });
             if (full_.empty()) return;
-            std::vector<std::uint8_t> chunk = std::move(full_.front());
+            Chunk chunk = std::move(full_.front());
             full_.pop_front();
             busy_ = true;
             hold.unlock();
@@ -412,7 +485,7 @@ private:
         return value;
     }
 
-    void Play(const std::vector<std::uint8_t>& chunk) {
+    void Play(const Chunk& chunk) {
         const std::uint8_t* at = chunk.data();
         const std::uint8_t* const end = at + chunk.size();
         GsRenderer& r = *inner_;
@@ -499,6 +572,15 @@ private:
                 }
                 case kClutFromMemory: r.ClutFromMemory(Take<GsClutLoad>(at)); break;
                 case kChannelShuffle: r.ChannelShuffle(Take<GsShuffle>(at)); break;
+                case kRunEffect: r.RunEffect(Take<GsEffect>(at)); break;
+                case kUploadReplacement: {
+                    const auto id = Take<std::uint64_t>(at);
+                    std::uint32_t a[4];
+                    std::memcpy(a, at, sizeof a);
+                    at += sizeof a;
+                    r.UploadReplacement(id, a[0], a[1], a[2], a[3], at, std::size_t(next - at));
+                    break;
+                }
                 case kClutRows: {
                     const auto rows = Take<std::uint32_t>(at);
                     std::memcpy(clut_, at, sizeof clut_);
@@ -550,16 +632,17 @@ private:
         "TargetToMemory", "DepthToMemory", "ReadDepth", "ReadTexture", "DisplayTarget", "ReadTarget",
         "ReadTargetFull", "queue full"};
     mutable unsigned drains_[kWhys] = {};
+    std::uint32_t rule_[3] = {};      // SetScaleRule's, as last passed on
     unsigned kicks_ = 0;
     // The caller's side.
-    mutable std::vector<std::uint8_t> open_;
+    mutable Chunk open_;
     GsDrawState last_;
     bool has_last_ = false;
     // Between the two.
     mutable std::mutex lock_;
     mutable std::condition_variable wake_, drained_;
-    mutable std::deque<std::vector<std::uint8_t>> full_;
-    mutable std::vector<std::vector<std::uint8_t>> spare_;
+    mutable std::deque<Chunk> full_;
+    mutable std::vector<Chunk> spare_;
     mutable bool busy_ = false;
     bool stop_ = false;
     // The renderer's thread.

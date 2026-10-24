@@ -93,7 +93,7 @@ inline GpuWaitObserver g_wait_observer = nullptr;      // SetGpuWaitObserver
 inline std::atomic<std::uint64_t> g_gpu_ns{0};
 /* PS2HOST_GPU_PROFILE: the GPU's time by what it did (GpuProfileReport). */
 enum ProfileKind { kProfOther, kProfDraw, kProfSwizzle, kProfLinear, kProfMemory, kProfFeedback, kProfDecode,
-                   kProfUpload, kProfClear, kProfDate, kProfReadback, kProfKinds };
+                   kProfUpload, kProfClear, kProfDate, kProfReadback, kProfEffects, kProfKinds };
 inline std::atomic<std::uint64_t> g_profile_ns[kProfKinds] = {};
 /* PS2HOST_GPU_PROFILE: the draws' time by their tag too (MarkDraw: the
    renderer's - its target and what kind of draw), for the report's list of
@@ -185,6 +185,7 @@ public:
     bool dual_source = false;       /* dualSrcBlend: the GS's blending */
     bool logic_op = false;          /* logicOp: FBMSK's partly masked channels */
     bool bc = false;                /* textureCompressionBC: texture packs' DDS uploaded as they are */
+    float anisotropy = 1.0f;        /* samplerAnisotropy's most (1: none): texture packs' samplers */
     bool owns_device = true;
 
 private:

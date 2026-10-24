@@ -1163,7 +1163,11 @@ void VuCompiledIsTheInterpreter() {
             const u64 a = interpreted->Run(program.entry, limit), b = ahead->Run(program.entry, limit);
             ++runs;
             if (ahead->compiled_pairs()) ++entered;
-            if (a != b || !interpreted->SameState(*ahead)) ++wrong;
+            if (a != b || !interpreted->SameState(*ahead)) {
+                ++wrong;
+                std::fprintf(stderr, "[compiled] program %zu entry %X trial %d: pairs %llu %llu (PS2HOST_VU_SAY_DIFF: what)\n",
+                             i, program.entry, trial, (unsigned long long)a, (unsigned long long)b);
+            }
         }
     }
     char what[128];

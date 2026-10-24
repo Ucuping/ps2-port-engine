@@ -11,6 +11,11 @@
 #ifdef SHADER_BLEND
 #define SINGLE_OUTPUT
 layout(set = 2, binding = 0) uniform sampler2D destination;
+#else
+// The scene's depth as the effects saw it (GsEffects' scene depth: the
+// distance in r, the depth's mapping a / 1024 in g and b in b), for a
+// game's soft particles (blend_ops bit 21).
+layout(set = 2, binding = 0) uniform sampler2D scene_depth;
 #endif
 
 layout(location = 0) in vec4 shade;
@@ -52,7 +57,10 @@ layout(push_constant) uniform Params {
     uint scale;         // a target drawn larger (the internal resolution): its pixels to a GS texel
     uint blend_ops;     // bits 0-7, SHADER_BLEND: ALPHA's A, B, C, D, two bits each; 8-15: Snap's scale;
                         // 16: a 16-bit target (five bits a channel stored); 17-18: its blend made
-                        // by the blender (gs_renderer.cpp's Blender16): 1 S written, 2 added, 3 taken away
+                        // by the blender (gs_renderer.cpp's Blender16): 1 S written, 2 added, 3 taken away;
+                        // 19 the paint's Fresnel term; 20 modern filtering, 22-24 log2 of its most taps;
+                        // 21 a soft particle; 25-26 the player's filter (1 nearest, 2 bilinear,
+                        // 3 trilinear or anisotropic: a replacement's too)
 } p;
 
 // What a draw may use, from its parameters (gs_renderer.cpp's Features): a
@@ -249,16 +257,53 @@ vec4 ReplacedLevel(vec2 r, int n, bool linear) {
     return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
 }
 
-// `r`: where in level 0's texels; `footprint`: its derivatives' larger length.
-vec4 ReplacedSample(vec2 r, float footprint) {
+// `r`: where in level 0's texels; `dx`, `dy`: its change a pixel. As the
+// game filters - or as the player chose (blend_ops 25-26): nearest, the
+// nearest level's nearest texel; bilinear, the nearest level; trilinear, two
+// levels mixed; anisotropic, up to 1 << blend_ops 22-24 taps along the
+// footprint's long axis, as SampleModern takes them.
+vec4 ReplacedSample(vec2 r, vec2 dx, vec2 dy) {
     const uint m = p.bilinear;
-    const bool linear = (m & 2u) == 0u ? (m & 1u) != 0u : ((m >> 8) & 1u) != 0u || ((m >> 5) & 7u) >= 4u;
     const int last = int((p.tex_format >> 9) & 7u);
-    const float lod = clamp(log2(max(footprint, 1e-6)), 0.0, float(last));
+    const uint forced = (p.blend_ops >> 25) & 3u;
+    const float lx = length(dx), ly = length(dy);
+    // REPEAT or CLAMP: the GPU's sampler filters it (gs_renderer.cpp's
+    // ReplacementSampler: linear in and between levels, the player's
+    // anisotropy) - one sample, where the levels by hand were 4 to 8 texels
+    // (and anisotropy's taps each); the region modes by hand still.
+    const bool by_sampler = p.wms <= 1u && p.wmt <= 1u;
+    const vec2 size0 = vec2(ReplacedSize(0));
+    if (forced == 0u) {
+        const bool linear = (m & 2u) == 0u ? (m & 1u) != 0u : ((m >> 8) & 1u) != 0u || ((m >> 5) & 7u) >= 4u;
+        if (linear && by_sampler) return floor(textureGrad(texture_image, r / size0, dx / size0, dy / size0) * 255.0 + 0.5);
+        const float lod = clamp(log2(max(max(lx, ly), 1e-6)), 0.0, float(last));
+        const int n = int(floor(lod));
+        const vec4 c0 = ReplacedLevel(r, n, linear);
+        if (!linear || n >= last || lod == float(n)) return floor(c0 + 0.5);
+        return floor(mix(c0, ReplacedLevel(r, n + 1, linear), lod - float(n)) + 0.5);
+    }
+    const float major = max(lx, ly), minor = max(min(lx, ly), 1e-6);
+    const float most = forced == 3u ? float(1u << ((p.blend_ops >> 22) & 7u)) : 1.0;
+    const float taps = clamp(ceil(major / minor), 1.0, most);
+    const float bias = most > 1.0 ? 1.0 : 0.0;
+    const float lod = clamp(log2(max(major / taps, 1e-6)) - bias, 0.0, float(last));
+    if (forced < 3u) {
+        const int n = int(min(floor(lod + 0.5), float(last)));
+        if (forced == 2u && by_sampler) return floor(textureLod(texture_image, r / size0, float(n)) * 255.0 + 0.5);
+        return floor(ReplacedLevel(r, n, forced == 2u) + 0.5);
+    }
+    if (by_sampler) return floor(textureGrad(texture_image, r / size0, dx / size0, dy / size0) * 255.0 + 0.5);
     const int n = int(floor(lod));
-    const vec4 c0 = ReplacedLevel(r, n, linear);
-    if (!linear || n >= last || lod == float(n)) return floor(c0 + 0.5);
-    return floor(mix(c0, ReplacedLevel(r, n + 1, linear), lod - float(n)) + 0.5);
+    const float f = lod - float(n);
+    const vec2 axis = lx > ly ? dx : dy;
+    vec4 sum = vec4(0.0);
+    for (int i = 0; i < int(taps); ++i) {
+        const vec2 at = r + axis * ((float(i) + 0.5) / taps - 0.5);
+        vec4 c = ReplacedLevel(at, n, true);
+        if (n < last && f > 0.0) c = mix(c, ReplacedLevel(at, n + 1, true), f);
+        sum += c;
+    }
+    return floor(sum / taps + 0.5);
 }
 
 // TEX1's mipmapping (GsDrawState::mip, in p.bilinear): the GS's LOD from the
@@ -267,6 +312,35 @@ vec4 ReplacedSample(vec2 r, float footprint) {
 // the two around mixed; 4 and 5 bilinear within a level. The GS's own
 // selection, not the GPU's: the levels it picks at any internal resolution
 // (the software GS's ChooseLevel).
+/* A mipmapped texture as a modern GPU filters it (blend_ops bit 20: a
+   game's choice, the bridge's SetGpuModernTextures): the level from the
+   footprint on screen - at an internal resolution the finer levels it can
+   show, where the GS's depth-based level is the PS2's picture's - blended
+   between levels (no bands where the level changes), and up to eight taps
+   along the footprint's long axis (anisotropic: the road ahead sharp, not
+   smeared). `dx`, `dy` the coordinate's change a pixel, in level 0's
+   texels; `most` the taps at most (the player's anisotropy; 1: trilinear,
+   the level the footprint's as it is - finer would shimmer, nothing to
+   calm it). */
+vec4 SampleModern(vec2 uv, vec2 dx, vec2 dy, int mxl, float most) {
+    const float lx = length(dx), ly = length(dy);
+    const float major = max(lx, ly), minor = max(min(lx, ly), 1e-4);
+    const float taps = clamp(ceil(major / minor), 1.0, most);
+    const float bias = most > 1.0 ? 1.0 : 0.0;     // (a level finer: sharp, the taps keep it calm)
+    const float lod = clamp(log2(max(major / taps, 1e-4)) - bias, 0.0, float(mxl));
+    const int n = int(floor(lod));
+    const float f = lod - float(n);
+    const vec2 axis = lx > ly ? dx : dy;
+    vec4 sum = vec4(0.0);
+    for (int i = 0; i < int(taps); ++i) {
+        const vec2 at = uv + axis * ((float(i) + 0.5) / taps - 0.5);
+        vec4 c = Sample(at, n, true);
+        if (n < mxl && f > 0.0) c = mix(c, Sample(at, n + 1, true), f);
+        sum += c;
+    }
+    return floor(sum / taps + 0.5);
+}
+
 vec4 Sample(vec2 uv) {
     const uint m = p.bilinear;
     if (!Has(kMip) || (m & 2u) == 0u) return Sample(uv, 0, Has(kLinear) && (m & 1u) != 0u);
@@ -320,7 +394,11 @@ void main() {
             const vec2 k = vec2(ReplacedSize(0)) / vec2(TextureSize());
             const vec2 r = coordinate.xy / coordinate.z * vec2(TextureSize()) * k;
             const vec2 dx = dFdx(r), dy = dFdy(r);
-            t = ReplacedSample(uv * k, sqrt(max(dot(dx, dx), dot(dy, dy))));
+            t = ReplacedSample(uv * k, dx, dy);
+        } else if (Has(kMip) && ((p.blend_ops >> 20) & 1u) != 0u && (p.bilinear & 2u) != 0u) {
+            const vec2 r = coordinate.xy / coordinate.z * vec2(TextureSize());
+            t = SampleModern(uv, dFdx(r), dFdy(r), int((p.bilinear >> 2) & 7u),
+                             float(1u << ((p.blend_ops >> 22) & 7u)));
         } else {
             t = Sample(uv);
         }
@@ -372,6 +450,36 @@ void main() {
         if (p.pabe == 1u && c.a < 128.0) discard;
         if (p.pabe == 2u && c.a >= 128.0) discard;
     }
+
+    if (((p.blend_ops >> 19) & 1u) != 0u) {
+        // A car's paint taking its reflection from a sphere map (a game's
+        // tag): the map's centre the view straight back, its rim grazing -
+        // N.V = sqrt(1 - r^2) - and a Fresnel term (Schlick's, softened) on
+        // the reflection: dimmer face on, brighter towards the body's edges,
+        // as lacquer. (On the colour, the blend by the paint's alpha as it
+        // was: scaling the share itself needs the target in the shader, a
+        // copy of it for each of the thousands of triangles.) Not to the rim
+        // itself: a warped map is least like the world there.
+        const vec2 st = coordinate.xy / (coordinate.z != 0.0 ? coordinate.z : 1.0) * 2.0 - 1.0;
+        const float r2 = min(dot(st, st), 0.85);
+        const float facing = 1.0 - sqrt(1.0 - r2);
+        const float fresnel = 0.04 + 0.96 * facing * facing * facing;
+        c.rgb = min(c.rgb * (0.7 + 3.0 * fresnel), vec3(255.0));
+    }
+
+#ifndef SHADER_BLEND
+    if (((p.blend_ops >> 21) & 1u) != 0u) {
+        // A soft particle (a game's tag): faded as it nears what is behind
+        // it, so smoke and fire meet the road and the cars without a seam.
+        const vec4 scene = texelFetch(scene_depth, ivec2(gl_FragCoord.xy), 0);
+        const float z = gl_FragCoord.z * 4294967296.0;
+        if (scene.a > 0.5 && z > scene.b + 0.5) {
+            const float mine = scene.g * 1024.0 / (z - scene.b);
+            const float soft = 0.35 + 0.025 * mine;
+            c.a = floor(c.a * clamp((scene.r - mine) / soft, 0.0, 1.0) + 0.5);
+        }
+    }
+#endif
 
 #ifdef SHADER_BLEND
     // Cv = ((A - B) * C >> 7) + D, clamped (COLCLAMP), as the software GS.
