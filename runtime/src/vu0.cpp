@@ -134,6 +134,15 @@ void Lanes(const Context& c, const FmacOp& f, u32 out[4]) {
     const __m128i acc = _mm_loadu_si128(reinterpret_cast<const __m128i*>(c.vacc));
     _mm_storeu_si128(reinterpret_cast<__m128i*>(out), LanesSse<Op>(a, b, acc));
 }
+#elif PS2RT_VU_NEON
+template <int Op>
+void Lanes(const Context& c, const FmacOp& f, u32 out[4]) {
+    const uint32x4_t a = vld1q_u32(c.vf[f.fs]);
+    const uint32x4_t b = f.operand == 6 ? vld1q_u32(c.vf[f.ft])
+                       : vdupq_n_u32(f.operand < 4 ? c.vf[f.ft][f.operand]
+                                     : f.operand == 4 ? c.vc[kRegQ] : c.vc[kRegI]);
+    vst1q_u32(out, LanesNeon<Op>(a, b, vld1q_u32(c.vacc)));
+}
 #else
 template <int Op>
 void Lanes(const Context& c, const FmacOp& f, u32 out[4]) {

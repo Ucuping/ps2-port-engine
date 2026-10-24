@@ -185,6 +185,9 @@ void Vcallms(Context& c, u32 address);
 }  // namespace lifted
 
 #include "ps2rt/vu_math.h"
+#if PS2RT_VU_NEON
+#include "ps2rt/fp_mode.h"
+#endif
 
 namespace lifted {
 
@@ -309,6 +312,38 @@ inline void MacroFmac(Context& c, u32 word, FmacForm f) {
     }
     if (!kMacroNearest) _mm_setcsr(saved);
 }
+#elif PS2RT_VU_NEON
+/* The same in NEON (LanesNeon), FPCR set as Cop2Slow sets it. */
+template <bool Flags>
+inline void MacroFmac(Context& c, u32 word, FmacForm f) {
+    const u32 fd = (word >> 6) & 0x1F, fs = (word >> 11) & 0x1F, ft = (word >> 16) & 0x1F;
+    const u32 dest = (word >> 21) & 0xF;
+    const ps2rt::VuFloatMode mode{!kMacroNearest};
+    const uint32x4_t a = vld1q_u32(c.vf[fs]);
+    const uint32x4_t b = f.operand == 6 ? vld1q_u32(c.vf[ft])
+                       : vdupq_n_u32(f.operand < 4 ? c.vf[ft][f.operand]
+                                     : f.operand == 4 ? c.vc[kRegQ] : c.vc[kRegI]);
+    const uint32x4_t acc = vld1q_u32(c.vacc);
+    uint32x4_t r;
+    switch (f.op) {
+        case kAdd: r = LanesNeon<kAdd>(a, b, acc); break;
+        case kSub: r = LanesNeon<kSub>(a, b, acc); break;
+        case kMul: r = LanesNeon<kMul>(a, b, acc); break;
+        case kMadd: r = LanesNeon<kMadd>(a, b, acc); break;
+        case kMsub: r = LanesNeon<kMsub>(a, b, acc); break;
+        case kMax_: r = LanesNeon<kMax_>(a, b, acc); break;
+        default: r = LanesNeon<kMini>(a, b, acc); break;
+    }
+    u32 out[4];
+    vst1q_u32(out, r);
+    u32* to = f.to_acc ? c.vacc : fd ? c.vf[fd] : nullptr;
+    if (to)
+        for (int lane = 0; lane < 4; ++lane)
+            if (dest & (8u >> lane)) to[lane] = out[lane];
+    if constexpr (Flags) {
+        if (f.op != kMax_ && f.op != kMini) MacroStatus(c, dest, out);
+    }
+}
 #endif
 
 /* Always inlined, with the decode above: at a lifted call site the word is a
@@ -316,7 +351,7 @@ inline void MacroFmac(Context& c, u32 word, FmacForm f) {
    left Cop2 out of line - the decode run every time, 2-3% of the EE). What it
    calls is the compiler's to place. */
 PS2RT_VU_INLINE void Cop2(Context& c, u32 word) {
-#if PS2RT_VU_SSE
+#if PS2RT_VU_SSE || PS2RT_VU_NEON
     const FmacForm f = FmacFormOf(word);
     if (f.valid) {
         MacroFmac<true>(c, word, f);
@@ -328,7 +363,7 @@ PS2RT_VU_INLINE void Cop2(Context& c, u32 word) {
 
 /* Cop2 without macro mode's flags, for a microprogram's VU (Cop2SlowUnflagged). */
 PS2RT_VU_INLINE void Cop2Unflagged(Context& c, u32 word) {
-#if PS2RT_VU_SSE
+#if PS2RT_VU_SSE || PS2RT_VU_NEON
     const FmacForm f = FmacFormOf(word);
     if (f.valid) {
         MacroFmac<false>(c, word, f);

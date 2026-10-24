@@ -35,7 +35,14 @@
 #else
 #define PS2RT_VU_SSE41 0
 #endif
-
+/* arm64: the same four lanes at once in NEON (LanesNeon below), every
+   processor of the architecture having it. */
+#if !PS2RT_VU_SSE && defined(__aarch64__)
+#include <arm_neon.h>
+#define PS2RT_VU_NEON 1
+#else
+#define PS2RT_VU_NEON 0
+#endif
 
 
 namespace lifted {
@@ -198,6 +205,68 @@ PS2RT_VU_INLINE __m128i LanesSse(__m128i a, __m128i b, __m128i acc) {
         const __m128 total = AsFloats((Known & 4) != 0 ? acc : clean(acc));
         return result(AsBits(Op == kMadd ? _mm_add_ps(total, AsFloats(product))
                                          : _mm_sub_ps(total, AsFloats(product))));
+    }
+}
+#endif
+
+#if PS2RT_VU_NEON
+/*
+ * LanesSse's lanes in NEON: the same single-precision operations on the same
+ * clean operands, so the same model's numbers. The control word is FPCR
+ * (ps2rt/fp_mode.h): toward zero and FZ in a VU run, where SSE has toward
+ * zero, FTZ and DAZ - FZ flushes denormal operands and results both, and
+ * toward zero the two tininess rules agree. A multiply and an add stay two
+ * roundings: vmulq then vaddq, never vfmaq (the model rounds the product
+ * first). VuLanesAreTheModel (host tests) compares these with the model.
+ */
+PS2RT_VU_INLINE uint32x4_t CleanLanes(uint32x4_t v) {
+    // SSE4.1's way: the magnitude clamped to the largest finite, zero below
+    // the smallest normal, the sign put back.
+    const uint32x4_t magnitude = vandq_u32(v, vdupq_n_u32(0x7FFFFFFFu));
+    const uint32x4_t sign = veorq_u32(v, magnitude);
+    const uint32x4_t clamped = vminq_u32(magnitude, vdupq_n_u32(kMax));
+    const uint32x4_t denormal = vcltq_u32(magnitude, vdupq_n_u32(0x00800000u));
+    return vorrq_u32(sign, vbicq_u32(clamped, denormal));
+}
+
+/* ClampLanes: Clean for code that runs with FZ on (a VU run), as SSE's. */
+PS2RT_VU_INLINE uint32x4_t ClampLanes(uint32x4_t v) {
+    const uint32x4_t magnitude = vandq_u32(v, vdupq_n_u32(0x7FFFFFFFu));
+    const uint32x4_t sign = veorq_u32(v, magnitude);
+    return vorrq_u32(sign, vminq_u32(magnitude, vdupq_n_u32(kMax)));
+}
+
+inline float32x4_t AsFloats(uint32x4_t v) { return vreinterpretq_f32_u32(v); }
+inline uint32x4_t AsBits(float32x4_t v) { return vreinterpretq_u32_f32(v); }
+
+PS2RT_VU_INLINE int32x4_t OrderLanes(uint32x4_t v) {
+    const int32x4_t negative = vshrq_n_s32(vreinterpretq_s32_u32(v), 31);
+    const int32x4_t magnitude = vreinterpretq_s32_u32(vandq_u32(v, vdupq_n_u32(0x7FFFFFFFu)));
+    return vsubq_s32(veorq_s32(magnitude, negative), negative);
+}
+
+/* LanesSse's `Known` and `Daz` (a run with FZ on: ClampLanes does what
+   CleanLanes would, and a result needs none). */
+template <int Op, int Known = 0, bool Daz = false>
+PS2RT_VU_INLINE uint32x4_t LanesNeon(uint32x4_t a, uint32x4_t b, uint32x4_t acc) {
+    if constexpr (Op == kMax_ || Op == kMini) {
+        const uint32x4_t take_b = Op == kMax_ ? vcltq_s32(OrderLanes(a), OrderLanes(b))
+                                              : vcltq_s32(OrderLanes(b), OrderLanes(a));
+        return vbslq_u32(take_b, b, a);
+    } else {
+        const auto clean = [](uint32x4_t v) { return Daz ? ClampLanes(v) : CleanLanes(v); };
+        const auto result = [](uint32x4_t v) { return Daz ? v : CleanLanes(v); };
+        if constexpr ((Known & 1) == 0) a = clean(a);
+        if constexpr ((Known & 2) == 0) b = clean(b);
+        if constexpr (Op == kAdd) return result(AsBits(vaddq_f32(AsFloats(a), AsFloats(b))));
+        else if constexpr (Op == kSub) return result(AsBits(vsubq_f32(AsFloats(a), AsFloats(b))));
+        else if constexpr (Op == kMul) return result(AsBits(vmulq_f32(AsFloats(a), AsFloats(b))));
+        else {
+            const uint32x4_t product = result(AsBits(vmulq_f32(AsFloats(a), AsFloats(b))));
+            const float32x4_t total = AsFloats((Known & 4) != 0 ? acc : clean(acc));
+            return result(AsBits(Op == kMadd ? vaddq_f32(total, AsFloats(product))
+                                             : vsubq_f32(total, AsFloats(product))));
+        }
     }
 }
 #endif

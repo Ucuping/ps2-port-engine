@@ -32,6 +32,7 @@
 #include "ps2host/texture_pack.h"
 #include "ps2host/vu.h"
 #include "ps2host/vu_core.h"
+#include "ps2rt/fp_mode.h"
 #include "ps2rt/generated.h"
 #include "fp_mode_tests.h"
 
@@ -1145,15 +1146,12 @@ void VifRunsMicroprogramsOnAVu() {
 // The VU's visible timing: the flags reach FMAND four cycles after the FMAC
 // operation, Q seven after DIV (WAITQ waits for it), and an upper beside a LOI
 // reads the I from before - as Burnout 3's microcode depends on.
-// The FMAC's four lanes at once (single precision, SSE) give what the
-// arithmetic model gives a lane at a time in double: every operation, operand
-// form, dest mask and destination, on bit patterns rich in zeros, denormals,
-// infinities, NaNs and values near overflow and underflow.
-void VuLanesAreTheModel() {
-    auto context = std::make_unique<lifted::Context>(), scalar = std::make_unique<lifted::Context>();
-    u32 seed = 2024, wrong = 0, runs = 0;
-    auto next = [&] { return seed = seed * 1664525u + 1013904223u; };
-    auto value = [&]() -> u32 {
+// Bit patterns rich in zeros, denormals, infinities, NaNs and values near
+// overflow and underflow, for the FMAC tests below.
+struct FmacValues {
+    u32 seed;
+    u32 next() { return seed = seed * 1664525u + 1013904223u; }
+    u32 value() {
         const u32 r = next(), sign = r & 0x80000000u;
         switch ((r >> 8) % 8) {
             case 0: return sign;                                            // zero
@@ -1164,7 +1162,21 @@ void VuLanesAreTheModel() {
             case 5: return sign | 0x3F800000u | (next() & 0x007FFFFFu);     // about one
             default: return next();
         }
-    };
+    }
+};
+
+// The FMAC's four lanes at once (single precision: SSE, or NEON on arm64)
+// give what the arithmetic model gives a lane at a time in double: every
+// operation, operand form, dest mask and destination, on FmacValues - in the
+// host's default float mode, and in the VUs' (a run's: toward zero, denormals
+// as zero).
+void VuLanesAreTheModelIn(bool vu_mode) {
+    const ps2rt::VuFloatMode mode(vu_mode);
+    auto context = std::make_unique<lifted::Context>(), scalar = std::make_unique<lifted::Context>();
+    FmacValues values{2024};
+    u32 wrong = 0, runs = 0;
+    auto next = [&] { return values.next(); };
+    auto value = [&] { return values.value(); };
     for (int i = 0; i < 200000; ++i) {
         for (auto& v : context->vf) for (u32& lane : v) lane = value();
         for (u32& lane : context->vacc) lane = value();
@@ -1186,8 +1198,61 @@ void VuLanesAreTheModel() {
             std::memcmp(context->vacc, scalar->vacc, sizeof context->vacc) != 0)
             ++wrong;
     }
+    char what[128];
+    std::snprintf(what, sizeof what, "VU FMAC lanes at once match the model, %s float mode (%u of %u differ)",
+                  vu_mode ? "the VUs'" : "the default", wrong, runs);
+    Check(wrong == 0, what);
+}
+
+void VuLanesAreTheModel() {
+    VuLanesAreTheModelIn(false);
+    VuLanesAreTheModelIn(true);
+}
+
+// Macro mode's COP2 inline (lifted::Cop2: four lanes at once where the host
+// has SSE or NEON) gives what the arithmetic model gives a lane at a time -
+// the result, where it goes and the status flag - for random FMAC words of
+// every form, on FmacValues.
+void MacroFmacIsTheModel() {
+    auto context = std::make_unique<lifted::Context>(), model = std::make_unique<lifted::Context>();
+    FmacValues values{2025};
+    u32 wrong = 0, runs = 0;
+    while (runs < 200000) {
+        const u32 word = 0x4A000000u | (values.next() & 0x01FFFFFFu);
+        lifted::FmacOp f;
+        if (!lifted::DecodeFmac(word, &f)) continue;
+        for (auto& v : context->vf) for (u32& lane : v) lane = values.value();
+        for (u32& lane : context->vacc) lane = values.value();
+        context->vc[lifted::kRegI] = values.value();
+        context->vc[lifted::kRegQ] = values.value();
+        context->vc[lifted::kRegStatus] = values.next() & 0xFFFu;
+        *model = *context;
+        lifted::Cop2(*context, word);
+        {
+            // The model, as Cop2Slow has it: every lane read before any is
+            // written, the status flag from the result (MAX and MINI set none).
+            const ps2rt::VuFloatMode mode(!lifted::kMacroNearest);
+            lifted::Context& m = *model;
+            const u32 broadcast = f.operand < 4 ? m.vf[f.ft][f.operand]
+                                : f.operand == 4 ? m.vc[lifted::kRegQ] : m.vc[lifted::kRegI];
+            u32 out[4] = {};
+            for (int lane = 0; lane < 4; ++lane)
+                if (f.dest & (8u >> lane))
+                    out[lane] = lifted::Binary(f.op, m.vf[f.fs][lane], f.operand == 6 ? m.vf[f.ft][lane] : broadcast,
+                                               m.vacc[lane]);
+            u32* to = f.to_acc ? m.vacc : f.fd ? m.vf[f.fd] : nullptr;
+            for (int lane = 0; lane < 4; ++lane)
+                if (to && (f.dest & (8u >> lane))) to[lane] = out[lane];
+            if (f.op != lifted::kMax_ && f.op != lifted::kMini) lifted::MacroStatus(m, f.dest, out);
+        }
+        ++runs;
+        if (std::memcmp(context->vf, model->vf, sizeof context->vf) != 0 ||
+            std::memcmp(context->vacc, model->vacc, sizeof context->vacc) != 0 ||
+            std::memcmp(context->vc, model->vc, sizeof context->vc) != 0)
+            ++wrong;
+    }
     char what[96];
-    std::snprintf(what, sizeof what, "VU FMAC lanes at once match the model (%u of %u differ)", wrong, runs);
+    std::snprintf(what, sizeof what, "macro mode's COP2 inline matches the model (%u of %u differ)", wrong, runs);
     Check(wrong == 0, what);
 }
 
@@ -2759,6 +2824,7 @@ int main() {
     VifRunsMicroprogramsOnAVu();
     MemoryCardKeepsSaves();
     VuLanesAreTheModel();
+    MacroFmacIsTheModel();
     ps2rt_tests::FloatModeTests(Check);
     VuCompiledIsTheInterpreter();
     VuFastIsTheExactButFlags();

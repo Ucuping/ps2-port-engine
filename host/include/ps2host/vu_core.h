@@ -211,6 +211,9 @@ struct VuCore {
         const __m128i denormal = _mm_andnot_si128(
             _mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x007FFFFF)), zero), _mm_cmpeq_epi32(exponent, zero));
         return _mm_movemask_epi8(_mm_or_si128(huge, denormal)) == 0;
+#elif PS2RT_VU_NEON
+        const uint32x4_t x = vld1q_u32(q);
+        return vminvq_u32(vceqq_u32(lifted::CleanLanes(x), x)) != 0;
 #else
         for (int lane = 0; lane < 4; ++lane)
             if (lifted::Clean(q[lane]) != q[lane]) return false;
@@ -224,6 +227,11 @@ struct VuCore {
 #if PS2RT_VU_SSE
         if constexpr (Dest == 15) {             // the quadword in one move (MSVC made four of the fields)
             _mm_storeu_si128(reinterpret_cast<__m128i*>(q), _mm_loadu_si128(reinterpret_cast<const __m128i*>(from)));
+            return;
+        }
+#elif PS2RT_VU_NEON
+        if constexpr (Dest == 15) {
+            vst1q_u32(q, vld1q_u32(from));
             return;
         }
 #endif
@@ -301,6 +309,31 @@ struct VuCore {
         HoldVf(v, out, it, dest, _mm_shuffle_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs])),
                                                    _MM_SHUFFLE(0, 3, 2, 1)));
     }
+#elif PS2RT_VU_NEON
+    /* The same in NEON: dest's fields as a lane mask, x the first lane. */
+    static PS2HOST_VU_INLINE uint32x4_t LaneMask(u32 dest) {
+        const uint32x4_t bits = {8, 4, 2, 1};
+        return vtstq_u32(vdupq_n_u32(dest), bits);
+    }
+    static PS2HOST_VU_INLINE uint32x4_t Blend(uint32x4_t mask, uint32x4_t taken, uint32x4_t kept) {
+        return vbslq_u32(mask, taken, kept);
+    }
+    static PS2HOST_VU_INLINE void HoldVf(Vu& v, Vu::Pending& out, int it, u32 dest, uint32x4_t value) {
+        if (it == 0) return;
+        const uint32x4_t before = vld1q_u32(v.regs.vf[it]);
+        const uint32x4_t after = Blend(LaneMask(dest), value, before);
+        if (vminvq_u32(vceqq_u32(after, before)) != 0) return;
+        out.vf = it;
+        out.lanes = dest;
+        vst1q_u32(out.value, after);
+    }
+    static PS2HOST_VU_INLINE void Move(Vu& v, Vu::Pending& out, int it, int fs, u32 dest) {
+        HoldVf(v, out, it, dest, vld1q_u32(v.regs.vf[fs]));
+    }
+    static PS2HOST_VU_INLINE void Mr32(Vu& v, Vu::Pending& out, int it, int fs, u32 dest) {
+        const uint32x4_t a = vld1q_u32(v.regs.vf[fs]);
+        HoldVf(v, out, it, dest, vextq_u32(a, a, 1));     // y, z, w, x
+    }
 #else
     static PS2HOST_VU_INLINE void HoldVf(Vu& v, Vu::Pending& out, int it, u32 dest, const u32 value[4]) {
         if (it == 0) return;
@@ -332,6 +365,8 @@ struct VuCore {
         if (x & 0x8000) x |= 0xFFFF0000u;
 #if PS2RT_VU_SSE
         HoldVf(v, out, it, dest, _mm_set1_epi32(int(x)));
+#elif PS2RT_VU_NEON
+        HoldVf(v, out, it, dest, vdupq_n_u32(x));
 #else
         const u32 value[4] = {x, x, x, x};
         HoldVf(v, out, it, dest, value);
@@ -370,6 +405,31 @@ struct VuCore {
         const u32 x = Clamp(v.regs.vf[ft][ftf]) & ~lifted::kSign;
         const __m128 root = _mm_sqrt_ss(_mm_castsi128_ps(_mm_cvtsi32_si128(int(x))));
         return lifted::Clean(u32(_mm_cvtsi128_si32(_mm_castps_si128(root))));
+    }
+#elif PS2RT_VU_NEON
+    /* The same single-precision operations, FPCR as a run sets it (toward
+       zero, FZ: SSE's DAZ and FTZ). */
+    static PS2HOST_VU_INLINE u32 Clamp(u32 bits) {
+        return (bits & 0x7F800000u) == 0x7F800000u ? (bits & lifted::kSign) | lifted::kMax : bits;
+    }
+    static PS2HOST_VU_INLINE float FloatOf(u32 bits) {
+        float value;
+        std::memcpy(&value, &bits, sizeof value);
+        return value;
+    }
+    static PS2HOST_VU_INLINE u32 BitsOf(float value) {
+        u32 bits;
+        std::memcpy(&bits, &value, sizeof bits);
+        return bits;
+    }
+    static PS2HOST_VU_INLINE u32 Div(const Vu& v, int fs, int fsf, int ft, int ftf) {
+        const u32 num = v.regs.vf[fs][fsf], den = v.regs.vf[ft][ftf];
+        if ((den & 0x7F800000u) == 0) return ((num ^ den) & lifted::kSign) | lifted::kMax;   // Value(den) == 0
+        return lifted::Clean(BitsOf(FloatOf(Clamp(num)) / FloatOf(Clamp(den))));
+    }
+    static PS2HOST_VU_INLINE u32 Sqrt(const Vu& v, int ft, int ftf) {
+        const u32 x = Clamp(v.regs.vf[ft][ftf]) & ~lifted::kSign;
+        return lifted::Clean(BitsOf(vget_lane_f32(vsqrt_f32(vdup_n_f32(FloatOf(x))), 0)));
     }
 #else
     static PS2HOST_VU_INLINE u32 Div(const Vu& v, int fs, int fsf, int ft, int ftf) {
@@ -488,6 +548,44 @@ struct VuCore {
                              _mm_or_si128(_mm_and_si128(mask, result), _mm_andnot_si128(mask, old)));
         }
     }
+#elif PS2RT_VU_NEON
+    /* The same in NEON (lifted::LanesNeon), as SSE's: operands clamped where
+       the block does not know them clean, under a run's FPCR (FZ). */
+    template <int Op, int Operand, int To, u32 Dest, int Known = 0, int SetFlags = 0>
+    static PS2HOST_VU_INLINE void Fmac(Vu& v, int fs, int ft) {
+        lifted::Context& c = v.regs;
+        uint32x4_t a = vld1q_u32(c.vf[fs]);
+        uint32x4_t b;
+        if constexpr (Operand == 6) b = vld1q_u32(c.vf[ft]);
+        else if constexpr (Operand == 4) b = vdupq_n_u32(c.vc[lifted::kRegQ]);
+        else if constexpr (Operand == 5) b = vdupq_n_u32(c.vc[lifted::kRegI]);
+        else b = vdupq_n_u32(c.vf[ft][Operand]);
+        constexpr bool kRaw = Op == lifted::kMax_ || Op == lifted::kMini;
+        if constexpr ((Known & 1) == 0 && !kRaw) a = lifted::ClampLanes(a);
+        if constexpr ((Known & 2) == 0 && !kRaw) b = lifted::ClampLanes(b);
+        uint32x4_t acc = vld1q_u32(c.vacc);
+        if constexpr ((Known & 4) == 0 && (Op == lifted::kMadd || Op == lifted::kMsub))
+            acc = lifted::ClampLanes(acc);
+        const uint32x4_t result = lifted::LanesNeon<Op, Known | 7, true>(a, b, acc);
+        if constexpr (SetFlags == 1) FlagsOf<Dest>(v, result);
+        else if constexpr (SetFlags == 2) StickyFlagsOf<Dest>(v, result);
+        else if constexpr (SetFlags == 3) MacFlagsOf<Dest>(v, result);
+        if constexpr (To == 0) {
+            vst1q_u32(v.discarded_, result);
+            return;
+        } else if constexpr (Dest == 0) {
+            return;
+        } else {
+            u32* to = To < 0 ? c.vacc : c.vf[To];
+            if constexpr (Dest == 15) {
+                vst1q_u32(to, result);
+                return;
+            }
+            const uint32x4_t mask = {(Dest & 8) ? ~0u : 0u, (Dest & 4) ? ~0u : 0u, (Dest & 2) ? ~0u : 0u,
+                                     (Dest & 1) ? ~0u : 0u};
+            vst1q_u32(to, vbslq_u32(mask, result, vld1q_u32(to)));
+        }
+    }
 #else
     template <int Op, int Operand, int To, u32 Dest, int Known = 0, int SetFlags = 0>
     static void Fmac(Vu& v, int fs, int ft) {
@@ -518,6 +616,11 @@ struct VuCore {
         __m128i* acc = reinterpret_cast<__m128i*>(v.regs.vacc);
         const __m128i product = lifted::LanesSse<lifted::kMul, 0, true>(a, b, _mm_setzero_si128());
         _mm_storeu_si128(acc, Blend(LaneMask(Dest & 14), product, _mm_loadu_si128(acc)));
+#elif PS2RT_VU_NEON
+        const uint32x4_t a = Yzxw(vld1q_u32(v.regs.vf[fs]));
+        const uint32x4_t b = Zxyw(vld1q_u32(v.regs.vf[ft]));
+        const uint32x4_t product = lifted::LanesNeon<lifted::kMul, 0, true>(a, b, vdupq_n_u32(0));
+        vst1q_u32(v.regs.vacc, Blend(LaneMask(Dest & 14), product, vld1q_u32(v.regs.vacc)));
 #else
         const u32 *a = v.regs.vf[fs], *b = v.regs.vf[ft];
         const u32 out[3] = {lifted::Result(lifted::Value(a[1]) * lifted::Value(b[2])),
@@ -549,6 +652,30 @@ struct VuCore {
         const __m128i old = _mm_loadu_si128(reinterpret_cast<const __m128i*>(to));
         _mm_storeu_si128(reinterpret_cast<__m128i*>(to),
                          _mm_or_si128(_mm_and_si128(mask, result), _mm_andnot_si128(mask, old)));
+    }
+#elif PS2RT_VU_NEON
+    /* SSE's shuffles: a.yzx and b.zxy (w stays where it is). */
+    static PS2HOST_VU_INLINE uint32x4_t Yzxw(uint32x4_t v) {
+        const uint8x16_t index = {4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 12, 13, 14, 15};
+        return vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(v), index));
+    }
+    static PS2HOST_VU_INLINE uint32x4_t Zxyw(uint32x4_t v) {
+        const uint8x16_t index = {8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15};
+        return vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(v), index));
+    }
+    template <u32 Dest>
+    static PS2HOST_VU_INLINE void Opmsub(Vu& v, int fd, int fs, int ft) {
+        const uint32x4_t a = Yzxw(vld1q_u32(v.regs.vf[fs]));
+        const uint32x4_t b = Zxyw(vld1q_u32(v.regs.vf[ft]));
+        const uint32x4_t result = lifted::LanesNeon<lifted::kMsub, 0, true>(a, b, vld1q_u32(v.regs.vacc));
+        if (fd == 0) {                                  // the flags' alone
+            const uint32x4_t xyz = {~0u, ~0u, ~0u, 0u};
+            vst1q_u32(v.discarded_, vandq_u32(result, xyz));
+            return;
+        }
+        u32* to = v.regs.vf[fd];
+        const uint32x4_t mask = {(Dest & 8) ? ~0u : 0u, (Dest & 4) ? ~0u : 0u, (Dest & 2) ? ~0u : 0u, 0u};
+        vst1q_u32(to, vbslq_u32(mask, result, vld1q_u32(to)));
     }
 #else
     template <u32 Dest>
@@ -582,6 +709,12 @@ struct VuCore {
         const __m128 x = _mm_cvtepi32_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs])));
         alignas(16) u32 out[4];
         _mm_store_si128(reinterpret_cast<__m128i*>(out), _mm_castps_si128(_mm_mul_ps(x, _mm_set1_ps(kInverse[Shift]))));
+#elif PS2RT_VU_NEON
+        // As SSE's: SCVTF rounds as FPCR says (toward zero in a run).
+        static constexpr float kInverse[4] = {1.0f, 1.0f / 16.0f, 1.0f / 4096.0f, 1.0f / 32768.0f};
+        const float32x4_t x = vcvtq_f32_s32(vreinterpretq_s32_u32(vld1q_u32(v.regs.vf[fs])));
+        alignas(16) u32 out[4];
+        vst1q_u32(out, vreinterpretq_u32_f32(vmulq_n_f32(x, kInverse[Shift])));
 #else
         static constexpr double kScale[4] = {1.0, 16.0, 4096.0, 32768.0};
         const u32* a = v.regs.vf[fs];
@@ -610,6 +743,19 @@ struct VuCore {
         else _mm_storeu_si128(to, Blend(LaneMask(Dest), value, _mm_loadu_si128(to)));
         Wrote<Dest>(v, ft, false);                      // integers
         return;
+#elif PS2RT_VU_NEON
+        // Clean, times a power of two, truncated: FCVTZS saturates past 32
+        // bits as lifted::FloatToInt does, with no turning round.
+        static constexpr float kScaleF[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
+        if (ft == 0) return;
+        const float32x4_t x = vmulq_n_f32(lifted::AsFloats(lifted::CleanLanes(vld1q_u32(v.regs.vf[fs]))),
+                                          kScaleF[Shift]);
+        const uint32x4_t value = vreinterpretq_u32_s32(vcvtq_s32_f32(x));
+        u32* to = v.regs.vf[ft];
+        if constexpr (Dest == 15) vst1q_u32(to, value);
+        else vst1q_u32(to, Blend(LaneMask(Dest), value, vld1q_u32(to)));
+        Wrote<Dest>(v, ft, false);                      // integers
+        return;
 #endif
         static constexpr double kScale[4] = {1.0, 16.0, 4096.0, 32768.0};
         const u32* a = v.regs.vf[fs];
@@ -625,6 +771,9 @@ struct VuCore {
         _mm_store_si128(reinterpret_cast<__m128i*>(out),
                         _mm_and_si128(lifted::CleanLanes(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs]))),
                                       _mm_set1_epi32(0x7FFFFFFF)));
+#elif PS2RT_VU_NEON
+        alignas(16) u32 out[4];
+        vst1q_u32(out, vandq_u32(lifted::CleanLanes(vld1q_u32(v.regs.vf[fs])), vdupq_n_u32(0x7FFFFFFFu)));
 #else
         const u32* a = v.regs.vf[fs];
         u32 out[4];
@@ -641,6 +790,11 @@ struct VuCore {
         const __m128i value = _mm_set_epi32(int(out[3]), int(out[2]), int(out[1]), int(out[0]));
         if constexpr (Dest == 15) _mm_storeu_si128(to, value);
         else _mm_storeu_si128(to, Blend(LaneMask(Dest), value, _mm_loadu_si128(to)));
+#elif PS2RT_VU_NEON
+        u32* to = v.regs.vf[reg];
+        const uint32x4_t value = vld1q_u32(out);
+        if constexpr (Dest == 15) vst1q_u32(to, value);
+        else vst1q_u32(to, Blend(LaneMask(Dest), value, vld1q_u32(to)));
 #else
         if constexpr ((Dest & 8) != 0) v.regs.vf[reg][0] = out[0];
         if constexpr ((Dest & 4) != 0) v.regs.vf[reg][1] = out[1];
@@ -710,6 +864,33 @@ struct VuCore {
         const u32 sign = u32(_mm_movemask_ps(_mm_castsi128_ps(bits)));
         v.mac_latest_ = (zero & Dest) | (sign & Dest) << 4;
     }
+#elif PS2RT_VU_NEON
+    /* The same in NEON: each lane's bit weighted and the lanes added, lane x
+       the highest (8) as the MAC flag has it. */
+    static PS2HOST_VU_INLINE u32 ZeroLanes(uint32x4_t bits) {
+        const uint32x4_t weights = {8, 4, 2, 1};
+        return vaddvq_u32(vandq_u32(vceqzq_u32(vandq_u32(bits, vdupq_n_u32(0x7FFFFFFFu))), weights));
+    }
+    static PS2HOST_VU_INLINE u32 SignLanes(uint32x4_t bits) {
+        const uint32x4_t weights = {8, 4, 2, 1};
+        return vaddvq_u32(vandq_u32(vreinterpretq_u32_s32(vshrq_n_s32(vreinterpretq_s32_u32(bits), 31)), weights));
+    }
+    template <u32 Dest>
+    static PS2HOST_VU_INLINE void FlagsOf(Vu& v, uint32x4_t bits) {
+        const u32 m = (ZeroLanes(bits) & Dest) | (SignLanes(bits) & Dest) << 4;
+        const u32 low = ((m & 0xF) ? 1u : 0u) | ((m & 0xF0) ? 2u : 0u);
+        v.mac_latest_ = m;
+        v.status_latest_ = (v.status_latest_ & ~0x3u) | low | low << 6;
+    }
+    template <u32 Dest>
+    static PS2HOST_VU_INLINE void StickyFlagsOf(Vu& v, uint32x4_t bits) {
+        const u32 zero = ZeroLanes(bits) & Dest, sign = SignLanes(bits) & Dest;
+        v.status_latest_ |= ((zero ? 1u : 0u) | (sign ? 2u : 0u)) << 6;
+    }
+    template <u32 Dest>
+    static PS2HOST_VU_INLINE void MacFlagsOf(Vu& v, uint32x4_t bits) {
+        v.mac_latest_ = (ZeroLanes(bits) & Dest) | (SignLanes(bits) & Dest) << 4;
+    }
 #endif
     /* The same for an upper that is not an FMAC (MacFlagsOf). */
     template <int Target, u32 Dest>
@@ -717,6 +898,8 @@ struct VuCore {
         const u32* out = Target > 0 ? v.regs.vf[Target] : Target == 0 ? v.discarded_ : v.regs.vacc;
 #if PS2RT_VU_SSE
         MacFlagsOf<Dest>(v, _mm_loadu_si128(reinterpret_cast<const __m128i*>(out)));
+#elif PS2RT_VU_NEON
+        MacFlagsOf<Dest>(v, vld1q_u32(out));
 #else
         u32 m = 0;
         for (int lane = 0; lane < 4; ++lane) {
@@ -733,6 +916,8 @@ struct VuCore {
         const u32* out = Target > 0 ? v.regs.vf[Target] : Target == 0 ? v.discarded_ : v.regs.vacc;
 #if PS2RT_VU_SSE
         FlagsOf<Dest>(v, _mm_loadu_si128(reinterpret_cast<const __m128i*>(out)));
+#elif PS2RT_VU_NEON
+        FlagsOf<Dest>(v, vld1q_u32(out));
 #else
         u32 m = 0;
         for (int lane = 0; lane < 4; ++lane) {
@@ -756,6 +941,8 @@ struct VuCore {
         const u32* out = Target > 0 ? v.regs.vf[Target] : Target == 0 ? v.discarded_ : v.regs.vacc;
 #if PS2RT_VU_SSE
         StickyFlagsOf<Dest>(v, _mm_loadu_si128(reinterpret_cast<const __m128i*>(out)));
+#elif PS2RT_VU_NEON
+        StickyFlagsOf<Dest>(v, vld1q_u32(out));
 #else
         u32 zero = 0, sign = 0;
         for (int lane = 0; lane < 4; ++lane) {
@@ -784,10 +971,13 @@ struct VuCore {
             _mm_storeu_si128(to, Blend(LaneMask(landing),
                                        _mm_loadu_si128(reinterpret_cast<const __m128i*>(pending.value)),
                                        _mm_loadu_si128(to)));
+#elif PS2RT_VU_NEON
+            u32* to = v.regs.vf[pending.vf];
+            vst1q_u32(to, Blend(LaneMask(landing), vld1q_u32(pending.value), vld1q_u32(to)));
 #endif
             for (int lane = 0; lane < 4; ++lane) {
                 if (landing & (8u >> lane)) {
-#if !PS2RT_VU_SSE
+#if !PS2RT_VU_SSE && !PS2RT_VU_NEON
                     v.regs.vf[pending.vf][lane] = pending.value[lane];
 #endif
                     if (times_lower) v.vf_ready_[pending.vf][lane] = ready;
@@ -822,6 +1012,12 @@ struct VuCore {
         if (written > 0 && lanes == 15)         // all four in a store
             _mm256_storeu_si256(reinterpret_cast<__m256i*>(v.vf_ready_[written]), _mm256_set1_epi64x(static_cast<long long>(ready)));
         else
+#elif PS2RT_VU_NEON
+        if (written > 0 && lanes == 15) {       // all four in two stores
+            const uint64x2_t both = vdupq_n_u64(ready);
+            vst1q_u64(v.vf_ready_[written], both);
+            vst1q_u64(v.vf_ready_[written] + 2, both);
+        } else
 #endif
         if (written > 0)
             for (int lane = 0; lane < 4; ++lane)

@@ -59,6 +59,22 @@ ELF loader's one, ReferSemaStatus's five).
   same MXCSR values as before, on arm64 FPCR (round toward zero, flush to
   zero). Tests pin the modes - `runtime/tests/fp_mode_tests.cpp`, run by
   `ps2rt_tests` and `ps2host_tests`.
+- The VUs' four lanes at once in NEON on arm64 (`PS2RT_VU_NEON`), wherever
+  x86 has SSE: the FMAC lanes (`vu_math.h`'s `LanesNeon`, the same
+  single-precision operations on the same cleaned operands, a multiply and
+  an add never fused), macro mode's inline COP2 (`lifted.h`'s `MacroFmac`,
+  FPCR set through `fp_mode.h`) and compiled microprograms (`vu_core.h`:
+  the FMACs, OPMULA/OPMSUB, ITOF/FTOI/ABS, DIV/SQRT, the flags, the held
+  writes). arm64 ran the scalar model for all of them, through a call and
+  a decode each: in Tekken 5's fight two thirds of VU1's time went there,
+  and half the EE's to macro mode's COP2. A VU1 bench of 3,000 of the
+  fight's runs (`--vu-bench`): 9.26 -> 1.83 ns a pair, the state hash the
+  same; an inline COP2 46 -> 39 ns, most of what is left the two FPCR
+  writes (about 12 ns each on an M1 Pro). The fight's logic, by its round
+  timer, went from half speed to 58-60 frames a second. `VuLanesAreTheModel`
+  now runs in both float modes, and `MacroFmacIsTheModel` compares the
+  inline COP2 with the model; both, and `VuCompiledIsTheInterpreter`, fail
+  on a fused multiply-add, a wrong shuffle or wrong flag weights.
 - The compiled checks build outside Windows: `cppcheck.py`, `liftcheck.py`
   and `equivalence.py` compile their libraries with clang++ (`$CXX`) at
   `-O3 -ffp-contract=off`, as a Release port is compiled; MSVC's path is
