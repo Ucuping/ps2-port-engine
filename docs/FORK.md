@@ -31,13 +31,14 @@ None of these changes what the Windows build does; the Windows CI
 (`.github/workflows/windows.yml`: MSVC, AVX2 on and off, a port linked from a
 stub dispatch table, every test) checks that it still builds and passes.
 
-Five are on branches of their own for upstream, each from `upstream/master`
+Six are on branches of their own for upstream, each from `upstream/master`
 (6226b59) with the one fix and a test that fails without it, pushed to this
 fork only: `pr/osd-config-syscalls` (services 0x4A and 0x4B),
 `pr/iop-export-names` (ioman's, iomanx's and stdio's names),
 `pr/lift-without-compiler`, `pr/elf-segment-overlap` (the ELF loader's
-zeroed tails, with `LoadExecutable` for the test) and
-`pr/ee-refer-sema-status` (ReferSemaStatus, CreateSema's attr and option).
+zeroed tails, with `LoadExecutable` for the test),
+`pr/ee-refer-sema-status` (ReferSemaStatus, CreateSema's attr and option)
+and `pr/likely-slot-liveness` (the structurer's liveness, below).
 The two in the host cannot be built on macOS from upstream's tree; they
 were checked on MSVC by the throwaway branches `ci-check/*`
 (`.github/workflows/pr-check.yml` there): upstream's host tests with the
@@ -256,6 +257,14 @@ ELF loader's one, ReferSemaStatus's five).
   (`.rodata`) with its code, off by default (`verify_read_only_sections`),
   on bytes nothing else holds (an overlay's image takes its executable's in
   the gap); they are part of lift's verdict fingerprint.
+- The structurer's liveness runs a likely branch's delay slot on its taken
+  path only (`liveness.live_out`): what the slot reads is live, what it
+  writes no longer looks dead on the other path. Counted on both, a
+  register's last definition before the branch could fold away while the
+  untaken path still read it - wrong code in a verified or
+  equivalence-checked form, since random tests seldom take that path.
+  Tekken 5's map erase stored a stale pointer and the game hung; 139 of its
+  functions get another folded form.
 
 Found and not yet changed, with the evidence in the Tekken 5 repository's
 `games/tekken5/docs/FINDINGS.md` ("Engine findings worth upstreaming"): a call
