@@ -2,6 +2,7 @@
 import contextlib
 import io
 import os
+import shutil
 import struct
 import sys
 import tempfile
@@ -63,7 +64,10 @@ class TestToolchain(unittest.TestCase):
         import regress
 
         self.assertEqual(os.environ.get("PS2RT_EE_ROUND_NEAREST"), "1")
-        game = tempfile.mkdtemp()
+        # Beside the tests: regress prints the CRC list's path relative to
+        # here, which Windows cannot do across drives (the CI's TEMP is C:).
+        game = tempfile.mkdtemp(dir=os.path.dirname(os.path.abspath(__file__)))
+        self.addCleanup(shutil.rmtree, game, True)
         os.makedirs(os.path.join(game, "port", "runs"))
         with open(os.path.join(game, "game.json"), "w") as handle:
             json.dump({"executable": "NONE.00", "iso": ""}, handle)
