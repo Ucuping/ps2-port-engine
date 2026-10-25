@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -29,6 +30,10 @@
 #include "ps2host/settings.h"
 #include "ps2host/timeline.h"
 #include "platform/platform.h"
+
+#if !defined(_WIN32)
+extern char** environ;          // (POSIX's: NoteEnvironment)
+#endif
 
 namespace ps2host {
 
@@ -727,7 +732,25 @@ private:
 
 }  // namespace
 
+namespace {
+// The environment variables that change what a run does (PS2HOST_*: the
+// host's switches; PS2RT_*: the runtime's), said at its start: a run started
+// from a tool once inherited verification's PS2RT_EE_ROUND_NEAREST and
+// rounded floats otherwise than the console, with nothing in its log.
+void NoteEnvironment() {
+#if defined(_WIN32)
+    char** names = _environ;
+#else
+    char** names = environ;
+#endif
+    for (char** e = names; e && *e; ++e)
+        if (std::strncmp(*e, "PS2HOST_", 8) == 0 || std::strncmp(*e, "PS2RT_", 6) == 0)
+            std::fprintf(stderr, "[host] environment: %s\n", *e);
+}
+}  // namespace
+
 int Run(const Options& options) {
+    NoteEnvironment();
     SetVirtualClock(options.virtual_time);  // before anything reads the clock
     g_trace = options.trace_calls;
     g_all_notes = options.all_notes;

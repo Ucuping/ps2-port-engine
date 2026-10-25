@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace ps2host {
 namespace gs {
@@ -397,6 +398,39 @@ void Gs::ApplyPrivileged(u32 address, u64 value) {
         case 0x00A0: display_[1] = value; break;
         case 0x00E0: bgcolor_ = value; break;
         default: break;
+    }
+    if ((address & 0xFFFF) <= 0x00A0) NoteDisplay();
+}
+
+// The picture's shape as the display registers give it, said each time it
+// changes - not the buffer shown, which a game flips every picture: a run's
+// log then says which mode a game was in (interlaced or progressive, the
+// size, the buffer's format) and when it went to another.
+void Gs::NoteDisplay() const {
+    const bool both = Bits(pmode_, 0, 1) && Bits(pmode_, 1, 1);
+    int circuit = Bits(pmode_, 1, 1) ? 1 : Bits(pmode_, 0, 1) ? 0 : -1;
+    if (circuit < 0) {
+        if (!dispfb_[1] && !dispfb_[0]) return;
+        circuit = dispfb_[1] ? 1 : 0;
+    }
+    const u64 fb = dispfb_[circuit], disp = display_[circuit];
+    const u32 fbw = Bits(fb, 9, 6), psm = Bits(fb, 15, 5);
+    if (!fbw || !disp) return;                      // (still being set up)
+    const u32 magh = Bits(disp, 23, 4) + 1, magv = Bits(disp, 27, 2) + 1;
+    const u32 dw = Bits(disp, 32, 12) + 1, dh = Bits(disp, 44, 11) + 1;
+    const bool interlaced = Bits(smode2_, 0, 1), field = interlaced && Bits(smode2_, 1, 1);
+    const char* format = psm == PSMCT32 ? "PSMCT32" : psm == PSMCT24 ? "PSMCT24" : psm == PSMCT16 ? "PSMCT16"
+                       : psm == PSMCT16S ? "PSMCT16S" : "another format";
+    char text[224];
+    std::snprintf(text, sizeof text, "%ux%u (DW %u / MAGH %u, DH %u / MAGV %u) at (%u, %u), %s; circuit %d%s; "
+                  "a %s buffer %u pixels wide",
+                  dw / magh, dh / magv, dw, magh, dh, magv, unsigned(Bits(disp, 0, 12)), unsigned(Bits(disp, 12, 11)),
+                  field ? "interlaced, a field a picture" : interlaced ? "interlaced, a frame a picture" : "progressive",
+                  circuit + 1, both ? " (both on)" : "", format, fbw * 64);
+    static std::string said;
+    if (said != text) {
+        said = text;
+        std::fprintf(stderr, "[gs] display: %s\n", text);
     }
 }
 

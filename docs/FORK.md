@@ -112,6 +112,11 @@ ELF loader's one, ReferSemaStatus's five).
   happens (focus, minimize, hide, fullscreen, the drawable's and the
   swapchain's sizes); a failed Vulkan call is said once. The platform
   tests check the log, a held log, and a crash's report in it, once.
+  A run's log also says, at its start, every PS2HOST_* and PS2RT_*
+  variable in its environment (a tool's PS2RT_EE_ROUND_NEAREST had gone
+  unseen), and the display mode each time it changes (`[gs] display:` -
+  size, interlaced or progressive, field or frame, the buffer's format;
+  not the buffer shown, which a game flips every picture).
 - padman's results where libpad reads them (ps2sdk's `libpad.c`): +0x14
   for SET_MMODE, SET_ACTDIR and SET_ACTALIGN, +0x10 for SET_BTNINFO (each
   had what the request left there). And off by default, on for a game with

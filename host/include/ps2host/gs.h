@@ -344,6 +344,7 @@ private:
     u32 cbp0_ = 0, cbp1_ = 0;                       // CLUT bases CLD compares with
     // Privileged.
     u64 pmode_ = 0, smode2_ = 0, dispfb_[2] = {}, display_[2] = {}, bgcolor_ = 0;
+    void NoteDisplay() const;
     u64 primitives_ = 0, uploads_ = 0;
     std::atomic<u64> pixels_{0};               // written by the row workers too
     u64 effect_params_[14] = {};                // 0x70-0x7D (on_effect)
