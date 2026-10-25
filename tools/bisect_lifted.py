@@ -116,7 +116,8 @@ class Renderer:
         command += self.args + ["--timeout", "14400", "--frames", frames, "--frames-every", str(self.frame)]
         if self.gpu:
             command.append("--gpu")
-        result = subprocess.run(command, cwd=self.root, capture_output=True, text=True, errors="replace")
+        result = subprocess.run(command, cwd=self.root, capture_output=True, text=True, errors="replace",
+                                env=toolchain.game_env())
         if log_calls is not None:
             log_calls.update(int(m.group(1), 16) for m in re.finditer(r"^\[call\] 0x([0-9A-F]{8})",
                                                                       result.stderr, re.M))

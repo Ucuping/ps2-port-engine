@@ -134,6 +134,16 @@ ELF loader's one, ReferSemaStatus's five).
   yet). `port.py`, `regress.py` and `bisect_lifted.py` find the executable
   through it, and the CI builds its stub port with it. `pgo` and `--sse4`
   stay Windows' (x86, clang-cl).
+  Correction (25 October 2026): `toolchain.py` imports
+  `ps2decomp/cppcheck.py`, which sets `PS2RT_EE_ROUND_NEAREST` for
+  verification's own runs, so `regress.py` and `bisect_lifted.py` started
+  the port rounding to nearest from then on - their pictures another FPU's
+  than the console's, which `port.py` and a run started by hand have.
+  Upstream's two did not import it. The port's environment is now
+  `toolchain.game_env` (what `port.py` had as `_game_env`), and every tool
+  that starts the port uses it; `test_a_scripted_run_rounds_as_the_console_does`
+  fails without it. Tekken 5's scripted runs recorded since then are
+  recorded again.
 - The host builds and runs outside Windows. The executable's path and the
   process's processors are the platform layer's; keys are named by
   Windows' virtual-key numbers everywhere (`host/src/keycodes.h`); where no

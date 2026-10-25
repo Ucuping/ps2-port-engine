@@ -54,6 +54,41 @@ class TestToolchain(unittest.TestCase):
         self.assertEqual(toolchain.port_executable(game), expected)
         self.assertEqual(toolchain.executable_name("ps2host_tests"), "ps2host_tests" + toolchain.EXE)
 
+    def test_a_scripted_run_rounds_as_the_console_does(self):
+        # Verification's harness (ps2decomp/cppcheck.py, which toolchain
+        # imports) sets PS2RT_EE_ROUND_NEAREST for itself: regress.py's runs
+        # must not have it, or their pictures are another FPU's.
+        import json
+        import subprocess
+        import regress
+
+        self.assertEqual(os.environ.get("PS2RT_EE_ROUND_NEAREST"), "1")
+        game = tempfile.mkdtemp()
+        os.makedirs(os.path.join(game, "port", "runs"))
+        with open(os.path.join(game, "game.json"), "w") as handle:
+            json.dump({"executable": "NONE.00", "iso": ""}, handle)
+        with open(os.path.join(game, "port", "runs", "boot.args"), "w") as handle:
+            handle.write("--virtual-time --until-frame 2")
+        seen = []
+
+        def run(command, **options):
+            seen.append(options.get("env"))
+            with open(os.path.join(command[command.index("--frames") + 1], "frame_000002.bmp"), "wb") as f:
+                f.write(b"picture")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        saved = regress.subprocess.run
+        regress.subprocess.run = run
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                regress.main(["--game", game, "boot", "--exe", "port", "--every", "2"])
+        finally:
+            regress.subprocess.run = saved
+        self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(seen[0])
+        self.assertNotIn("PS2RT_EE_ROUND_NEAREST", seen[0])
+        self.assertEqual(seen[0].get("PATH"), os.environ.get("PATH"))
+
     def test_the_preset_is_the_templates(self):
         import json
         import toolchain

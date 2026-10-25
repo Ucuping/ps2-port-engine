@@ -42,6 +42,17 @@ def executable_name(name: str) -> str:
     return name + EXE
 
 
+def game_env(**extra) -> dict:
+    """The environment a port runs in: this process's, less what verification
+    sets for itself - ps2decomp/cppcheck.py, imported above, makes the runtime
+    round to nearest as the interpreter does (PS2RT_EE_ROUND_NEAREST); the
+    game itself must round as the console does (a run started from a tool
+    that imported it drew other pictures, and played so)."""
+    env = dict(os.environ, **extra)
+    env.pop("PS2RT_EE_ROUND_NEAREST", None)
+    return env
+
+
 def port_folder() -> str:
     """The main build's folder under build/port: Windows' `cmake`, the
     preset's own name elsewhere (its binaryDir)."""

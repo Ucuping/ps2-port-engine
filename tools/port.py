@@ -294,17 +294,6 @@ def _write_if_changed(path: str, text: str) -> None:
             handle.write(text)
 
 
-def _game_env(**extra) -> dict:
-    """The environment a port runs in: this process's, less what verification
-    sets for itself - ps2decomp/cppcheck.py, imported above, makes the runtime
-    round to nearest as the interpreter does (PS2RT_EE_ROUND_NEAREST); the
-    game itself must round as the console does (a run started here drew
-    other pictures, and played so)."""
-    env = dict(os.environ, **extra)
-    env.pop("PS2RT_EE_ROUND_NEAREST", None)
-    return env
-
-
 def _game_json(game) -> dict:
     """game.json as written (its build options: lto, pgo_runs)."""
     with open(game.path("game.json"), encoding="utf-8") as handle:
@@ -399,7 +388,7 @@ def pgo(game, generated: str) -> str:
     shutil.rmtree(raw, ignore_errors=True)
     os.makedirs(raw)
     # Each run's counts in a file of its own (%p: the process).
-    env = _game_env(LLVM_PROFILE_FILE=os.path.join(os.path.abspath(raw), "run-%p.profraw"))
+    env = toolchain.game_env(LLVM_PROFILE_FILE=os.path.join(os.path.abspath(raw), "run-%p.profraw"))
     regress = os.path.join(os.path.dirname(os.path.abspath(__file__)), "regress.py")
     for name in runs:
         gpu = os.path.exists(game.path(os.path.join("port", "runs", name + ".gpu.crc")))
@@ -441,7 +430,7 @@ def run(game, executable: str, extra) -> int:
             result = subprocess.run([executable, elf, "--discover", discoveries_path(game),
                                      "--called", called_path(game)]
                                     + options + list(extra), stdout=out, stderr=subprocess.STDOUT,
-                                    timeout=timeout + HOST_GRACE_SECONDS, env=_game_env())
+                                    timeout=timeout + HOST_GRACE_SECONDS, env=toolchain.game_env())
             code = result.returncode
         except subprocess.TimeoutExpired:
             # The host stops itself at its own time limit; outliving it by this

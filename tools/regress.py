@@ -85,7 +85,8 @@ def main(argv=None) -> int:
     if args.frame_times:
         command += ["--frame-times", str(args.frame_times)]
     started = time.time()
-    result = subprocess.run(command, capture_output=True, text=True, errors="replace")
+    result = subprocess.run(command, capture_output=True, text=True, errors="replace",
+                            env=toolchain.game_env())     # (the console's rounding, not verification's)
     elapsed = time.time() - started
     for line in result.stdout.splitlines():
         if line.startswith("time:") or line.startswith("gpu: "):
