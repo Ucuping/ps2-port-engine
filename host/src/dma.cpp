@@ -23,11 +23,20 @@ std::uint32_t Address(std::uint64_t tag) {
     return (tag >> 63) ? kScratchpad | (address & 0x3FF0u) : address;
 }
 
+// A channel's MADR or TADR with bit 31 (SPR) set names the scratchpad, at its
+// low 14 bits, as a tag's ADDR does (Address) - not kseg0's view of main RAM.
+// Tekken 5's boot screens send their packets from the scratchpad: read from
+// main RAM they were zeros, and the screens black.
+std::uint32_t Source(std::uint32_t address) {
+    return (address >> 31) ? kScratchpad | (address & 0x3FF0u) : address;
+}
+
 // The quadwords taken: all of them, unless the receiver asked to stop (`stop`):
 // then the quadword it stopped in counts as taken and the rest of it is held.
 std::uint32_t Send(std::uint32_t from, std::uint32_t quadwords, DmaOutcome& outcome, const DmaBlockSink& words,
                    DmaStop* stop) {
     Memory& m = GuestMemory();
+    from = Source(from);
     auto stopped = [&](std::uint32_t taken, const std::uint32_t* run) {
         const std::uint32_t taken_quadwords = (taken + 3) / 4;
         for (std::uint32_t k = taken; k < 4 * taken_quadwords; ++k)
@@ -96,12 +105,13 @@ DmaOutcome SendDmaBlocks(DmaChannelState& ch, const DmaBlockSink& word, std::uin
     std::uint32_t depth = (ch.chcr >> 4) & 3;       // ASP: call stack depth
     Memory& m = GuestMemory();
     while (outcome.tags < max_tags) {
-        const std::uint64_t tag = m.Read(ch.tadr, 8);
+        const std::uint64_t tag = m.Read(Source(ch.tadr), 8);
         ++outcome.tags;
         ch.chcr = (ch.chcr & 0xFFFFu) | (std::uint32_t(tag) & 0xFFFF0000u);     // TAG
         bool stopped_in_tag = false;
         if (transfer_tags) {
-            const std::uint32_t high[2] = {std::uint32_t(m.Read(ch.tadr + 8, 4)), std::uint32_t(m.Read(ch.tadr + 12, 4))};
+            const std::uint32_t high[2] = {std::uint32_t(m.Read(Source(ch.tadr) + 8, 4)),
+                                           std::uint32_t(m.Read(Source(ch.tadr) + 12, 4))};
             word(high, 2, ch.tadr + 8);
             if (stop && stop->requested) {          // in the tag's VIFcodes: its data still to come
                 stop->held.assign(high + stop->taken, high + 2);

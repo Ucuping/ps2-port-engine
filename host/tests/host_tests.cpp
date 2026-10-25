@@ -485,6 +485,26 @@ void DmaChainsAreWalked() {
     PutTag(chain, 0, 2, chain, 0, 0);               // next -> itself
     ps2host::DmaChannelState loop{0x105u, 0, 0, chain, 0, 0};
     Check(!ps2host::SendDma(loop, [](u32) {}, 100).ended, "a looping chain is cut off");
+    // MADR and TADR with bit 31 (SPR) set read the scratchpad, not main RAM
+    // (Tekken 5's boot screens: packets built there, sent as zeros).
+    for (u32 i = 0; i < 4; ++i) {
+        m.Write(0x70000050u + 4 * i, 0x5C0 + i, 4);
+        m.Write(0x00000050u + 4 * i, 0, 4);
+    }
+    ps2host::DmaChannelState spr{0x101u, 0x80000050u, 1, 0, 0, 0};    // normal mode, STR
+    std::vector<u32> spr_words;
+    ps2host::SendDma(spr, [&spr_words](u32 w) { spr_words.push_back(w); }, 1u << 16, false);
+    Check(spr_words.size() == 4 && spr_words[0] == 0x5C0u && spr_words[3] == 0x5C3u,
+          "MADR's SPR bit reads the scratchpad");
+    m.Write(0x70001260u, 1u | (7u << 28), 4);      // end, its one qword after it
+    m.Write(0x70001264u, 0, 4);
+    for (u32 i = 0; i < 4; ++i) m.Write(0x70001270u + 4 * i, 0x5D0 + i, 4);
+    ps2host::DmaChannelState spr_chain{0x105u, 0, 0, 0x80001260u, 0, 0};
+    std::vector<u32> chain_words;
+    const ps2host::DmaOutcome spr_out =
+        ps2host::SendDma(spr_chain, [&chain_words](u32 w) { chain_words.push_back(w); }, 1u << 16, false);
+    Check(spr_out.ended && chain_words.size() == 4 && chain_words[0] == 0x5D0u,
+          "TADR's SPR bit reads the chain's tags from the scratchpad");
 }
 
 // Every format's layout maps a page's pixels onto distinct bytes (nibbles).

@@ -88,6 +88,13 @@ ELF loader's one, ReferSemaStatus's five).
   453 of its 1,365 cases. The software GS's own estimates
   (`gs_draw.cpp`'s texture, frame and depth ends) count the same way and
   are left as they are for now.
+- A DMA channel's MADR or TADR with bit 31 (SPR) set reads the scratchpad
+  (`dma.cpp`, `Source`), as a tag's ADDR already did: it read kseg0's view
+  of main RAM instead. Tekken 5 sends its boot-time Starblade from the
+  scratchpad (PATH3 with MADR 0x80000050, chains at TADR 0x80001260): the
+  GS got empty tags and the screen stayed black while its sound played.
+  The EE's DMA documentation and PCSX2 both take bit 31 as the scratchpad.
+  `DmaChainsAreWalked` covers both registers and fails on the old code.
 - The compiled checks build outside Windows: `cppcheck.py`, `liftcheck.py`
   and `equivalence.py` compile their libraries with clang++ (`$CXX`) at
   `-O3 -ffp-contract=off`, as a Release port is compiled; MSVC's path is
