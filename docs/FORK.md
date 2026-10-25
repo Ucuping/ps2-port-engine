@@ -124,6 +124,11 @@ ELF loader's one, ReferSemaStatus's five).
   bytes) on and off, and SET_ACTDIR driving the host's motors through the
   bytes SET_ACTALIGN gave them - padman's games had no vibration.
   `PadmanIsADualShock2` calls the server through SIF DMA as the EE does.
+- On Apple's systems the Vulkan window's drawable is in the screen's own
+  pixels (`SDL_WINDOW_HIGH_PIXEL_DENSITY`): a Retina screen's fullscreen
+  picture was drawn at half its resolution and scaled up by the compositor
+  (1512 x 949 of 3024 x 1898 on a 14-inch MacBook Pro). The game's pointer
+  keeps its size in points.
 - The compiled checks build outside Windows: `cppcheck.py`, `liftcheck.py`
   and `equivalence.py` compile their libraries with clang++ (`$CXX`) at
   `-O3 -ffp-contract=off`, as a Release port is compiled; MSVC's path is

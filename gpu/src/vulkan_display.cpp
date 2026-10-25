@@ -438,7 +438,15 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
                      gamepads);
     }
     if (!Check(volkInitialize(), "volkInitialize (is there a Vulkan driver?)")) return false;
-    window_ = SDL_CreateWindow(title, width, height, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+    // On Apple's systems the drawable in the screen's own pixels (a Retina
+    // screen's two a point), not in points the compositor scales up: the
+    // picture as sharp as the screen, fullscreen too.
+#if defined(__APPLE__)
+    constexpr SDL_WindowFlags kDensity = SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#else
+    constexpr SDL_WindowFlags kDensity = 0;
+#endif
+    window_ = SDL_CreateWindow(title, width, height, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | kDensity);
     if (!window_) {
         error_ = std::string("SDL_CreateWindow: ") + SDL_GetError();
         return false;
@@ -1859,7 +1867,9 @@ void VulkanDisplay::MouseAt(float x, float y) {
 void VulkanDisplay::UpdateCursor() {
     if (!window_) return;
     const bool want = cursor_wanted_.load();
-    std::uint32_t size = std::uint32_t(float(shown_h_.load()) / 20.0f + 0.5f);
+    // (shown_h_ in the drawable's pixels, the pointer's size in the window's points)
+    const float density = SDL_GetWindowPixelDensity(window_);
+    std::uint32_t size = std::uint32_t(float(shown_h_.load()) / 20.0f / (density > 0.0f ? density : 1.0f) + 0.5f);
     size = std::clamp<std::uint32_t>(size, 20, 128);
     if (want) {
         std::lock_guard<std::mutex> hold(mouse_lock_);
