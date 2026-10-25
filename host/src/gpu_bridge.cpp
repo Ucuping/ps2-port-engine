@@ -1902,24 +1902,26 @@ void OnDraw(const gs::Gs::DrawCall& call) {
             const u32 candidates[2] = {tex_format == 2 ? tex_psm : gs::PSMCT32,
                                        tex_format == 2 ? tex_psm : tex_format == 4 ? gs::PSMCT32 : gs::PSMCT24};
             const u32 tex_fbw = Bits(c.tex0, 14, 6);
+            // A target drawn at the texture's own address, in either format,
+            // first; only then one it lies inside (Containing). Starblade
+            // draws its scene into a PSMCT24 target and copies it out as a
+            // PSMCT32 texture: the PSMCT32 image the same address had lain
+            // inside since a clear at boot was taken instead, its old rows -
+            // yellow and black bars.
+            for (int pass = 0; pass < 2 && !state.texture_target; ++pass)
             for (u32 psm : candidates) {
                 u32 tex_fbp = tbp_blocks / 32;
-                // Inside another target (Containing): that one, its rows lower.
-                if (s.primary && !s.owned.count(std::make_tuple(tex_fbp, tex_fbw, psm, false))) {
-                    u32 offset = 0;
-                    if (Owned* base = Containing(s, tex_fbp, tex_fbw, psm, &offset)) {
-                        tex_fbp = base->fbp;
-                        t_offset = offset;
-                        for (std::size_t i = 0; i < n; ++i) v[i].t += float(offset) * v[i].q / float(th);
-                    }
-                }
-                const bool known = s.primary ? s.owned.count(std::make_tuple(tex_fbp, tex_fbw, psm, false)) != 0
+                const bool exact = s.primary ? s.owned.count(std::make_tuple(tex_fbp, tex_fbw, psm, false)) != 0
                                              : s.renderer->HasTarget(tex_fbp, tex_fbw, psm);
-                if (!known) {
-                    if (t_offset)
-                        for (std::size_t i = 0; i < n; ++i) v[i].t -= float(t_offset) * v[i].q / float(th);
-                    t_offset = 0;
-                    continue;
+                if (exact != (pass == 0)) continue;
+                if (!exact) {
+                    // Inside another target (Containing): that one, its rows lower.
+                    u32 offset = 0;
+                    Owned* base = s.primary ? Containing(s, tex_fbp, tex_fbw, psm, &offset) : nullptr;
+                    if (!base) continue;
+                    tex_fbp = base->fbp;
+                    t_offset = offset;
+                    for (std::size_t i = 0; i < n; ++i) v[i].t += float(offset) * v[i].q / float(th);
                 }
                 if (s.primary) {
                     Owned& source = s.owned[std::make_tuple(tex_fbp, tex_fbw, psm, false)];

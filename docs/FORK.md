@@ -124,6 +124,17 @@ ELF loader's one, ReferSemaStatus's five).
   bytes) on and off, and SET_ACTDIR driving the host's motors through the
   bytes SET_ACTALIGN gave them - padman's games had no vibration.
   `PadmanIsADualShock2` calls the server through SIF DMA as the EE does.
+- The GPU bridge samples a texture from the target drawn at the texture's
+  own address, in either of the formats it could be (PSMCT32, PSMCT24),
+  before one the address lies inside (`Containing`). It tried the first
+  format's containing image before the second format's exact one:
+  Starblade, the game Tekken 5 offers while it loads, draws its scene into a
+  PSMCT24 target and copies each field out of it as a PSMCT32 texture, where
+  a PSMCT32 image had held the address since a clear at boot - its old rows
+  came out as yellow and black bars, the halves apart at the middle. Under
+  `--gpu`, Tekken 5's `boot_to_title` changes over Starblade's frames only.
+  `GpuTexturesTakeTheTargetDrawnThere` (a Vulkan device's, skipped without
+  one) fails without it.
 - On Apple's systems the Vulkan window's drawable is in the screen's own
   pixels (`SDL_WINDOW_HIGH_PIXEL_DENSITY`): a Retina screen's fullscreen
   picture was drawn at half its resolution and scaled up by the compositor

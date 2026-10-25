@@ -2903,6 +2903,55 @@ void SegmentsKeepTheirBytes() {
     for (u32 i = 0; i < kWideSize; i += 4) m.Write(kWide + i, 0u, 4);
 }
 
+// The GPU bridge (gpu_bridge.cpp): a texture over a target drawn at its own
+// address is sampled from that target, in either format, before one it lies
+// inside (Containing). Starblade draws its scene into a PSMCT24 target and
+// copies it out as a PSMCT32 texture, where a PSMCT32 image had held the
+// address since a clear: that one's old rows came out - yellow and black
+// bars. Needs a Vulkan device (skipped without one); last, since the bridge
+// stays installed on the GS.
+void GpuTexturesTakeTheTargetDrawnThere() {
+    using namespace ps2host::gs;
+    std::string error;
+    if (!ps2host::StartGpuRenderer(&error, ps2host::GpuMode::Primary, false)) {
+        std::printf("  the GPU bridge's test skipped: %s\n", error.c_str());
+        return;
+    }
+    Gs& gs = TheGs();
+    gs.WriteRegister(0x4E, (u64(1) << 32) | 0x100);                     // ZBUF: far away, not written
+    auto sprite = [&](u32 fbp, u32 psm, u32 rows, u64 rgba) {
+        gs.WriteRegister(0x4C, u64(fbp) | (u64(1) << 16) | (u64(psm) << 24));   // FRAME: 64 wide
+        gs.WriteRegister(0x40, u64(63) << 16 | u64(rows - 1) << 48);            // SCISSOR
+        gs.WriteRegister(0x00, 6);                                             // PRIM: sprite
+        gs.WriteRegister(0x01, rgba);
+        gs.WriteRegister(0x05, 0);
+        gs.WriteRegister(0x05, (u64(64) << 4) | (u64(rows) << 4) << 16);
+    };
+    sprite(0, PSMCT32, 128, 0x800000FFull);     // red, four pages tall
+    sprite(2, PSMCT32, 64, 0x800000FFull);      // inside it, 64 rows down
+    sprite(2, PSMCT24, 64, 0x8000FF00ull);      // the same address as PSMCT24: green
+    // Block 64 copied out as a PSMCT32 texture (64x64, decal) into a third.
+    gs.WriteRegister(0x4C, u64(8) | (u64(1) << 16) | (u64(PSMCT32) << 24));
+    gs.WriteRegister(0x40, u64(63) << 16 | u64(63) << 48);
+    gs.WriteRegister(0x06, u64(64) | (u64(1) << 14) | (u64(PSMCT32) << 20) | (u64(6) << 26) | (u64(6) << 30) |
+                               (u64(1) << 34) | (u64(1) << 35));
+    gs.WriteRegister(0x00, 6 | (1 << 4) | (1 << 8));                    // sprite, textured, UV
+    gs.WriteRegister(0x03, 0);
+    gs.WriteRegister(0x05, 0);
+    gs.WriteRegister(0x03, (u64(64) << 4) | (u64(64) << 4) << 16);
+    gs.WriteRegister(0x05, (u64(64) << 4) | (u64(64) << 4) << 16);
+    // Shown, so back in local memory.
+    gs.SetPrivileged(0x12000000, 1);                                     // PMODE: circuit 1
+    gs.SetPrivileged(0x12000070, u64(8) | (u64(1) << 9) | (u64(PSMCT32) << 15));
+    gs.SetPrivileged(0x12000080, (u64(63) << 32) | (u64(63) << 44));
+    std::vector<u32> pixels;
+    u32 w = 0, h = 0;
+    const bool shown = gs.Picture(&pixels, &w, &h);
+    Check(shown && w == 64 && h == 64 && (pixels[32 * 64 + 32] & 0xFFFFFF) == 0x00FF00,
+          "the GPU samples the target drawn at a texture's address (PSMCT24 read as PSMCT32), "
+          "not the one it lay inside");
+}
+
 int main() {
     OverlaysRunWhatIsLoaded();
     CallsAreRecordedNotJumps();
@@ -2976,6 +3025,7 @@ int main() {
     ps2host::InstallDevices();
     Vif1StandsUntilStc();
     Vif1StandingIsReported();
+    GpuTexturesTakeTheTargetDrawnThere();
     std::printf(g_failures ? "host tests: %d failed\n" : "host tests: all passed\n", g_failures);
     return g_failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }
