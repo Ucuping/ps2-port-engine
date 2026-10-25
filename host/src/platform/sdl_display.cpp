@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <string>
 #include <vector>
 
 #include "ps2gpu/sdl_pad.h"
@@ -82,6 +84,12 @@ public:
             switch (event.type) {
                 case SDL_EVENT_QUIT:
                 case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                    if (!closed_) {
+                        closed_by_ = event.type == SDL_EVENT_QUIT
+                                         ? "the app's Quit (Cmd+Q, or Quit in its menu)"
+                                         : "the window's close (its button, or Cmd+W)";
+                        std::fprintf(stderr, "[window] closed by %s\n", closed_by_.c_str());
+                    }
                     closed_ = true;
                     break;
                 case SDL_EVENT_GAMEPAD_ADDED:
@@ -101,6 +109,8 @@ public:
         }
         return !closed_;
     }
+
+    std::string ClosedBy() const override { return closed_ ? closed_by_ : std::string(); }
 
     bool Focused() const override {
         return window_ && (SDL_GetWindowFlags(window_) & SDL_WINDOW_INPUT_FOCUS) != 0;
@@ -206,6 +216,7 @@ private:
     std::vector<Gamepad> pads_;
     float aspect_ = 4.0f / 3.0f;
     bool closed_ = false;
+    std::string closed_by_;             // ClosedBy
     std::uint64_t presents_ = 0;
 };
 

@@ -46,6 +46,13 @@ namespace {
 HWND g_window = nullptr;
 #endif
 bool g_closed = false;
+std::string g_closed_by;            // WindowClosedBy
+
+// The run ends at the next frame, for `why` (the first reason given).
+void Close(const std::string& why) {
+    if (!g_closed) g_closed_by = why.empty() ? "the window's close or the app's Quit" : why;
+    g_closed = true;
+}
 
 #ifdef PS2HOST_VULKAN
 std::unique_ptr<ps2gpu::Display> g_display;
@@ -110,7 +117,7 @@ int Scancode(int key) {
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM w, LPARAM l) {
     switch (message) {
         case WM_CLOSE:
-            g_closed = true;
+            Close("the window's close");
             DestroyWindow(window);
             return 0;
         case WM_DESTROY:
@@ -290,8 +297,10 @@ bool WindowFocused() {
 
 bool WindowClosed() { return g_closed; }
 
+std::string WindowClosedBy() { return g_closed_by; }
+
 // A game's own EXIT GAME: as if the window had been closed.
-void QuitGame() { g_closed = true; }
+void QuitGame() { Close("the game's own EXIT GAME"); }
 
 bool HostKeyDown(int key) {
     if (ScriptedKeyDown(key)) return true;          // --key
@@ -485,7 +494,7 @@ void KeepFullscreenSetting() {
 bool PumpWindow() {
 #ifdef PS2HOST_VULKAN
     if (g_display) {
-        if (!g_display->Pump()) g_closed = true;
+        if (!g_display->Pump()) Close(g_display->ClosedBy());
         KeepFullscreenSetting();
         if (g_display->TakeCapture()) RequestCapture();
         UpdatePcMenu();                     // F9: the PC settings panel (pc_menu.cpp)
@@ -716,14 +725,15 @@ void PresentFrame() {
 #ifdef PS2HOST_VULKAN
     if (g_display) {
         if (!g_display->Pump()) {
-            g_closed = true;
+            Close(g_display->ClosedBy());
             return;
         }
         KeepFullscreenSetting();
         std::vector<u32> pixels;
         u32 w = 0, h = 0;
         const bool got = (g_picture_source && g_picture_source(&pixels, &w, &h)) || gs::TheGs().Picture(&pixels, &w, &h);
-        if (got && !g_display->Present(pixels.data(), w, h)) g_closed = true;
+        if (got && !g_display->Present(pixels.data(), w, h))
+            Close("a picture the window could not show (the [display] line before)");
         return;
     }
 #endif

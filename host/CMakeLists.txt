@@ -20,7 +20,8 @@ target_compile_features(ps2rt PUBLIC cxx_std_17)
 add_library(ps2platform STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/platform/fiber.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/platform/system.cpp
-    ${CMAKE_CURRENT_LIST_DIR}/src/platform/fault.cpp)
+    ${CMAKE_CURRENT_LIST_DIR}/src/platform/fault.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/platform/run_log.cpp)
 target_link_libraries(ps2platform PUBLIC ps2rt)        # ps2rt/fp_mode.h: a fiber's float control
 if(WIN32)
     target_link_libraries(ps2platform PRIVATE winmm)   # timeBeginPeriod

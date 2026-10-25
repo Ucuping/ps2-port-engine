@@ -132,6 +132,7 @@ public:
     std::atomic<float> refresh_hz_{0.0f};       // Pump's
     unsigned refresh_looks_ = 0;
     Pacing TakePacing() override;
+    std::string ClosedBy() const override { return closed_ ? closed_by_ : std::string(); }
     bool Focused() const override;
     bool KeyDown(int scancode) const override;
     bool Pad(PadState* state) const override;
@@ -287,6 +288,7 @@ private:
     // Set by Pump (the main thread), read where pictures are presented (the
     // GS thread, when it presents).
     std::atomic<bool> closed_{false}, stale_{false};
+    std::string closed_by_;             // ClosedBy (the window's thread writes it before closed_)
     /* Acquires the next swapchain image and begins the command buffer:
        false (with *ok) when there is nothing to present into. */
     bool BeginPresent(std::uint32_t* index, bool* ok);
@@ -406,6 +408,7 @@ bool VulkanDisplay::Check(VkResult result, const char* what) {
     if (result == VK_SUCCESS) return true;
     char text[160];
     std::snprintf(text, sizeof text, "%s failed (VkResult %d)", what, int(result));
+    if (error_ != text) std::fprintf(stderr, "[display] %s\n", text);     // (once while it repeats)
     error_ = text;
     return false;
 }
@@ -571,6 +574,9 @@ bool VulkanDisplay::CreateSwapchain() {
     extent_ = caps.currentExtent.width != 0xFFFFFFFFu ? caps.currentExtent
               : VkExtent2D{std::uint32_t(w), std::uint32_t(h)};
     if (extent_.width == 0 || extent_.height == 0) return true;      // minimised: nothing to show
+    std::fprintf(stderr, "[display] swapchain %ux%u (the window %dx%d pixels; the surface's own %ux%u)\n",
+                 unsigned(extent_.width), unsigned(extent_.height), w, h, unsigned(caps.currentExtent.width),
+                 unsigned(caps.currentExtent.height));
     if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
         error_ = "the swapchain cannot be a transfer destination";
         return false;
@@ -735,6 +741,8 @@ bool VulkanDisplay::BeginPresent(std::uint32_t* index, bool* ok) {
         return false;
     }
     if (stale_ && !CreateSwapchain()) {
+        std::fprintf(stderr, "[display] the swapchain could not be made again (%s): no more pictures\n",
+                     error_.c_str());
         *ok = false;
         return false;
     }
@@ -1742,8 +1750,29 @@ bool VulkanDisplay::Pump() {
     }
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) closed_ = true;
-        if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) stale_ = true;
+        // The window's life, said as it happens: a run that ends by a window
+        // closed says by what, and the rest (focus, size, fullscreen) is what
+        // a report of a picture gone wrong needs.
+        if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+            if (!closed_) {
+                closed_by_ = e.type == SDL_EVENT_QUIT ? "the app's Quit (Cmd+Q, or Quit in its menu)"
+                                                      : "the window's close (its button, or Cmd+W)";
+                std::fprintf(stderr, "[window] closed by %s\n", closed_by_.c_str());
+            }
+            closed_ = true;
+        }
+        if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
+            stale_ = true;
+            std::fprintf(stderr, "[window] drawable %dx%d pixels\n", int(e.window.data1), int(e.window.data2));
+        }
+        if (e.type == SDL_EVENT_WINDOW_FOCUS_LOST) std::fprintf(stderr, "[window] focus lost\n");
+        if (e.type == SDL_EVENT_WINDOW_FOCUS_GAINED) std::fprintf(stderr, "[window] focus gained\n");
+        if (e.type == SDL_EVENT_WINDOW_MINIMIZED) std::fprintf(stderr, "[window] minimized\n");
+        if (e.type == SDL_EVENT_WINDOW_RESTORED) std::fprintf(stderr, "[window] restored\n");
+        if (e.type == SDL_EVENT_WINDOW_HIDDEN) std::fprintf(stderr, "[window] hidden (Cmd+H, say)\n");
+        if (e.type == SDL_EVENT_WINDOW_SHOWN) std::fprintf(stderr, "[window] shown\n");
+        if (e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN) std::fprintf(stderr, "[window] fullscreen\n");
+        if (e.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN) std::fprintf(stderr, "[window] fullscreen left\n");
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_RETURN &&
             (e.key.mod & SDL_KMOD_ALT))
             SetFullscreen(!Fullscreen());

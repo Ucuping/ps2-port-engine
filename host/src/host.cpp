@@ -825,7 +825,8 @@ int Run(const Options& options) {
         std::fprintf(stderr, "[host] entry %s\n", Describe(entry).c_str());
         RunThreads(c, entry, options.loop_budget);
     } catch (const GuestExit& exit) {
-        outcome = "the guest exited with code " + std::to_string(exit.code);
+        outcome = WindowClosed() ? "stopped: the window was closed by " + WindowClosedBy()
+                                 : "the guest exited with code " + std::to_string(exit.code);
         code = 0;
     } catch (const Unimplemented& missing) {
         outcome = "stopped: " + missing.what;

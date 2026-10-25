@@ -53,6 +53,9 @@ public:
     /* Handles the window's events; false once it has been closed. Alt+Enter
        toggles fullscreen. */
     virtual bool Pump() = 0;
+    /* What closed it, once Pump has said so: the app's Quit (Cmd+Q on macOS)
+       or the window's close (its button, Cmd+W). */
+    virtual std::string ClosedBy() const { return {}; }
 
     /* How evenly pictures went to the screen since the last call (--frame-times):
        presents, and the time between them - mean, standard deviation and

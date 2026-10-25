@@ -384,6 +384,8 @@ void SetGameTitle(const std::string& title);
 const std::string& GameTitle();
 bool WindowOpen();
 bool WindowClosed();
+/* What closed it (the app's Quit, the window's close), for the run's report. */
+std::string WindowClosedBy();
 void PresentFrame();
 /* The window's events alone (PresentFrame without the picture, which the GS
    thread presents): false once it has been closed. */

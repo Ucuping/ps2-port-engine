@@ -95,6 +95,23 @@ ELF loader's one, ReferSemaStatus's five).
   GS got empty tags and the screen stayed black while its sound played.
   The EE's DMA documentation and PCSX2 both take bit 31 as the scratchpad.
   `DmaChainsAreWalked` covers both registers and fails on the old code.
+- The run log outside Windows (`platform/run_log.cpp`, `main.cpp`): a run
+  started with arguments copies its stdout and stderr, as they are
+  written, into `<executable>.log` beside the executable (`<name>.<pid>.log`
+  while another run holds that one; `--log FILE` names it) while they still
+  go where they went - a player's window has no terminal, and a terminal's
+  output is gone once it is cleared. A run without arguments wrote its log
+  already. Whatever ends a run says so there: the host's report, the exit
+  code, a crash (the report written to the log directly, since stderr's
+  pipe dies with the process), an exception nothing caught, `exit()` from a
+  library, SIGHUP, SIGINT, SIGTERM and SIGQUIT (`NoteEndingSignals`, which
+  also ignores SIGPIPE: a closed pipe is a failed write, not a silent end).
+  A run the window ended says what closed it - the app's Quit (Cmd+Q) or
+  the window's close (its button, Cmd+W), a picture it could not show, the
+  game's own EXIT GAME - and the window's life goes to the log as it
+  happens (focus, minimize, hide, fullscreen, the drawable's and the
+  swapchain's sizes); a failed Vulkan call is said once. The platform
+  tests check the log, a held log, and a crash's report in it, once.
 - The compiled checks build outside Windows: `cppcheck.py`, `liftcheck.py`
   and `equivalence.py` compile their libraries with clang++ (`$CXX`) at
   `-O3 -ffp-contract=off`, as a Release port is compiled; MSVC's path is

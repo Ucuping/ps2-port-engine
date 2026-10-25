@@ -6,6 +6,8 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <exception>
 #include <fcntl.h>
 #include <filesystem>
 #include <sys/stat.h>
@@ -207,6 +209,52 @@ void AttachTerminal() {
 #endif
 }
 
+#ifndef _WIN32
+/* The run log for a run with arguments (one without writes its own,
+   PlayArguments): beside the executable as <name>.log, or <name>.<pid>.log
+   while another run holds that one; --log FILE names it. */
+void StartLog(const std::string& asked, const char* self) {
+    namespace fs = std::filesystem;
+    const fs::path exe = platform::ExecutablePath().empty() ? fs::path(self) : platform::ExecutablePath();
+    std::string path = asked.empty() ? (exe.parent_path() / (exe.stem().string() + ".log")).string() : asked;
+    int started = platform::StartRunLog(path);
+    if (started == 0 && asked.empty()) {
+        path = (exe.parent_path() / (exe.stem().string() + "." + std::to_string(getpid()) + ".log")).string();
+        started = platform::StartRunLog(path);
+    }
+    if (started != 1) {
+        std::fprintf(stderr, "[log] cannot write the run log %s\n", path.c_str());
+        return;
+    }
+    std::fprintf(stderr, "[log] %s\n", path.c_str());
+}
+
+/* Whatever ends the run says so in its log, besides the host's report and a
+   crash's (platform.h): an exception nothing caught, exit() from a library, a
+   signal from outside. */
+void NoteOtherEnds() {
+    platform::NoteEndingSignals();
+    std::set_terminate([] {
+        std::string what = "not a std::exception";
+        if (const std::exception_ptr e = std::current_exception()) {
+            try {
+                std::rethrow_exception(e);
+            } catch (const std::exception& x) {
+                what = x.what();
+            } catch (...) {
+            }
+        }
+        std::fprintf(stderr, "[exit] an exception nothing caught (%s): the run aborts\n", what.c_str());
+        std::abort();                       // the crash report follows (platform.h)
+    });
+    // The host leaves through std::_Exit below: exit() is someone else's.
+    std::atexit([] {
+        std::fprintf(stderr, "[exit] the process ends through exit() - not the host's own way out\n");
+        platform::FinishRunLog();
+    });
+}
+#endif
+
 int main(int argc, char** argv) {
     AttachTerminal();
     std::vector<std::string> play;
@@ -219,6 +267,23 @@ int main(int argc, char** argv) {
         argc = int(play.size());
         argv = play_argv.data();
     }
+#ifndef _WIN32
+    // --log FILE, taken out before the host reads the rest.
+    std::string log_path;
+    std::vector<char*> rest;
+    for (int i = 0; i < argc; ++i) {
+        if (std::string(argv[i]) == "--log" && i + 1 < argc) {
+            log_path = argv[++i];
+            continue;
+        }
+        rest.push_back(argv[i]);
+    }
+    rest.push_back(nullptr);
+    argc = int(rest.size()) - 1;
+    argv = rest.data();
+    NoteOtherEnds();
+    if (play.empty()) StartLog(log_path, argv[0]);
+#endif
     if (!HasAvx2()) {
         std::fprintf(stderr, "This build needs a processor with AVX2 (Intel Haswell, AMD Excavator or later).\n");
         return 70;
@@ -254,6 +319,8 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     TerminateProcess(GetCurrentProcess(), UINT(code));
 #else
+    std::fprintf(stderr, "[exit] code %d\n", code);
+    platform::FinishRunLog();
     std::_Exit(code);
 #endif
     return code;

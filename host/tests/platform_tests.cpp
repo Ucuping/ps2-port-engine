@@ -26,7 +26,9 @@
 #include <windows.h>
 #define PS2_NOINLINE __declspec(noinline)
 #else
+#include <fcntl.h>
 #include <signal.h>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #define PS2_NOINLINE __attribute__((noinline))
@@ -358,6 +360,7 @@ Child RunChild(Body body) {
     int pipe_fds[2];
     Child child;
     if (pipe(pipe_fds) != 0) return child;
+    std::fflush(nullptr);                   // (the child's copy of a buffer is not written twice)
     const pid_t pid = fork();
     if (pid == 0) {
         dup2(pipe_fds[1], STDERR_FILENO);
@@ -406,6 +409,72 @@ void GuardStopsAnOverflow() {
     Check(child.output.find("[crash] SIG") != std::string::npos && WIFEXITED(child.status) &&
               WEXITSTATUS(child.status) == 42,
           "a fiber's stack overflow faults on its guard, and is reported on the handler's own stack");
+}
+
+std::string TempPath(const char* name) {
+    const char* dir = std::getenv("TMPDIR");
+    std::string path = std::string(dir && *dir ? dir : "/tmp") + "/" + name + "." + std::to_string(getpid());
+    std::remove(path.c_str());
+    return path;
+}
+
+std::string FileText(const std::string& path) {
+    std::string text;
+    if (std::FILE* f = std::fopen(path.c_str(), "rb")) {
+        char buffer[4096];
+        for (std::size_t n; (n = std::fread(buffer, 1, sizeof buffer, f)) > 0;) text.append(buffer, n);
+        std::fclose(f);
+    }
+    return text;
+}
+
+std::size_t Count(const std::string& text, const char* what) {
+    std::size_t n = 0;
+    for (std::size_t at = text.find(what); at != std::string::npos; at = text.find(what, at + 1)) ++n;
+    return n;
+}
+
+void RunLogTakesBothStreams() {
+    const std::string path = TempPath("ps2platform_run_log");
+    const Child child = RunChild([&] {
+        if (platform::StartRunLog(path) != 1) _exit(3);
+        std::printf("to stdout\n");
+        std::fprintf(stderr, "to stderr\n");
+        platform::FinishRunLog();
+        std::fprintf(stderr, "after the log\n");
+        _exit(0);
+    });
+    const std::string text = FileText(path);
+    Check(WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0, "a run log starts");
+    Check(Count(text, "to stdout") == 1 && Count(text, "to stderr") == 1 && Count(text, "after the log") == 0,
+          "the run log has both streams, until it finishes");
+    Check(Count(child.output, "to stderr") == 1 && Count(child.output, "after the log") == 1,
+          "...and stderr still goes where it went before");
+    // Another process holds the log: this one's is not started there.
+    const int held = open(path.c_str(), O_WRONLY);
+    flock(held, LOCK_EX);
+    const Child second = RunChild([&] { _exit(platform::StartRunLog(path) == 0 ? 0 : 3); });
+    close(held);
+    Check(WIFEXITED(second.status) && WEXITSTATUS(second.status) == 0 && FileText(path) == text,
+          "a log another run holds is left alone");
+    std::remove(path.c_str());
+}
+
+void CrashReportInTheRunLog() {
+    const std::string path = TempPath("ps2platform_crash_log");
+    const Child child = RunChild([&] {
+        signal(SIGSEGV, HandlerBefore);
+        signal(SIGBUS, HandlerBefore);
+        platform::InstallCrashHandler();
+        if (platform::StartRunLog(path) != 1) _exit(3);
+        volatile std::uintptr_t nowhere = 16;
+        *reinterpret_cast<volatile int*>(nowhere) = 1;
+    });
+    const std::string text = FileText(path);
+    Check(Count(text, "[crash] SIG") == 1 && Count(text, "native frames") == 1,
+          "a crash's report reaches the run log, once");
+    Check(Count(child.output, "[crash] SIG") == 1, "...and the stderr it had before");
+    std::remove(path.c_str());
 }
 
 #else
@@ -463,6 +532,8 @@ int main() {
 #if !defined(_WIN32)
     CrashReportThenTheHandlerBefore();
     GuardStopsAnOverflow();
+    RunLogTakesBothStreams();
+    CrashReportInTheRunLog();
 #else
     NativeFibersOnRecord();
 #endif

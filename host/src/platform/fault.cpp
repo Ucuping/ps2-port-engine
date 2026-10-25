@@ -62,8 +62,19 @@ constexpr int kSignals[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGABRT};
 struct sigaction g_previous[NSIG];
 std::atomic<bool> g_reported{false};
 
-// Only what a signal handler may call: write(2), and formatting by hand.
-void Write(const char* text) { (void)!::write(STDERR_FILENO, text, std::strlen(text)); }
+std::atomic<int> g_report_file{-1};                  // SetCrashReportFile
+std::atomic<int> g_report_console{STDERR_FILENO};
+
+// Only what a signal handler may call: write(2), and formatting by hand. With
+// a run log, to where stderr went before it and to the log's file directly:
+// stderr is then the log's pipe, whose thread does not get to copy it before
+// the process dies.
+void Write(const char* text) {
+    const std::size_t n = std::strlen(text);
+    (void)!::write(g_report_console.load(std::memory_order_relaxed), text, n);
+    const int file = g_report_file.load(std::memory_order_relaxed);
+    if (file >= 0) (void)!::write(file, text, n);
+}
 
 void WriteNumber(std::uint64_t value, int base) {
     char digits[24];
@@ -133,12 +144,46 @@ void Report(int sig, siginfo_t* info, void* context) {
         Write("\n[crash] native frames, innermost first:\n");
         void* frames[32];
         const int count = backtrace(frames, 32);
-        backtrace_symbols_fd(frames, count, STDERR_FILENO);
+        backtrace_symbols_fd(frames, count, g_report_console.load(std::memory_order_relaxed));
+        const int file = g_report_file.load(std::memory_order_relaxed);
+        if (file >= 0) backtrace_symbols_fd(frames, count, file);
     }
     Forward(sig, info, context);
 }
 
+// The signals that end a process from outside it, each said where a crash's
+// report goes; then the process ends as the signal would have ended it.
+constexpr int kEndSignals[] = {SIGHUP, SIGINT, SIGTERM, SIGQUIT};
+
+void NoteEnd(int sig) {
+    Write("[exit] ");
+    Write(sig == SIGHUP    ? "SIGHUP (the terminal it ran in went away)"
+          : sig == SIGINT  ? "SIGINT (Ctrl+C)"
+          : sig == SIGTERM ? "SIGTERM (asked to end from outside)"
+                           : "SIGQUIT");
+    Write(": the process ends\n");
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 }  // namespace
+
+void NoteEndingSignals() {
+    for (int sig : kEndSignals) {
+        struct sigaction before {};
+        sigaction(sig, nullptr, &before);
+        if (before.sa_handler == SIG_IGN) continue;             // (nohup's, say: left as it is)
+        signal(sig, NoteEnd);
+    }
+    // A write to a pipe nobody reads (a terminal's pipe closed, a log
+    // reader gone) fails with EPIPE instead of ending the process unsaid.
+    signal(SIGPIPE, SIG_IGN);
+}
+
+void SetCrashReportFile(int file, int console) {
+    g_report_console.store(console, std::memory_order_relaxed);
+    g_report_file.store(file, std::memory_order_relaxed);
+}
 
 void InstallCrashHandler() {
     // The handler's own stack on this thread - the one the EE's fibers run

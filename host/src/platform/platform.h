@@ -84,6 +84,22 @@ bool SafeCopy(void* target, const void* source, std::size_t bytes);
 // that was there before, or to the default action. Windows' report is
 // profile.cpp's, through its unhandled-exception filter.
 void InstallCrashHandler();
+// The crash report written to `console` in stderr's place and to `file` too
+// (-1: none) - the run log's file, so that a report reaches it while the
+// process dies, and where stderr went before the log took it.
+void SetCrashReportFile(int file, int console);
+// SIGHUP, SIGINT, SIGTERM and SIGQUIT said where the crash report goes before
+// they end the process as before; SIGPIPE ignored (a failed write, not an end).
+void NoteEndingSignals();
+
+// ------------------------------------------------------------------ the run log
+// Everything the run writes to stdout and stderr copied into `path` too, as it
+// is written - each stream through a pipe and a thread that hands it on to
+// wherever it went before and to the file. 1 when started; 0 when another
+// process holds the file (an advisory lock), -1 when it cannot be opened.
+int StartRunLog(const std::string& path);
+// The streams drained into the file and put back as they were.
+void FinishRunLog();
 #endif
 
 }  // namespace ps2host::platform
