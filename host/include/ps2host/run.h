@@ -150,6 +150,10 @@ const char* IopRelease();
    the releases of its modules - loadfile's answers its version check. */
 void UseIopImage(const std::string& path);
 void InstallDbc();
+/* padman's controller as a DualShock 2 (dbc.cpp): its model, pressure mode
+   and two motors, which libpad's DualShock 2 checks and vibration need. Off
+   by default: a DualShock (mode 0x73) with no motors, as before. */
+void SetPadmanDualShock2(bool on);
 void InstallIopHeap();
 /* libmc's memory card server (mcserv.cpp) over --memcard's directory. */
 void InstallMcserv();

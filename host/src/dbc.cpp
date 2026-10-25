@@ -444,11 +444,28 @@ std::vector<u8> Server(u32 procedure, const std::vector<u8>& request) {
  *         current mode, +0x6A actuators
  *   +0x70 state (6: stable), +0x71 request state (0: done, 2: busy),
  *   +0x72 1 (a controller is there)
+ *
+ * A command's result is where libpad reads it (ps2sdk's libpad.c): +0xC for
+ * most, +0x10 for SET_BTNINFO (0x0A), +0x14 for SET_MMODE (0x06), SET_ACTDIR
+ * (0x07) and SET_ACTALIGN (0x08).
+ *
+ * As a DualShock 2 (SetPadmanDualShock2, off by default): the area says what
+ * the pad's own replies say (ps2sdk's padman keeps them there; the values
+ * are the DualShock 2's, as the controller protocol's public descriptions
+ * give them) - +0x66 the model (3), +0x6B one actuator combination, +0x30
+ * the two actuators (the small motor on or off, the large one 0-255), +0x40
+ * the combination; GET_BTNMASK (0x09) answers the 18 pressure-sensitive
+ * buttons, SET_BTNINFO (0x0A) turns pressure on (mode 0x79, the report's
+ * twelve pressure bytes too) or off, and SET_ACTDIR (0x07) drives the
+ * motors through the bytes SET_ACTALIGN (0x08) gave them.
  */
 struct PadArea {
     u32 port = 0, slot = 0, area = 0;
     u32 frame = 0;
+    bool pressure = false;              // SET_BTNINFO's pressure mode (a DualShock 2's)
+    u8 align[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};    // SET_ACTALIGN: each byte's actuator
 };
+bool g_padman_ds2 = false;              // SetPadmanDualShock2
 std::map<u64, PadArea>& PadAreas() {
     static std::map<u64, PadArea> areas;
     return areas;
@@ -485,9 +502,48 @@ std::vector<u8> Padman(u32 /*procedure*/, const std::vector<u8>& request) {
             PadAreas().erase(u64(At(request, 4)) << 32 | At(request, 8));
             Put(answer, 0xC, 1);
             return answer;
+        case 0x06:                                  // SET_MMODE
+            Put(answer, 0xC, 1);
+            Put(answer, 0x14, 1);
+            return answer;
+        case 0x07: case 0x08: {                     // SET_ACTDIR, SET_ACTALIGN: six bytes at +0xC
+            const auto found = PadAreas().find(u64(At(request, 4)) << 32 | At(request, 8));
+            if (g_padman_ds2 && found != PadAreas().end() && request.size() >= 0x12) {
+                PadArea& p = found->second;
+                if (command == 0x08) {
+                    std::copy(request.begin() + 0xC, request.begin() + 0x12, p.align);
+                } else {
+                    u8 large = 0, small = 0;
+                    for (int i = 0; i < 6; ++i) {
+                        if (p.align[i] == 0) small = request[0xC + i] ? 255 : 0;
+                        if (p.align[i] == 1) large = request[0xC + i];
+                    }
+                    if (std::getenv("PS2HOST_RUMBLE_LOG"))
+                        std::fprintf(stderr, "[pad] motors: large %u small %u (padman)\n", unsigned(large),
+                                     unsigned(small));
+                    PortRumble(p.port, large, small);
+                }
+            }
+            Put(answer, 0xC, 1);
+            Put(answer, 0x14, 1);
+            return answer;
+        }
+        case 0x09:                                  // GET_BTNMASK
+            Put(answer, 0xC, g_padman_ds2 ? 0x0003FFFFu : 1);
+            return answer;
+        case 0x0A: {                                // SET_BTNINFO: +0xC the buttons read for pressure
+            const auto found = PadAreas().find(u64(At(request, 4)) << 32 | At(request, 8));
+            if (found != PadAreas().end()) found->second.pressure = At(request, 0xC) != 0;
+            Put(answer, 0xC, 1);
+            Put(answer, 0x10, 1);
+            return answer;
+        }
         default: {
-            char text[96];
-            std::snprintf(text, sizeof text, "PAD: padman command 0x%X (answered done)", unsigned(command));
+            char text[160];
+            std::snprintf(text, sizeof text,
+                          "PAD: padman command 0x%X (answered done): words %08X %08X %08X %08X %08X",
+                          unsigned(command), unsigned(At(request, 4)), unsigned(At(request, 8)),
+                          unsigned(At(request, 12)), unsigned(At(request, 16)), unsigned(At(request, 20)));
             Note("padman " + std::to_string(command), text);
             Put(answer, 0xC, 1);
             return answer;
@@ -512,19 +568,27 @@ void PadmanFrame() {
         if (pad_log && (data[0] != 0xFF || data[1] != 0xFF))
             std::fprintf(stderr, "[pad] frame %llu port %u area 0x%08X frame# %u buttons %02X%02X\n",
                          (unsigned long long)g_frame, unsigned(p.port), unsigned(f), unsigned(p.frame), data[1], data[0]);
-        const u32 length = 2 + 2 * (kPadmanMode & 0xF);
+        const u8 mode = g_padman_ds2 && p.pressure ? 0x79 : kPadmanMode;
+        const u32 length = 2 + 2 * (mode & 0xF);
         m.Write(f + 0, 0, 1);
-        m.Write(f + 1, kPadmanMode, 1);
+        m.Write(f + 1, mode, 1);
         for (u32 i = 0; i + 2 < length; ++i) m.Write(f + 2 + i, data[i], 1);
         m.Write(f + 0x60, length, 4);
         m.Write(f + 0x50, 4, 2);                         // digital,
         m.Write(f + 0x52, 7, 2);                         // DualShock
         m.Write(f + 0x64, 2, 1);
-        m.Write(f + 0x65, kPadmanMode, 1);
+        m.Write(f + 0x65, mode, 1);
         m.Write(f + 0x68, 2, 1);
         m.Write(f + 0x69, 1, 1);
         m.Write(f + 0x6A, 2, 1);
         m.Write(f + 0x72, 1, 1);
+        if (g_padman_ds2) {
+            m.Write(f + 0x66, 3, 1);                     // DualShock 2
+            m.Write(f + 0x6B, 1, 1);
+            m.Write(f + 0x30, 0x0A000201u, 4);           // the small motor: on or off
+            m.Write(f + 0x34, 0x14010101u, 4);           // the large one: 0-255
+            m.Write(f + 0x40, 0x00010002u, 4);
+        }
     }
 }
 
@@ -698,6 +762,8 @@ void DbcFrame() {
         m.Write(b + 0x7C, ++s.counter, 4);
     }
 }
+
+void SetPadmanDualShock2(bool on) { g_padman_ds2 = on; }
 
 void InstallDbc() {
     RegisterRpcServer(0x80001300u, Server);

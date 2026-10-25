@@ -112,6 +112,18 @@ ELF loader's one, ReferSemaStatus's five).
   happens (focus, minimize, hide, fullscreen, the drawable's and the
   swapchain's sizes); a failed Vulkan call is said once. The platform
   tests check the log, a held log, and a crash's report in it, once.
+- padman's results where libpad reads them (ps2sdk's `libpad.c`): +0x14
+  for SET_MMODE, SET_ACTDIR and SET_ACTALIGN, +0x10 for SET_BTNINFO (each
+  had what the request left there). And off by default, on for a game with
+  `SetPadmanDualShock2`: the pad a DualShock 2 - the model (3), its two
+  actuators and their combination in the pad's area, as ps2sdk's padman
+  keeps the pad's replies there (the values the controller protocol's
+  public descriptions give: the small motor on or off, the large one
+  0-255); GET_BTNMASK answering the 18 pressure-sensitive buttons,
+  SET_BTNINFO turning pressure mode (0x79, the report's twelve pressure
+  bytes) on and off, and SET_ACTDIR driving the host's motors through the
+  bytes SET_ACTALIGN gave them - padman's games had no vibration.
+  `PadmanIsADualShock2` calls the server through SIF DMA as the EE does.
 - The compiled checks build outside Windows: `cppcheck.py`, `liftcheck.py`
   and `equivalence.py` compile their libraries with clang++ (`$CXX`) at
   `-O3 -ffp-contract=off`, as a Release port is compiled; MSVC's path is

@@ -2248,6 +2248,73 @@ u32 BindFromTheEe(u32 sid) {
     return u32(m.Read(kReceive + 36, 4));
 }
 
+// A call from the EE to the server a bind gave: `data` as its arguments,
+// `size` bytes of the answer.
+std::vector<u8> CallFromTheEe(u32 server, const std::vector<u8>& data, u32 size) {
+    ps2host::Memory& m = ps2host::GuestMemory();
+    constexpr u32 kData = 0x00344000u, kReceive = 0x00345000u, kPacket = 0x00341000u, kList = 0x00342000u;
+    m.WriteBytes(kData, data.data(), data.size());
+    for (u32 i = 0; i < 0x40; i += 4) m.Write(kPacket + i, 0, 4);
+    m.Write(kPacket, 0x40, 4), m.Write(kPacket + 8, 0x8000000Au, 4), m.Write(kPacket + 32, 1, 4);
+    m.Write(kPacket + 36, u32(data.size()), 4), m.Write(kPacket + 40, kReceive, 4), m.Write(kPacket + 44, size, 4);
+    m.Write(kPacket + 52, server, 4);
+    m.Write(kList, kData, 4), m.Write(kList + 4, server + 0x100, 4), m.Write(kList + 8, u32(data.size()), 4);
+    m.Write(kList + 12, 0, 4);
+    m.Write(kList + 16, kPacket, 4), m.Write(kList + 20, 0, 4), m.Write(kList + 24, 0x40, 4), m.Write(kList + 28, 0, 4);
+    ps2host::SifDma(kList, 2);
+    while (ps2host::DeliverIopReply()) {}
+    std::vector<u8> answer(size);
+    m.ReadBytes(kReceive, answer.data(), size);
+    return answer;
+}
+
+// padman's pad as a DualShock 2 (SetPadmanDualShock2): libpad's results
+// where it reads them, the model and actuators in the pad's area, pressure
+// mode on SET_BTNINFO - Tekken 5 takes no other pad as a controller.
+void PadmanIsADualShock2() {
+    ps2host::InstallDbc();
+    ps2host::SetPadmanDualShock2(true);
+    ps2host::Memory& m = ps2host::GuestMemory();
+    const u32 server = BindFromTheEe(0x80000100u);
+    auto call = [&](std::initializer_list<u32> words) {
+        std::vector<u8> request(0x80, 0);
+        u32 at = 0;
+        for (u32 w : words) std::memcpy(&request[at], &w, 4), at += 4;
+        const std::vector<u8> answer = CallFromTheEe(server, request, 0x80);
+        return [answer](u32 offset) {
+            u32 w;
+            std::memcpy(&w, &answer[offset], 4);
+            return w;
+        };
+    };
+    constexpr u32 kArea = 0x00346000u;
+    for (u32 i = 0; i < 0x100; i += 4) m.Write(kArea + i, 0, 4);
+    Check(call({0x01, 0, 0, 0, kArea})(0xC) == 1, "padman: port 0 opened");
+    // The newer of the area's two frames, by their numbers at +0x58.
+    auto frame = [&] {
+        return m.Read(kArea + 0x58, 4) > m.Read(kArea + 0x80 + 0x58, 4) ? kArea : kArea + 0x80;
+    };
+    ps2host::DbcFrame();
+    u32 f = frame();
+    Check(m.Read(f + 0x66, 1) == 3 && (m.Read(f + 0x66, 1) & 2) && m.Read(f + 0x6A, 1) == 2 &&
+              m.Read(f + 0x6B, 1) == 1 && m.Read(f + 0x32, 1) == 0 && m.Read(f + 0x36, 1) == 1,
+          "padman: a DualShock 2's model, its small and large motors");
+    Check(m.Read(f + 1, 1) == 0x73 && m.Read(f + 0x60, 4) == 8, "padman: analog, no pressure yet");
+    Check(call({0x09, 0, 0})(0xC) == 0x3FFFFu, "padman: GET_BTNMASK, every pressure-sensitive button");
+    Check(call({0x0A, 0, 0, 0xFFF})(0x10) == 1, "padman: SET_BTNINFO's result at +0x10");
+    ps2host::DbcFrame();
+    f = frame();
+    Check(m.Read(f + 1, 1) == 0x79 && m.Read(f + 0x65, 1) == 0x79 && m.Read(f + 0x60, 4) == 20,
+          "padman: pressure mode, the report's twelve pressure bytes with it");
+    Check(call({0x08, 0, 0, 0xFFFF0100u, 0x0000FFFFu})(0x14) == 1, "padman: SET_ACTALIGN's result at +0x14");
+    Check(call({0x07, 0, 0, 0xFFFF8001u, 0x0000FFFFu})(0x14) == 1, "padman: SET_ACTDIR's result at +0x14");
+    Check(call({0x0A, 0, 0, 0})(0x10) == 1, "padman: pressure off");
+    ps2host::DbcFrame();
+    Check(m.Read(frame() + 1, 1) == 0x73, "padman: back to analog");
+    call({0x0E, 0, 0});
+    ps2host::SetPadmanDualShock2(false);
+}
+
 // A server a module the host runs will register (iop::AwaitServer): bound to
 // none until a module has registered it, as an IOP answers - the EE binds
 // again - then to the module's. A server no port names, that no module serves,
@@ -2896,6 +2963,7 @@ int main() {
     IopServesRequestsOneByOne();
     IopCallsTheEe();
     IopBindsWaitForTheirModules();
+    PadmanIsADualShock2();
     IopImportsTheHostLacksStopTheRun();
     SpuDecodesAdpcmAndPlaysAVoice();
     SpuPlaysItsSoundDataInput();
